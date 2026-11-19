@@ -6,6 +6,20 @@ import { renderMarkdown } from "./markdown.mjs";
 import { renderSwarmStrip } from "./swarm.mjs";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const itemRenderCache = new WeakMap();
+
+export function resolveThoughtMode(state) {
+  if (state?.thoughtMode === "fold" || state?.thoughtMode === "expanded" || state?.thoughtMode === "hidden") {
+    return state.thoughtMode;
+  }
+  return state?.showThoughts ? "expanded" : "fold";
+}
+
+function renderFoldedThoughtSummary(count, totalDurationMs, style) {
+  const durPart = totalDurationMs > 0 ? ` for ${formatDuration(totalDurationMs)}` : "";
+  const stepsPart = count > 1 ? ` · ${count} steps` : "";
+  return `  ${style.thought(`▸ Thought${durPart}`)}${style.muted(`${stepsPart}  (Ctrl+T to expand)`)}`;
+}
 
 export function formatTokenCount(count) {
   if (typeof count !== "number" || Number.isNaN(count)) return "";
@@ -193,16 +207,20 @@ function renderToolItem(item, maxWidth, style, state) {
 }
 
 function renderThoughtItem(item, maxWidth, style, state) {
-  const lines = [];
+  const thoughtMode = resolveThoughtMode(state);
+  if (thoughtMode === "hidden") return [];
+
   const text = (item.text || "").trim();
-  if (!text) return lines;
+  if (!text) return [];
 
   const isLive = Boolean(item.streaming);
-  const labelIcon = isLive ? style.thought(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]) : style.thought("◇");
   const dur = item.durationMs ? ` · ${formatDuration(item.durationMs)}` : "";
 
-  if (state.showThoughts || state.expandTools) {
-    lines.push(`  ${labelIcon} ${style.thought(`Thought${dur}`)}`);
+  if (thoughtMode === "expanded") {
+    const lines = [];
+    const labelIcon = isLive ? style.thought(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]) : style.thought("▾");
+    const titleLabel = isLive ? `Thinking${dur}` : `Thought${dur}`;
+    lines.push(`  ${labelIcon} ${style.thought(titleLabel)}`);
     const wrapped = wrapAnsiText(style.thought(text), Math.max(16, maxWidth - 6));
     for (const w of wrapped) {
       lines.push(`    ${style.border("│")} ${w}`);
@@ -210,16 +228,12 @@ function renderThoughtItem(item, maxWidth, style, state) {
     return lines;
   }
 
-  // Compact single-line summary
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  const previewCap = Math.max(16, maxWidth - 28);
-  const snippet = truncateAnsi(oneLine, previewCap, "…");
+  // Folded mode (default, Claude Code style)
   if (isLive) {
-    lines.push(`  ${labelIcon} ${style.thought(`Thinking${dur}`)} ${style.muted("— " + snippet)}`);
-  } else {
-    lines.push(`  ${labelIcon} ${style.thought(`Thought${dur}`)} ${style.muted(`(${text.length} chars · Ctrl+T)`)}`);
+    const spin = style.thought(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]);
+    return [`  ${spin} ${style.thought(`Thinking${dur}`)}  ${style.muted("(Ctrl+T to expand)")}`];
   }
-  return lines;
+  return [renderFoldedThoughtSummary(1, item.durationMs || 0, style)];
 }
 
 function renderPlanItem(item, maxWidth, style) {
@@ -246,101 +260,221 @@ function renderPlanItem(item, maxWidth, style) {
   return lines;
 }
 
+function renderUserItem(item, contentWidth, style) {
+  const out = [];
+  const rawLines = String(item.text || "").split("\n");
+  let firstLine = true;
+  for (const rl of rawLines) {
+    const wrapped = wrapAnsiLine(style.bold(rl), Math.max(16, contentWidth - 2));
+    for (const wl of wrapped) {
+      const prefix = firstLine ? `${style.accentBold("❯")} ` : `${style.border("│")} `;
+      out.push(`  ${prefix}${wl}`);
+      firstLine = false;
+    }
+  }
+  const hasFiles = Array.isArray(item.attachedPaths) && item.attachedPaths.length > 0;
+  const hasImages = Array.isArray(item.attachedImages) && item.attachedImages.length > 0;
+  if (hasFiles || hasImages) {
+    const tags = [];
+    if (hasImages) {
+      for (const img of item.attachedImages) {
+        const sizeStr = img.sizeBytes ? ` (${formatBytes(img.sizeBytes)})` : "";
+        tags.push(style.warn(`🖼 ${img.label}${sizeStr}`));
+      }
+    }
+    if (hasFiles) {
+      for (const p of item.attachedPaths) {
+        tags.push(style.accentAlt(`@${p}`));
+      }
+    }
+    out.push(`    ${style.muted("attached:")} ${tags.join("  ")}`);
+  }
+  out.push("");
+  return out;
+}
+
+function renderAssistantItem(item, contentWidth, style) {
+  const out = [];
+  const mdLines = renderMarkdown(item.text || "", contentWidth, style);
+  for (const ml of mdLines) {
+    out.push(ml ? `  ${ml}` : "");
+  }
+  return out;
+}
+
+function renderNoticeItem(item, contentWidth, style) {
+  const marker =
+    item.level === "error"
+      ? style.errorBold("!")
+      : item.level === "warn"
+        ? style.warnBold("!")
+        : style.muted("·");
+  const textStyled =
+    item.level === "error"
+      ? style.error(item.text)
+      : item.level === "warn"
+        ? style.warn(item.text)
+        : style.muted(item.text);
+  const wrapped = wrapAnsiText(textStyled, Math.max(16, contentWidth - 2));
+  return wrapped.map((wl, wIdx) => (wIdx === 0 ? `  ${marker} ${wl}` : `    ${wl}`));
+}
+
+function isCacheableTimelineItem(item, thoughtMode) {
+  if (!item || typeof item !== "object") return false;
+  switch (item.type) {
+    case "user":
+    case "notice":
+    case "plan":
+      return true;
+    case "tool":
+      return ["completed", "failed", "error", "cancelled"].includes(item.status);
+    case "assistant":
+      return !item.streaming;
+    case "thought":
+      return thoughtMode === "expanded" && !item.streaming;
+    default:
+      return false;
+  }
+}
+
+function renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, renderFn) {
+  if (!isCacheableTimelineItem(item, thoughtMode)) {
+    return renderFn();
+  }
+  const key = `${cols}|${style.name}|${style.depth}|${state.cwd || ""}|${state.expandTools ? 1 : 0}|${thoughtMode}|${item._rev || 0}`;
+  const cached = itemRenderCache.get(item);
+  if (cached && cached.key === key) {
+    return cached.lines;
+  }
+  const lines = renderFn();
+  itemRenderCache.set(item, { key, lines });
+  return lines;
+}
+
 export function renderTimeline(state, cols, style) {
   if (state.items.length === 0) {
     return renderWelcome(state, cols, style);
   }
 
   const contentWidth = Math.max(24, cols - 4);
+  const thoughtMode = resolveThoughtMode(state);
   const lines = [""];
+
+  let foldedThoughtCount = 0;
+  let foldedThoughtMs = 0;
+  let hasPendingFolded = false;
+  let lastEmittedType = null;
+
+  const flushFoldedThoughts = () => {
+    if (!hasPendingFolded) return;
+    lines.push(renderFoldedThoughtSummary(foldedThoughtCount, foldedThoughtMs, style));
+    foldedThoughtCount = 0;
+    foldedThoughtMs = 0;
+    hasPendingFolded = false;
+    lastEmittedType = "thought";
+  };
+
+  const pushLines = (chunk) => {
+    for (let i = 0; i < chunk.length; i += 1) {
+      lines.push(chunk[i]);
+    }
+  };
 
   for (let idx = 0; idx < state.items.length; idx += 1) {
     const item = state.items[idx];
-    const prev = idx > 0 ? state.items[idx - 1] : null;
 
     if (item.type === "user") {
+      flushFoldedThoughts();
       if (lines.length > 1) lines.push("");
-      const rawLines = String(item.text || "").split("\n");
-      let firstLine = true;
-      for (const rl of rawLines) {
-        const wrapped = wrapAnsiLine(style.bold(rl), Math.max(16, contentWidth - 2));
-        for (const wl of wrapped) {
-          const prefix = firstLine ? `${style.accentBold("❯")} ` : `${style.border("│")} `;
-          lines.push(`  ${prefix}${wl}`);
-          firstLine = false;
-        }
-      }
-      const hasFiles = Array.isArray(item.attachedPaths) && item.attachedPaths.length > 0;
-      const hasImages = Array.isArray(item.attachedImages) && item.attachedImages.length > 0;
-      if (hasFiles || hasImages) {
-        const tags = [];
-        if (hasImages) {
-          for (const img of item.attachedImages) {
-            const sizeStr = img.sizeBytes ? ` (${formatBytes(img.sizeBytes)})` : "";
-            tags.push(style.warn(`🖼 ${img.label}${sizeStr}`));
-          }
-        }
-        if (hasFiles) {
-          for (const p of item.attachedPaths) {
-            tags.push(style.accentAlt(`@${p}`));
-          }
-        }
-        lines.push(`    ${style.muted("attached:")} ${tags.join("  ")}`);
-      }
-      lines.push("");
+      const userLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+        renderUserItem(item, contentWidth, style),
+      );
+      pushLines(userLines);
+      lastEmittedType = "user";
       continue;
     }
 
     if (item.type === "thought") {
-      lines.push(...renderThoughtItem(item, contentWidth, style, state));
+      if (thoughtMode === "hidden") {
+        continue;
+      }
+      if (thoughtMode === "fold") {
+        if (item.streaming) {
+          const combinedMs = foldedThoughtMs + (item.durationMs || 0);
+          const spin = style.thought(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]);
+          const dur = combinedMs > 0 ? ` · ${formatDuration(combinedMs)}` : "";
+          const stepTag = foldedThoughtCount > 0 ? ` · ${foldedThoughtCount + 1} steps` : "";
+          lines.push(`  ${spin} ${style.thought(`Thinking${dur}`)}${style.muted(`${stepTag}  (Ctrl+T to expand)`)}`);
+          foldedThoughtCount = 0;
+          foldedThoughtMs = 0;
+          hasPendingFolded = false;
+          lastEmittedType = "thought";
+        } else if ((item.text || "").trim()) {
+          foldedThoughtCount += 1;
+          foldedThoughtMs += item.durationMs || 0;
+          hasPendingFolded = true;
+        }
+        continue;
+      }
+
+      const thoughtLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+        renderThoughtItem(item, contentWidth, style, state),
+      );
+      if (thoughtLines.length > 0) {
+        pushLines(thoughtLines);
+        lastEmittedType = "thought";
+      }
       continue;
     }
 
     if (item.type === "tool") {
-      lines.push(...renderToolItem(item, contentWidth, style, state));
+      const toolLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+        renderToolItem(item, contentWidth, style, state),
+      );
+      pushLines(toolLines);
+      lastEmittedType = "tool";
       continue;
     }
 
     if (item.type === "plan") {
-      lines.push(...renderPlanItem(item, contentWidth, style));
+      const planLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+        renderPlanItem(item, contentWidth, style),
+      );
+      if (planLines.length > 0) {
+        pushLines(planLines);
+        lastEmittedType = "plan";
+      }
       continue;
     }
 
     if (item.type === "assistant") {
-      if (prev && (prev.type === "tool" || prev.type === "thought" || prev.type === "plan")) {
+      flushFoldedThoughts();
+      if (lastEmittedType === "tool" || lastEmittedType === "thought" || lastEmittedType === "plan") {
         lines.push("");
       }
-      const mdLines = renderMarkdown(item.text || "", contentWidth, style);
-      for (const ml of mdLines) {
-        lines.push(ml ? `  ${ml}` : "");
-      }
+      const assistantLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+        renderAssistantItem(item, contentWidth, style),
+      );
+      pushLines(assistantLines);
       if (item.streaming) {
         lines.push(`  ${style.accent(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length])}`);
       }
       lines.push("");
+      lastEmittedType = "assistant";
       continue;
     }
 
     if (item.type === "notice") {
-      const marker =
-        item.level === "error"
-          ? style.errorBold("!")
-          : item.level === "warn"
-            ? style.warnBold("!")
-            : style.muted("·");
-      const textStyled =
-        item.level === "error"
-          ? style.error(item.text)
-          : item.level === "warn"
-            ? style.warn(item.text)
-            : style.muted(item.text);
-      const wrapped = wrapAnsiText(textStyled, Math.max(16, contentWidth - 2));
-      wrapped.forEach((wl, wIdx) => {
-        lines.push(wIdx === 0 ? `  ${marker} ${wl}` : `    ${wl}`);
-      });
+      flushFoldedThoughts();
+      const noticeLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+        renderNoticeItem(item, contentWidth, style),
+      );
+      pushLines(noticeLines);
+      lastEmittedType = "notice";
     }
   }
 
+  flushFoldedThoughts();
   return lines;
 }
 
@@ -407,18 +541,44 @@ export function renderComposerBlock(state, cols, style) {
     lines.push(` ${truncateAnsi(`${pills}${clearHint}`, cols - 2, "…")}`);
   }
 
+  const thoughtMode = resolveThoughtMode(state);
+
   // Optional status strip right above the composer hairline
   const statusPieces = [];
-  if (state.busy) {
+  if (state.activeModalType === "permission") {
+    statusPieces.push(
+      truncateAnsi(
+        `${style.warnBold("⚠ Permission approval required above")} ${style.muted("· press 1-9, ↑/↓ + Enter, or Esc to deny")}`,
+        Math.max(16, cols - 2),
+        "…",
+      ),
+    );
+  } else if (state.activeModalType === "picker") {
+    statusPieces.push(
+      truncateAnsi(
+        `${style.accent("▸ Picker open")} ${style.muted("· type to filter, ↑/↓ + Enter to select, Esc to close")}`,
+        Math.max(16, cols - 2),
+        "…",
+      ),
+    );
+  } else if (state.busy) {
     const spin = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length];
-    const elapsed = state.turnStartedAt ? ` · ${formatDuration(Date.now() - state.turnStartedAt)}` : "";
-    statusPieces.push(`${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`);
+    const items = Array.isArray(state.items) ? state.items : [];
+    const lastItem = items.length > 0 ? items[items.length - 1] : null;
+    const isThinkingHidden = thoughtMode === "hidden" && lastItem?.type === "thought" && lastItem?.streaming;
+    if (isThinkingHidden) {
+      const tDur = lastItem.durationMs ? ` · ${formatDuration(lastItem.durationMs)}` : "";
+      statusPieces.push(`${style.thought(spin)} ${style.muted(`Working · thinking${tDur} · ^T show · Esc cancel`)}`);
+    } else {
+      const elapsed = state.turnStartedAt ? ` · ${formatDuration(Date.now() - state.turnStartedAt)}` : "";
+      statusPieces.push(`${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`);
+    }
   } else if (state.toast && Date.now() < state.toast.expiresAt) {
     const tone = state.toast.level === "error" ? style.error : style.success;
     statusPieces.push(tone(state.toast.text));
   }
 
-  if (state.scrollOffset > 0) {
+  if (state.scrollOffset > 0 && !state.activeModalType) {
     statusPieces.push(style.accentAlt(`↓ ${state.scrollOffset} lines below · End to jump`));
   }
 
@@ -434,9 +594,14 @@ export function renderComposerBlock(state, cols, style) {
   for (let i = 0; i < layout.lines.length; i += 1) {
     const promptPrefix = i === 0 ? ` ${style.accentBold("❯")} ` : ` ${style.border("│")} `;
     if (isEmpty && i === 0) {
-      const placeholder = state.busy
-        ? "Type to steer the running turn…"
-        : "Message agent…  (/ commands · @ files · Shift+Tab mode)";
+      const placeholder =
+        state.activeModalType === "permission"
+          ? "Respond to permission prompt above (1-9 / Enter / Esc)…"
+          : state.activeModalType === "picker"
+            ? "Type in the picker above to filter…"
+            : state.busy
+              ? "Type to steer the running turn…"
+              : "Message agent…  (/ commands · @ files · Shift+Tab mode)";
       lines.push(`${promptPrefix}${style.muted(truncateAnsi(placeholder, inputWidth, "…"))}`);
     } else {
       lines.push(`${promptPrefix}${layout.lines[i]}`);
@@ -448,12 +613,18 @@ export function renderComposerBlock(state, cols, style) {
   // Compact footer hints — drop trailing items cleanly rather than clipping mid-word
   const mouseState = state.mouseCapture ? style.success("on") : style.warn("off");
   const detailsState = state.expandTools ? style.accent("full") : style.muted("compact");
+  const thoughtsHint =
+    thoughtMode === "expanded"
+      ? style.accent("thoughts:on")
+      : thoughtMode === "hidden"
+        ? style.muted("thoughts:off")
+        : style.muted("thoughts");
   const footerCandidates = [
     `${style.muted("Enter")} send`,
     `${style.muted("^J")} newline`,
     `${style.muted("⇧Tab")} mode`,
     `${style.muted("^O")} ${detailsState}`,
-    `${style.muted("^T")} thoughts`,
+    `${style.muted("^T")} ${thoughtsHint}`,
     `${style.muted("^Y")} copy`,
     `${style.muted("^G")} mouse:${mouseState}`,
     `${style.muted("/help")}`,
@@ -485,7 +656,7 @@ export function renderComposerBlock(state, cols, style) {
  */
 export function applyOverlayModal(viewportRows, cols, modal, style) {
   const height = viewportRows.length;
-  if (!modal || height < 6 || cols < 36) return viewportRows;
+  if (!modal || height < 4 || cols < 36) return viewportRows;
 
   const boxWidth = Math.min(Math.max(44, Math.floor(cols * 0.78)), cols - 4, 86);
   const innerWidth = boxWidth - 4;
@@ -558,7 +729,7 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
       ["Esc", "Cancel running turn / close popup or modal"],
       ["Shift+Tab", "Cycle execution mode (default / accept-edits / auto / plan)"],
       ["Ctrl+B / /board", "Toggle Swarm & Subagent multi-pane board"],
-      ["Ctrl+O  /  Ctrl+T", "Toggle tool details/diffs  /  full thinking blocks"],
+      ["Ctrl+O  /  Ctrl+T", "Toggle tool details  /  fold or expand thoughts (/thoughts)"],
       ["Ctrl+Y  /  Ctrl+G", "Copy latest reply (OSC 52)  /  toggle mouse capture"],
       ["Ctrl+V  /  /image", "Attach clipboard image or image file (also @img.png / drag path)"],
       ["PgUp / PgDn / Wheel", "Scroll conversation history"],

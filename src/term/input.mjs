@@ -245,19 +245,43 @@ export class InputParser {
   }
 
   handleCsi(params, finalByte) {
-    // Kitty / CSI u: \x1b[<codepoint>;<modifiers>u
+    // Kitty / CSI u: \x1b[<codepoint>[:<shifted>[:<base>]];[<modifiers>[:<eventType>]]u
     if (finalByte === "u") {
-      const parts = params.split(";").map((p) => Number.parseInt(p.split(":")[0], 10));
-      const codepoint = parts[0] || 0;
-      const mods = decodeModifierFlags(parts[1] || 1);
-      const name = keyNameFromCsiCode(codepoint);
-      if (name) {
-        if (name.length === 1 && !mods.ctrl && !mods.alt && codepoint >= 32 && codepoint <= 126) {
-          const ch = mods.shift ? name.toUpperCase() : name;
-          this.emit({ type: "text", text: ch });
+      const partsRaw = params.split(";");
+      const codeSub = (partsRaw[0] || "").split(":");
+      const baseCode = Number.parseInt(codeSub[0], 10) || 0;
+      const shiftedCode = codeSub[1] ? Number.parseInt(codeSub[1], 10) || 0 : 0;
+
+      const modSub = (partsRaw[1] || "").split(":");
+      const modParam = modSub[0] ? Number.parseInt(modSub[0], 10) || 1 : 1;
+      const eventType = modSub[1] ? Number.parseInt(modSub[1], 10) || 1 : 1;
+
+      if (eventType === 3) {
+        return;
+      }
+
+      const mods = decodeModifierFlags(modParam);
+      const effectiveCode = mods.shift && shiftedCode >= 32 ? shiftedCode : baseCode;
+
+      if (
+        !mods.ctrl &&
+        !mods.alt &&
+        !mods.meta &&
+        effectiveCode >= 32 &&
+        effectiveCode !== 127 &&
+        effectiveCode <= 0x10ffff
+      ) {
+        if (effectiveCode <= 126 && mods.shift && !shiftedCode && effectiveCode >= 97 && effectiveCode <= 122) {
+          this.emit({ type: "text", text: String.fromCharCode(effectiveCode - 32) });
         } else {
-          this.emit({ type: "key", name, ...mods });
+          this.emit({ type: "text", text: String.fromCodePoint(effectiveCode) });
         }
+        return;
+      }
+
+      const name = keyNameFromCsiCode(baseCode);
+      if (name) {
+        this.emit({ type: "key", name, ...mods });
       }
       return;
     }

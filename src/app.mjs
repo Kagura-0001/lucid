@@ -38,7 +38,7 @@ const LOCAL_COMMANDS = [
   { name: "copy", description: "Copy latest assistant reply (OSC 52)", local: true },
   { name: "mouse", description: "Toggle mouse wheel capture (OFF = native drag-select)", local: true },
   { name: "expand", description: "Toggle expanded tool outputs & diffs", local: true },
-  { name: "thoughts", description: "Toggle full thinking/reasoning blocks", local: true },
+  { name: "thoughts", description: "Toggle, fold, or hide thinking blocks (/thoughts [fold|show|hide])", local: true },
   { name: "quota", description: "Check Antigravity quota (read-only)", local: true },
   { name: "clear", description: "Clear visible timeline (keeps session alive)", local: true },
   { name: "help", description: "Show keyboard shortcuts & commands", local: true },
@@ -125,6 +125,12 @@ export class LucidApp {
     this.acp = null;
     this.fileIndex = new WorkspaceFileIndex(this.cwd);
 
+    const thoughtMode = ["fold", "expanded", "hidden"].includes(this.userConfig.thoughtMode)
+      ? this.userConfig.thoughtMode
+      : this.userConfig.showThoughts
+        ? "expanded"
+        : "fold";
+
     this.state = {
       cwd: this.cwd,
       agentLabel: this.launchSpec.name,
@@ -148,7 +154,8 @@ export class LucidApp {
       scrollOffset: 0,
       maxScrollOffset: 0,
       mouseCapture: cliOptions.noMouse ? false : Boolean(this.userConfig.mouseCapture),
-      showThoughts: Boolean(this.userConfig.showThoughts),
+      thoughtMode,
+      showThoughts: thoughtMode === "expanded",
       expandTools: Boolean(this.userConfig.expandTools),
       composer: new Composer(),
       stagedImages: [],
@@ -166,6 +173,7 @@ export class LucidApp {
     this.boardState = { selectedIdx: 0, tab: "board", scrollOffset: 0, maxDetailScroll: 0 };
 
     this.renderTimer = null;
+    this.renderPriority = false;
     this.spinnerTimer = null;
     this.lastCtrlCAt = 0;
     this.exiting = false;
@@ -191,7 +199,7 @@ export class LucidApp {
         this.state.spinnerFrame = (this.state.spinnerFrame + 1) % 10;
         this.scheduleRender();
       }
-    }, 90);
+    }, 120);
 
     await this.connectAndStartSession();
 
@@ -622,9 +630,10 @@ export class LucidApp {
       const last = this.state.items[this.state.items.length - 1];
       if (last && last.type === "user" && last.fromReplay) {
         last.text += chunk;
+        last._rev = (last._rev || 0) + 1;
       } else {
         this.finalizeAllStreaming();
-        this.state.items.push({ type: "user", text: chunk, fromReplay: true });
+        this.state.items.push({ type: "user", text: chunk, fromReplay: true, _rev: 0 });
       }
       this.scheduleRender();
       return;
@@ -637,6 +646,7 @@ export class LucidApp {
       if (last && last.type === "thought" && last.streaming) {
         last.text += chunk;
         last.durationMs = Date.now() - last.startedAt;
+        last._rev = (last._rev || 0) + 1;
       } else {
         this.finalizeAssistantStreaming();
         this.state.items.push({
@@ -645,6 +655,7 @@ export class LucidApp {
           streaming: true,
           startedAt: Date.now(),
           durationMs: 0,
+          _rev: 0,
         });
       }
       this.scheduleRender();
@@ -658,11 +669,13 @@ export class LucidApp {
       const last = this.state.items[this.state.items.length - 1];
       if (last && last.type === "assistant" && last.streaming) {
         last.text += chunk;
+        last._rev = (last._rev || 0) + 1;
       } else {
         this.state.items.push({
           type: "assistant",
           text: chunk,
           streaming: true,
+          _rev: 0,
         });
       }
       this.scheduleRender();
@@ -682,8 +695,9 @@ export class LucidApp {
       const entries = Array.isArray(update.entries) ? update.entries : [];
       if (this.activePlanItem && this.state.items.includes(this.activePlanItem)) {
         this.activePlanItem.entries = entries;
+        this.activePlanItem._rev = (this.activePlanItem._rev || 0) + 1;
       } else {
-        this.activePlanItem = { type: "plan", entries };
+        this.activePlanItem = { type: "plan", entries, _rev: 0 };
         this.state.items.push(this.activePlanItem);
       }
       this.scheduleRender();
@@ -707,10 +721,13 @@ export class LucidApp {
         outputText: "",
         outputPreview: "",
         rawInputSummary: "",
+        _rev: 0,
       };
       this.toolMap.set(id, item);
       this.state.items.push(item);
     }
+
+    item._rev = (item._rev || 0) + 1;
 
     if (update.title) item.title = update.title;
     if (update.name) item.name = update.name;
@@ -780,6 +797,7 @@ export class LucidApp {
       if (item.type === "thought" && item.streaming) {
         item.streaming = false;
         item.durationMs = Date.now() - item.startedAt;
+        item._rev = (item._rev || 0) + 1;
       }
     }
   }
@@ -789,6 +807,7 @@ export class LucidApp {
       const item = this.state.items[i];
       if (item.type === "assistant" && item.streaming) {
         item.streaming = false;
+        item._rev = (item._rev || 0) + 1;
       }
     }
   }
@@ -877,7 +896,7 @@ export class LucidApp {
       if (this.modal && this.modal.type === "picker") {
         this.modal.filter = (this.modal.filter || "") + event.text.replace(/\n/g, " ");
         this.refreshPickerFilter();
-        this.scheduleRender();
+        this.scheduleRender(true);
         return;
       }
       if (!this.modal) {
@@ -888,12 +907,12 @@ export class LucidApp {
         if (droppedImg) {
           this.state.stagedImages.push(droppedImg);
           this.showToast(`Attached image: ${droppedImg.label} (${formatBytes(droppedImg.sizeBytes)})`);
-          this.scheduleRender();
+          this.scheduleRender(true);
           return;
         }
         this.state.composer.insert(event.text);
         this.updatePopupState();
-        this.scheduleRender();
+        this.scheduleRender(true);
       }
       return;
     }
@@ -912,7 +931,7 @@ export class LucidApp {
       this.state.composer.insert(event.text);
       this.dismissedPopupKey = null;
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
 
@@ -927,10 +946,10 @@ export class LucidApp {
         const maxScroll = this.modal.maxScroll || 0;
         if (event.action === "wheelUp") {
           this.modal.scrollOffset = Math.max(0, (this.modal.scrollOffset || 0) - 3);
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.action === "wheelDown") {
           this.modal.scrollOffset = Math.min(maxScroll, (this.modal.scrollOffset || 0) + 3);
-          this.scheduleRender();
+          this.scheduleRender(true);
         }
         return;
       }
@@ -939,10 +958,10 @@ export class LucidApp {
         if (count > 0) {
           if (event.action === "wheelUp") {
             this.modal.selected = Math.max(0, this.modal.selected - 1);
-            this.scheduleRender();
+            this.scheduleRender(true);
           } else if (event.action === "wheelDown") {
             this.modal.selected = Math.min(count - 1, this.modal.selected + 1);
-            this.scheduleRender();
+            this.scheduleRender(true);
           }
         }
       }
@@ -953,10 +972,10 @@ export class LucidApp {
       const maxScroll = this.boardState.maxDetailScroll || 0;
       if (event.action === "wheelUp") {
         this.boardState.scrollOffset = Math.max(0, this.boardState.scrollOffset - 3);
-        this.scheduleRender();
+        this.scheduleRender(true);
       } else if (event.action === "wheelDown") {
         this.boardState.scrollOffset = Math.min(maxScroll, this.boardState.scrollOffset + 3);
-        this.scheduleRender();
+        this.scheduleRender(true);
       }
       return;
     }
@@ -972,7 +991,7 @@ export class LucidApp {
     const next = Math.max(0, Math.min(this.state.maxScrollOffset, this.state.scrollOffset + deltaLines));
     if (next !== this.state.scrollOffset) {
       this.state.scrollOffset = next;
-      this.scheduleRender();
+      this.scheduleRender(true);
     }
   }
 
@@ -980,7 +999,7 @@ export class LucidApp {
     if (this.modal.type === "help") {
       if (event.type === "key" && (event.name === "escape" || event.name === "enter" || (event.ctrl && event.name === "c"))) {
         this.modal = null;
-        this.scheduleRender();
+        this.scheduleRender(true);
       }
       return;
     }
@@ -990,19 +1009,19 @@ export class LucidApp {
         const maxScroll = this.modal.maxScroll || 0;
         if (event.name === "escape" || (event.ctrl && event.name === "c")) {
           this.modal = null;
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "up") {
           this.modal.scrollOffset = Math.max(0, (this.modal.scrollOffset || 0) - 1);
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "down") {
           this.modal.scrollOffset = Math.min(maxScroll, (this.modal.scrollOffset || 0) + 1);
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "pageup") {
           this.modal.scrollOffset = Math.max(0, (this.modal.scrollOffset || 0) - 10);
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "pagedown") {
           this.modal.scrollOffset = Math.min(maxScroll, (this.modal.scrollOffset || 0) + 10);
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.ctrl && event.name === "y") {
           copyToClipboardOsc52(this.modal.content || "", process.stdout);
           this.showToast(`Copied artifact (${(this.modal.content || "").length} chars)`);
@@ -1012,11 +1031,16 @@ export class LucidApp {
     }
 
     if (this.modal.type === "permission") {
-      if (event.type === "text" && /^[1-9]$/.test(event.text)) {
-        const idx = Number.parseInt(event.text, 10) - 1;
-        const options = Array.isArray(this.modal.params?.options) ? this.modal.params.options : [];
-        if (idx < options.length) {
-          this.resolveActivePermission(idx);
+      if (event.type === "text") {
+        if (/^[1-9]$/.test(event.text)) {
+          const idx = Number.parseInt(event.text, 10) - 1;
+          const options = Array.isArray(this.modal.params?.options) ? this.modal.params.options : [];
+          if (idx < options.length) {
+            this.resolveActivePermission(idx);
+          }
+        } else {
+          this.showToast("Permission dialog active — press 1-9 / Enter to choose, or Esc to deny", "error", 3200);
+          this.scheduleRender(true);
         }
         return;
       }
@@ -1026,10 +1050,10 @@ export class LucidApp {
           this.resolveActivePermission(null);
         } else if (event.name === "up" && options.length > 0) {
           this.modal.selected = (this.modal.selected - 1 + options.length) % options.length;
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "down" && options.length > 0) {
           this.modal.selected = (this.modal.selected + 1) % options.length;
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "enter" && options.length > 0) {
           this.resolveActivePermission(this.modal.selected);
         }
@@ -1041,7 +1065,7 @@ export class LucidApp {
       if (event.type === "text") {
         this.modal.filter = (this.modal.filter || "") + event.text;
         this.refreshPickerFilter();
-        this.scheduleRender();
+        this.scheduleRender(true);
         return;
       }
       if (event.type === "key") {
@@ -1049,7 +1073,7 @@ export class LucidApp {
         if (event.name === "escape" || (event.ctrl && event.name === "c")) {
           const onCancel = this.modal.onCancel;
           this.modal = null;
-          this.scheduleRender();
+          this.scheduleRender(true);
           if (onCancel) {
             Promise.resolve(onCancel()).catch((err) => {
               this.pushNotice("error", err.message);
@@ -1059,18 +1083,18 @@ export class LucidApp {
         } else if (event.name === "backspace") {
           this.modal.filter = (this.modal.filter || "").slice(0, -1);
           this.refreshPickerFilter();
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "up" && items.length > 0) {
           this.modal.selected = (this.modal.selected - 1 + items.length) % items.length;
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "down" && items.length > 0) {
           this.modal.selected = (this.modal.selected + 1) % items.length;
-          this.scheduleRender();
+          this.scheduleRender(true);
         } else if (event.name === "enter" && items.length > 0) {
           const chosen = items[this.modal.selected];
           const onSelect = this.modal.onSelect;
           this.modal = null;
-          this.scheduleRender();
+          this.scheduleRender(true);
           if (onSelect && chosen) {
             Promise.resolve(onSelect(chosen)).catch((err) => {
               this.pushNotice("error", err.message);
@@ -1125,7 +1149,7 @@ export class LucidApp {
       if (!this.state.composer.isEmpty()) {
         this.state.composer.clear();
         this.popup = null;
-        this.scheduleRender();
+        this.scheduleRender(true);
         return;
       }
       if (this.state.busy && this.state.sessionId) {
@@ -1149,7 +1173,7 @@ export class LucidApp {
       } else {
         this.state.composer.deleteForward();
         this.updatePopupState();
-        this.scheduleRender();
+        this.scheduleRender(true);
       }
       return;
     }
@@ -1159,14 +1183,13 @@ export class LucidApp {
       this.userConfig.expandTools = this.state.expandTools;
       saveUserConfig(this.userConfig);
       this.showToast(this.state.expandTools ? "Tool details: expanded" : "Tool details: compact");
+      this.scheduleRender(true);
       return;
     }
 
     if (key.ctrl && key.name === "t") {
-      this.state.showThoughts = !this.state.showThoughts;
-      this.userConfig.showThoughts = this.state.showThoughts;
-      saveUserConfig(this.userConfig);
-      this.showToast(this.state.showThoughts ? "Thoughts: expanded" : "Thoughts: collapsed");
+      const next = this.state.thoughtMode === "expanded" ? "fold" : "expanded";
+      this.setThoughtMode(next);
       return;
     }
 
@@ -1207,7 +1230,7 @@ export class LucidApp {
       if (this.popup) {
         this.dismissedPopupKey = this.popup.triggerKey;
         this.popup = null;
-        this.scheduleRender();
+        this.scheduleRender(true);
         return;
       }
       if (this.state.busy && this.state.sessionId) {
@@ -1217,7 +1240,7 @@ export class LucidApp {
       }
       if (this.state.scrollOffset > 0) {
         this.state.scrollOffset = 0;
-        this.scheduleRender();
+        this.scheduleRender(true);
       }
       return;
     }
@@ -1244,12 +1267,12 @@ export class LucidApp {
     if (this.popup && this.popup.items.length > 0) {
       if (key.name === "up") {
         this.popup.selected = (this.popup.selected - 1 + this.popup.items.length) % this.popup.items.length;
-        this.scheduleRender();
+        this.scheduleRender(true);
         return;
       }
       if (key.name === "down") {
         this.popup.selected = (this.popup.selected + 1) % this.popup.items.length;
-        this.scheduleRender();
+        this.scheduleRender(true);
         return;
       }
       if (key.name === "tab") {
@@ -1269,7 +1292,7 @@ export class LucidApp {
     ) {
       this.state.composer.insert("\n");
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
 
@@ -1278,10 +1301,19 @@ export class LucidApp {
       if (this.state.composer.text.endsWith("\\")) {
         this.state.composer.backspace();
         this.state.composer.insert("\n");
-        this.scheduleRender();
+        this.scheduleRender(true);
         return;
       }
       this.submitComposer();
+      return;
+    }
+
+    // Fallback space insertion when terminal encodes Space as key name
+    if (!key.ctrl && !key.alt && key.name === "space") {
+      this.state.composer.insert(" ");
+      this.dismissedPopupKey = null;
+      this.updatePopupState();
+      this.scheduleRender(true);
       return;
     }
 
@@ -1293,41 +1325,41 @@ export class LucidApp {
         this.state.composer.backspace();
       }
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.name === "delete") {
       this.state.composer.deleteForward();
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.ctrl && key.name === "w") {
       this.state.composer.deleteWordBackward();
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.ctrl && key.name === "u") {
       this.state.composer.killToLineStart();
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.ctrl && key.name === "k") {
       this.state.composer.killToLineEnd();
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.ctrl && key.name === "a") {
       this.state.composer.moveLineStart();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.ctrl && key.name === "e") {
       this.state.composer.moveLineEnd();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.name === "home") {
@@ -1336,7 +1368,7 @@ export class LucidApp {
       } else {
         this.state.composer.moveLineStart();
       }
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.name === "end") {
@@ -1345,7 +1377,7 @@ export class LucidApp {
       } else {
         this.state.composer.moveLineEnd();
       }
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.name === "left") {
@@ -1355,7 +1387,7 @@ export class LucidApp {
         this.state.composer.moveLeft();
       }
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.name === "right") {
@@ -1365,19 +1397,19 @@ export class LucidApp {
         this.state.composer.moveRight();
       }
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.name === "up") {
       this.state.composer.moveUpOrHistory(inputWidth);
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (key.name === "down") {
       this.state.composer.moveDownOrHistory(inputWidth);
       this.updatePopupState();
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
   }
@@ -1453,7 +1485,7 @@ export class LucidApp {
     if (kind === "file") {
       this.state.composer.replaceRange(trigger.startIdx, trigger.endIdx, item.value);
       this.popup = null;
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
 
@@ -1467,7 +1499,7 @@ export class LucidApp {
 
     this.state.composer.replaceRange(trigger.startIdx, trigger.endIdx, `${item.value} `);
     this.popup = null;
-    this.scheduleRender();
+    this.scheduleRender(true);
   }
 
   submitComposer() {
@@ -1506,13 +1538,13 @@ export class LucidApp {
     const entries = this.state.multiAgent.getRosterEntries();
     if (event.name === "escape" || (event.ctrl && event.name === "b") || (event.ctrl && event.name === "c")) {
       this.boardOpen = false;
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (event.name === "tab") {
       this.boardState.tab = this.boardState.tab === "board" ? "detail" : "board";
       this.boardState.scrollOffset = 0;
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (event.name === "up" && entries.length > 0) {
@@ -1520,7 +1552,7 @@ export class LucidApp {
       const sel = entries[this.boardState.selectedIdx];
       this.boardState.tab = sel?.kind === "board" ? "board" : "detail";
       this.boardState.scrollOffset = 0;
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (event.name === "down" && entries.length > 0) {
@@ -1528,17 +1560,17 @@ export class LucidApp {
       const sel = entries[this.boardState.selectedIdx];
       this.boardState.tab = sel?.kind === "board" ? "board" : "detail";
       this.boardState.scrollOffset = 0;
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (event.name === "pageup") {
       this.boardState.scrollOffset = Math.max(0, this.boardState.scrollOffset - 8);
-      this.scheduleRender();
+      this.scheduleRender(true);
       return;
     }
     if (event.name === "pagedown") {
       this.boardState.scrollOffset = Math.min(this.boardState.maxDetailScroll || 0, this.boardState.scrollOffset + 8);
-      this.scheduleRender();
+      this.scheduleRender(true);
     }
   }
 
@@ -1671,10 +1703,26 @@ export class LucidApp {
     }
 
     if (cmdName === "thoughts") {
-      this.state.showThoughts = !this.state.showThoughts;
-      this.userConfig.showThoughts = this.state.showThoughts;
-      saveUserConfig(this.userConfig);
-      this.showToast(this.state.showThoughts ? "Thoughts: expanded" : "Thoughts: collapsed");
+      const arg = (argText || "").trim().toLowerCase();
+      if (!arg) {
+        const next = this.state.thoughtMode === "expanded" ? "fold" : "expanded";
+        this.setThoughtMode(next);
+        return;
+      }
+      if (["show", "expand", "on"].includes(arg)) {
+        this.setThoughtMode("expanded");
+        return;
+      }
+      if (["fold", "collapse"].includes(arg)) {
+        this.setThoughtMode("fold");
+        return;
+      }
+      if (["hide", "off"].includes(arg)) {
+        this.setThoughtMode("hidden");
+        return;
+      }
+      this.pushNotice("warn", "Usage: /thoughts [fold|show|hide]");
+      this.scheduleRender(true);
       return;
     }
 
@@ -1966,12 +2014,37 @@ export class LucidApp {
     }
   }
 
-  scheduleRender() {
-    if (this.exiting || this.renderTimer) return;
+  setThoughtMode(nextMode) {
+    const mode = ["fold", "expanded", "hidden"].includes(nextMode) ? nextMode : "fold";
+    this.state.thoughtMode = mode;
+    this.state.showThoughts = mode === "expanded";
+    this.userConfig.thoughtMode = mode;
+    this.userConfig.showThoughts = this.state.showThoughts;
+    saveUserConfig(this.userConfig);
+    const label =
+      mode === "expanded"
+        ? "Thoughts: expanded"
+        : mode === "hidden"
+          ? "Thoughts: hidden"
+          : "Thoughts: folded";
+    this.showToast(label);
+    this.scheduleRender(true);
+  }
+
+  scheduleRender(priority = false) {
+    if (this.exiting) return;
+    if (this.renderTimer) {
+      if (!priority || this.renderPriority) return;
+      clearTimeout(this.renderTimer);
+      this.renderTimer = null;
+    }
+    this.renderPriority = Boolean(priority);
+    const delayMs = priority ? 8 : 33;
     this.renderTimer = setTimeout(() => {
       this.renderTimer = null;
+      this.renderPriority = false;
       this.renderNow();
-    }, 16);
+    }, delayMs);
   }
 
   buildScreenFrame(cols, rows) {
@@ -1994,7 +2067,10 @@ export class LucidApp {
       };
     }
 
-    const composerBlock = renderComposerBlock(this.state, cols, this.style);
+    const composerState = this.modal
+      ? { ...this.state, activeModalType: this.modal.type }
+      : this.state;
+    const composerBlock = renderComposerBlock(composerState, cols, this.style);
     const popupLines = this.modal ? [] : renderAutocompletePopup(this.popup, cols, this.style);
 
     const reservedBottom = composerBlock.lines.length + popupLines.length;

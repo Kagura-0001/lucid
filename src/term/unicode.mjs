@@ -1,4 +1,5 @@
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const PRINTABLE_ASCII_RE = /^[\x20-\x7e]*$/;
 
 // Matches CSI, OSC (ST or BEL terminated), and simple 2-byte ESC sequences.
 const ANSI_REGEX = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
@@ -122,6 +123,7 @@ export function stripAnsi(text) {
 
 export function splitGraphemes(text) {
   if (!text) return [];
+  if (PRINTABLE_ASCII_RE.test(text)) return text.split("");
   const result = [];
   for (const item of graphemeSegmenter.segment(text)) {
     result.push(item.segment);
@@ -174,7 +176,13 @@ export function graphemeWidth(grapheme) {
 
 export function displayWidth(text) {
   if (!text) return 0;
-  const plain = stripAnsi(text);
+  if (!text.includes("\x1b") && PRINTABLE_ASCII_RE.test(text)) {
+    return text.length;
+  }
+  const plain = text.includes("\x1b") ? stripAnsi(text) : text;
+  if (PRINTABLE_ASCII_RE.test(plain)) {
+    return plain.length;
+  }
   let width = 0;
   for (const item of graphemeSegmenter.segment(plain)) {
     width += graphemeWidth(item.segment);

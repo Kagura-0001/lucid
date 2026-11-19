@@ -53,6 +53,7 @@ export const DEFAULT_CONFIG = {
   theme: "transparent",
   agent: "agy",
   mouseCapture: true,
+  thoughtMode: "fold",
   showThoughts: false,
   expandTools: false,
   customAgents: {},
