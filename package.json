@@ -1,0 +1,45 @@
+{
+  "name": "lucid-acp",
+  "version": "0.1.0",
+  "description": "A transparent, flicker-free, zero-dependency terminal UI for Google Antigravity (agy acp) and any ACP coding agent",
+  "type": "module",
+  "license": "MIT",
+  "author": "Kagura-0001",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kagura-0001/lucid.git"
+  },
+  "homepage": "https://github.com/Kagura-0001/lucid#readme",
+  "bugs": {
+    "url": "https://github.com/Kagura-0001/lucid/issues"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "lucid": "./bin/lucid.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node ./bin/lucid.mjs",
+    "test": "node --test test/*.test.mjs",
+    "preview": "node ./test/render_preview.mjs",
+    "assets": "node ./scripts/generate-assets.mjs"
+  },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "antigravity",
+    "agy",
+    "tui",
+    "terminal",
+    "coding-agent",
+    "tmux"
+  ]
+}

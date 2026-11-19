@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 456" width="920" height="456" role="img" aria-label="Before and after transparent background comparison">
+  <!-- Left Card: Conventional TUI -->
+  <rect x="16" y="14" width="436" height="428" rx="12" fill="#1c253b" stroke="#4b3b4e" stroke-width="1.3" />
+  <path d="M 16 26 Q 16 14 28 14 L 440 14 Q 452 14 452 26 L 452 56 L 16 56 Z" fill="#161c2e" />
+  <line x1="16" y1="56" x2="452" y2="56" stroke="#354060" stroke-width="1" />
+  <rect x="32" y="24" width="188" height="22" rx="11" fill="#f7768e" fill-opacity="0.14" stroke="#f7768e" stroke-opacity="0.4" stroke-width="1" />
+  <text x="126" y="39" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#ff9db0">✗  Conventional TUI</text>
+  <text x="436" y="39" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b97ba">Opaque black/gray patches</text>
+  
+  <!-- Clashing opaque header strip -->
+  <rect x="30" y="69.0" width="406" height="22" rx="4" fill="#0d0f17" />
+  <text x="38" y="84.2" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" font-weight="700" fill="#d0d7de" xml:space="preserve"> agy-tui  api  Gemini 4  auto</text>
+
+  <!-- User bubble with dark opaque block -->
+  <rect x="30" y="119.4" width="406" height="24" rx="5" fill="#252936" />
+  <text x="38" y="138.2" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" fill="#e6edf3" xml:space="preserve">&gt; Raise keepAliveTimeout in @server.ts</text>
+
+  <!-- Opaque diff block -->
+  <rect x="30" y="159.0" width="406" height="72" rx="5" fill="#11131a" />
+  <rect x="36" y="178.8" width="394" height="17" rx="2" fill="#3a1920" />
+  <rect x="36" y="198.6" width="394" height="17" rx="2" fill="#173322" />
+  <text x="40" y="177.8" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" font-weight="700" fill="#9ece6a" xml:space="preserve">Edit server.ts</text>
+  <text x="40" y="197.6" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" fill="#ffa198" xml:space="preserve">- const timeout = 5000;</text>
+  <text x="40" y="217.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" fill="#7ee787" xml:space="preserve">+ const timeout = 65_000;</text>
+
+  <!-- Inline code with clashing gray pill boxes -->
+  <rect x="90" y="263.4" width="58" height="17" rx="3" fill="#2f3545" />
+  <rect x="176" y="263.4" width="74" height="17" rx="3" fill="#2f3545" />
+  <text x="34" y="282.2" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" fill="#c9d1d9" xml:space="preserve">Updated  timeout  in  server.ts :</text>
+
+  <!-- Opaque black code block -->
+  <rect x="30" y="299.4" width="406" height="46" rx="5" fill="#090b10" />
+  <text x="40" y="318.2" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681" xml:space="preserve">ts</text>
+  <text x="40" y="338.0" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" fill="#a5d6ff" xml:space="preserve">server.keepAliveTimeout = 65_000;</text>
+
+  <!-- Opaque dark input box -->
+  <rect x="30" y="369.6" width="406" height="34" rx="6" fill="#0f1119" stroke="#30363d" stroke-width="1" />
+  <text x="40" y="393.8" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" fill="#6e7681" xml:space="preserve">&gt; Message agent...</text>
+
+  <!-- Right Card: lucid -->
+  <rect x="468" y="14" width="436" height="428" rx="12" fill="#1c253b" stroke="#44628d" stroke-width="1.3" />
+  <path d="M 468 26 Q 468 14 480 14 L 892 14 Q 904 14 904 26 L 904 56 L 468 56 Z" fill="#161c2e" />
+  <line x1="468" y1="56" x2="904" y2="56" stroke="#354060" stroke-width="1" />
+  <rect x="484" y="24" width="214" height="22" rx="11" fill="#9ece6a" fill-opacity="0.14" stroke="#9ece6a" stroke-opacity="0.4" stroke-width="1" />
+  <text x="591" y="39" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#b9f27c">✓  lucid (Zero Opaque Bg)</text>
+  <text x="888" y="39" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b97ba">Native terminal canvas</text>
+  <text x="486.0" y="84.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> </tspan><tspan fill="#7aa2f7" font-weight="700">◆ lucid</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#565f89" fill-opacity="0.58">·</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#d8e0f5" font-weight="700">api</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#565f89" fill-opacity="0.58">·</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#7dcfff">Gemini 4</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#565f89" fill-opacity="0.58">·</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#9ece6a" font-weight="700">auto</tspan></text>
+  <text x="486.0" y="102.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#565f89" fill-opacity="0.58">────────────────────────────────────────────────────</tspan></text>
+  <text x="486.0" y="138.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> </tspan><tspan fill="#7aa2f7" font-weight="700">❯</tspan><tspan fill="#d8e0f5"> Raise keepAliveTimeout in @server.ts</tspan></text>
+  <text x="486.0" y="174.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> </tspan><tspan fill="#9ece6a">✓</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#d8e0f5" font-weight="700">Edit server.ts</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#737aa2" fill-opacity="0.58">[edit] · 0.2s</tspan></text>
+  <text x="486.0" y="192.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5">   </tspan><tspan fill="#565f89" fill-opacity="0.58">╭─</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#737aa2" fill-opacity="0.58">server.ts</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#9ece6a">+1</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#f7768e">-1</tspan></text>
+  <text x="486.0" y="210.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5">   </tspan><tspan fill="#565f89" fill-opacity="0.58">│</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#737aa2" fill-opacity="0.58">   1</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#f7768e">- const timeout = 5000;</tspan></text>
+  <text x="486.0" y="228.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5">   </tspan><tspan fill="#565f89" fill-opacity="0.58">│</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#737aa2" fill-opacity="0.58">   1</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#9ece6a">+ const timeout = 65_000;</tspan></text>
+  <text x="486.0" y="246.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5">   </tspan><tspan fill="#565f89" fill-opacity="0.58">╰─</tspan></text>
+  <text x="486.0" y="282.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> Updated </tspan><tspan fill="#e0af68">timeout</tspan><tspan fill="#d8e0f5"> in </tspan><tspan fill="#e0af68">server.ts</tspan><tspan fill="#d8e0f5">:</tspan></text>
+  <text x="486.0" y="318.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> </tspan><tspan fill="#565f89" fill-opacity="0.58">╭─</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#737aa2" fill-opacity="0.58">ts</tspan></text>
+  <text x="486.0" y="336.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> </tspan><tspan fill="#565f89" fill-opacity="0.58">│</tspan><tspan fill="#d8e0f5"> server.keepAliveTimeout = </tspan><tspan fill="#ff9e64">65</tspan><tspan fill="#d8e0f5">_000;</tspan></text>
+  <text x="486.0" y="354.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> </tspan><tspan fill="#565f89" fill-opacity="0.58">╰─</tspan></text>
+  <text x="486.0" y="390.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#565f89" fill-opacity="0.58">────────────────────────────────────────────────────</tspan></text>
+  <text x="486.0" y="408.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#d8e0f5"> </tspan><tspan fill="#7aa2f7" font-weight="700">❯</tspan><tspan fill="#d8e0f5"> </tspan><tspan fill="#737aa2" fill-opacity="0.58">Message agent... (/help)</tspan></text>
+  <text x="486.0" y="426.4" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.8" xml:space="preserve"><tspan fill="#565f89" fill-opacity="0.58">────────────────────────────────────────────────────</tspan></text>
+</svg>

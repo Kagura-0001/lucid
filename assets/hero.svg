@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 272" width="920" height="272" role="img" aria-label="lucid hero banner">
+  <defs>
+    <linearGradient id="hero-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d121d" />
+      <stop offset="55%" stop-color="#131b2c" />
+      <stop offset="100%" stop-color="#171d32" />
+    </linearGradient>
+    <linearGradient id="hero-border" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#7dcfff" stop-opacity="0.45" />
+      <stop offset="50%" stop-color="#7aa2f7" stop-opacity="0.32" />
+      <stop offset="100%" stop-color="#bb9af7" stop-opacity="0.45" />
+    </linearGradient>
+    <radialGradient id="orb-cyan" cx="14%" cy="32%" r="44%">
+      <stop offset="0%" stop-color="#7dcfff" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#7dcfff" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="orb-violet" cx="86%" cy="74%" r="46%">
+      <stop offset="0%" stop-color="#bb9af7" stop-opacity="0.18" />
+      <stop offset="100%" stop-color="#bb9af7" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="gem-top" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a4e4ff" />
+      <stop offset="100%" stop-color="#7aa2f7" />
+    </linearGradient>
+    <linearGradient id="gem-bot" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7aa2f7" />
+      <stop offset="100%" stop-color="#bb9af7" />
+    </linearGradient>
+    <linearGradient id="wordmark-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#f4f8ff" />
+      <stop offset="65%" stop-color="#dbeafe" />
+      <stop offset="100%" stop-color="#a5f3fc" />
+    </linearGradient>
+  </defs>
+
+  <rect x="6" y="6" width="908" height="260" rx="18" fill="url(#hero-bg)" stroke="url(#hero-border)" stroke-width="1.4" />
+  <rect x="6" y="6" width="908" height="260" rx="18" fill="url(#orb-cyan)" />
+  <rect x="6" y="6" width="908" height="260" rx="18" fill="url(#orb-violet)" />
+
+  <!-- Subtle architectural grid lines -->
+  <line x1="6" y1="68" x2="914" y2="68" stroke="#7aa2f7" stroke-opacity="0.06" stroke-width="1" />
+  <line x1="6" y1="226" x2="914" y2="226" stroke="#7aa2f7" stroke-opacity="0.06" stroke-width="1" />
+  <line x1="164" y1="6" x2="164" y2="266" stroke="#7aa2f7" stroke-opacity="0.06" stroke-width="1" />
+
+  <!-- Crystal diamond prism emblem -->
+  <g transform="translate(54, 72)">
+    <rect x="-10" y="-10" width="102" height="102" rx="22" fill="#7aa2f7" fill-opacity="0.08" stroke="#7dcfff" stroke-opacity="0.24" stroke-width="1.1" />
+    <polygon points="41,6 74,41 41,41" fill="url(#gem-top)" fill-opacity="0.92" />
+    <polygon points="41,6 8,41 41,41" fill="#7dcfff" fill-opacity="0.72" />
+    <polygon points="41,76 74,41 41,41" fill="url(#gem-bot)" fill-opacity="0.86" />
+    <polygon points="41,76 8,41 41,41" fill="#7aa2f7" fill-opacity="0.58" />
+    <polygon points="41,17 61,41 41,65 21,41" fill="#ffffff" fill-opacity="0.16" stroke="#e0f2fe" stroke-opacity="0.55" stroke-width="1" />
+  </g>
+
+  <!-- Title & Tagline -->
+  <text x="188" y="114" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="52" font-weight="800" letter-spacing="-1.2" fill="url(#wordmark-grad)">lucid</text>
+  <rect x="318" y="84" width="66" height="24" rx="12" fill="#7dcfff" fill-opacity="0.12" stroke="#7dcfff" stroke-opacity="0.35" stroke-width="1" />
+  <text x="351" y="100" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#7dcfff">v0.1.0</text>
+
+  <text x="188" y="150" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18.5" font-weight="500" fill="#b7c3e3">Transparent, flicker-free terminal UI for Antigravity &amp; ACP coding agents</text>
+  
+    <rect x="188" y="182" width="162.8" height="28" rx="14" fill="#7dcfff" fill-opacity="0.10" stroke="#7dcfff" stroke-opacity="0.34" stroke-width="1" />
+    <circle cx="202.0" cy="196" r="3" fill="#7dcfff" />
+    <text x="211.0" y="200.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#dce4f8">Zero Opaque Blocks</text>
+    <rect x="360.79999999999995" y="182" width="155.2" height="28" rx="14" fill="#9ece6a" fill-opacity="0.10" stroke="#9ece6a" stroke-opacity="0.34" stroke-width="1" />
+    <circle cx="374.8" cy="196" r="3" fill="#9ece6a" />
+    <text x="383.8" y="200.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#dce4f8">Zero Dependencies</text>
+    <rect x="526" y="182" width="155.2" height="28" rx="14" fill="#7aa2f7" fill-opacity="0.10" stroke="#7aa2f7" stroke-opacity="0.34" stroke-width="1" />
+    <circle cx="540.0" cy="196" r="3" fill="#7aa2f7" />
+    <text x="549.0" y="200.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#dce4f8">SSH + tmux Native</text>
+    <rect x="691.2" y="182" width="124.8" height="28" rx="14" fill="#bb9af7" fill-opacity="0.10" stroke="#bb9af7" stroke-opacity="0.34" stroke-width="1" />
+    <circle cx="705.2" cy="196" r="3" fill="#bb9af7" />
+    <text x="714.2" y="200.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#dce4f8">Universal ACP</text>
+
+  <!-- Bottom subtle CLI snippet -->
+  <text x="188" y="246" font-family="ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="11.5" fill="#7c8bb5" xml:space="preserve">$ lucid --theme tokyo-night    # fresh session    |    $ lucid -r    # resume session</text>
+</svg>
