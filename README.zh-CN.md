@@ -174,6 +174,7 @@ flowchart LR
 | `Ctrl+B` / `/board` | 打开/关闭 Swarm 与 Subagent 多栏看板 |
 | `Ctrl+O` / `/expand` | 切换工具输出与 Diff 展开/折叠 |
 | `Ctrl+T` / `/thoughts` | 切换思考过程（Thought）完整显示/折叠 |
+| 鼠标拖拽 | 在对话区选中文字，松开即通过 OSC 52 复制；有选区时 `Ctrl+C` 再复制一次，`Esc` 取消选区 |
 | `Ctrl+Y` / `/copy` | 通过 OSC 52 复制最新一条助手回复到本地剪贴板 |
 | `Ctrl+G` / `/mouse` | 切换鼠标滚轮捕获（关闭后即可使用终端原生拖拽复制） |
 | `Ctrl+V` / `/image <path>` / `/paste-image` | 附带剪贴板或本地图片（支持 `@img.png` 与路径拖放；`/unattach` 清空） |

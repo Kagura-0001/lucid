@@ -128,6 +128,7 @@ export function renderWelcome(state, cols, style) {
   lines.push(`  ${style.accent("/model")}      ${style.muted("Switch model")}    ${style.accent("/effort")}  ${style.muted("Adjust thinking level")}`);
   lines.push(`  ${style.accent("/theme")}      ${style.muted("Switch palette")}  ${style.accent("@file")}    ${style.muted("Attach workspace file")}`);
   lines.push(`  ${style.accent("Ctrl+Y")}      ${style.muted("Copy last reply (SSH/tmux OSC 52)")}`);
+  lines.push(`  ${style.accent("Drag")}        ${style.muted("Select text & copy (OSC 52); Ctrl+C copies again, Esc clears")}`);
   lines.push(`  ${style.accent("Ctrl+G")}      ${style.muted("Toggle mouse capture for native drag-select")}`);
   lines.push("");
   return lines;
@@ -148,11 +149,21 @@ function renderToolItem(item, maxWidth, style, state) {
     icon = style.warn(spinner);
   }
 
-  const title = item.title || item.name || item.kind || "Tool";
+  const fullTitle = String(item.title || item.name || item.kind || "Tool");
+  // Multi-line commands (heredocs, scripts) are summarized as their first line in
+  // the one-row header; the full command is in the expanded details (Ctrl+O).
+  const titleLines = fullTitle
+    .replace(/\t/g, "    ")
+    .split(/\r\n|\r|\n/)
+    .filter((line) => line.trim() !== "");
+  const title = titleLines.length > 0 ? titleLines[0] : "Tool";
+  const hiddenLineCount = Math.max(0, titleLines.length - 1);
+  const moreLinesTag = hiddenLineCount > 0 ? style.muted(` (+${hiddenLineCount} lines)`) : "";
   const kindTag = item.kind ? style.muted(` [${item.kind}]`) : "";
   const durTag = item.durationMs ? style.muted(` · ${formatDuration(item.durationMs)}`) : "";
 
-  const headerText = `${icon} ${style.bold(truncateAnsi(title, Math.max(20, maxWidth - 20), "…"))}${kindTag}${durTag}`;
+  const titleWidth = Math.max(20, maxWidth - 20 - (hiddenLineCount > 0 ? 14 : 0));
+  const headerText = `${icon} ${style.bold(truncateAnsi(title, titleWidth, "…"))}${moreLinesTag}${kindTag}${durTag}`;
   lines.push(`  ${headerText}`);
 
   // Render diff blocks cleanly even in compact mode (with sensible cap)
@@ -730,6 +741,7 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
       ["Shift+Tab", "Cycle execution mode (default / accept-edits / auto / plan)"],
       ["Ctrl+B / /board", "Toggle Swarm & Subagent multi-pane board"],
       ["Ctrl+O  /  Ctrl+T", "Toggle tool details  /  fold or expand thoughts (/thoughts)"],
+      ["Mouse drag", "Select timeline text, copied on release (Ctrl+C copies again, Esc clears)"],
       ["Ctrl+Y  /  Ctrl+G", "Copy latest reply (OSC 52)  /  toggle mouse capture"],
       ["Ctrl+V  /  /image", "Attach clipboard image or image file (also @img.png / drag path)"],
       ["PgUp / PgDn / Wheel", "Scroll conversation history"],

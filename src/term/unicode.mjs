@@ -1,8 +1,83 @@
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const PRINTABLE_ASCII_RE = /^[\x20-\x7e]*$/;
 
-// Matches CSI, OSC (ST or BEL terminated), and simple 2-byte ESC sequences.
-const ANSI_REGEX = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+// Matches CSI (any parameter bytes 0x30-0x3F, e.g. "38:2:..." or ">1"), OSC
+// (ST or BEL terminated), and simple 2-byte ESC sequences.
+const ANSI_SOURCE = "\\x1b(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|[@-Z\\\\-_])";
+const ANSI_REGEX = new RegExp(ANSI_SOURCE, "g");
+// Sticky variant: only matches exactly at lastIndex, never scans forward.
+const ANSI_AT_INDEX_REGEX = new RegExp(ANSI_SOURCE, "y");
+
+const SGR_SEQUENCE_RE = /^\x1b\[[0-9;:]*m$/;
+const OSC8_PREFIX = "\x1b]8;";
+// C0 controls (incl. ESC, TAB, LF, CR), DEL and C1 controls.
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f]/;
+const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f]/g;
+const LINE_BREAK_MARKER = " ⏎ ";
+const TAB_REPLACEMENT = "    ";
+
+// Intl.Segmenter iteration is quadratic on long strings in Node 20
+// (30k chars ≈ 280 ms). Long non-ASCII runs are therefore segmented in
+// bounded pieces, cut only where a new grapheme is guaranteed to start.
+const SEGMENT_PIECE_LENGTH = 256;
+const SEGMENT_PIECE_SEARCH_LIMIT = SEGMENT_PIECE_LENGTH * 16;
+
+/**
+ * Returns the ANSI escape sequence starting exactly at `index`, or null.
+ */
+function matchAnsiAt(text, index) {
+  ANSI_AT_INDEX_REGEX.lastIndex = index;
+  const match = ANSI_AT_INDEX_REGEX.exec(text);
+  return match ? match[0] : null;
+}
+
+function isPrintableAsciiCode(code) {
+  return code >= 0x20 && code <= 0x7e;
+}
+
+/**
+ * Code points that never join the preceding grapheme cluster: CJK ideographs,
+ * CJK symbols/punctuation (minus the combining tone marks) and fullwidth forms.
+ */
+function isSafeGraphemeStart(code) {
+  if (code >= 0x4e00 && code <= 0x9fff) return true;
+  if (code >= 0x3400 && code <= 0x4dbf) return true;
+  if (code >= 0x3000 && code <= 0x303f) {
+    const isCombiningToneMark = code >= 0x302a && code <= 0x302f;
+    return !isCombiningToneMark;
+  }
+  if (code >= 0xff01 && code <= 0xff60) return true;
+  return false;
+}
+
+function pushSegmentedGraphemes(text, out) {
+  for (const item of graphemeSegmenter.segment(text)) {
+    out.push(item.segment);
+  }
+}
+
+/**
+ * Segments a run without printable ASCII, splitting long runs into pieces so the
+ * segmenter only ever sees short strings.
+ */
+function pushComplexRunGraphemes(run, out) {
+  let pieceStart = 0;
+  while (pieceStart < run.length) {
+    let pieceEnd = run.length;
+    if (run.length - pieceStart > SEGMENT_PIECE_LENGTH) {
+      pieceEnd = run.length;
+      const searchEnd = Math.min(run.length, pieceStart + SEGMENT_PIECE_SEARCH_LIMIT);
+      for (let pos = pieceStart + SEGMENT_PIECE_LENGTH; pos < searchEnd; pos += 1) {
+        if (isSafeGraphemeStart(run.charCodeAt(pos))) {
+          pieceEnd = pos;
+          break;
+        }
+      }
+    }
+    pushSegmentedGraphemes(run.slice(pieceStart, pieceEnd), out);
+    pieceStart = pieceEnd;
+  }
+}
 
 // Fullwidth / East Asian Wide Unicode code point ranges (Unicode 15/16).
 const WIDE_RANGES = [
@@ -121,14 +196,95 @@ export function stripAnsi(text) {
   return text.replace(ANSI_REGEX, "");
 }
 
+/**
+ * Splits text into grapheme clusters in linear time.
+ *
+ * Printable ASCII characters always start a new grapheme, so ASCII runs are split
+ * per character and only the remaining runs go through Intl.Segmenter. The last
+ * ASCII character before a non-ASCII run is handed to the segmenter together with
+ * that run, because it may carry combining marks (e.g. "e\u0301").
+ */
 export function splitGraphemes(text) {
   if (!text) return [];
   if (PRINTABLE_ASCII_RE.test(text)) return text.split("");
+
   const result = [];
-  for (const item of graphemeSegmenter.segment(text)) {
-    result.push(item.segment);
+  const length = text.length;
+  let index = 0;
+  while (index < length) {
+    let asciiEnd = index;
+    while (asciiEnd < length && isPrintableAsciiCode(text.charCodeAt(asciiEnd))) {
+      asciiEnd += 1;
+    }
+
+    let complexStart = asciiEnd;
+    const asciiRunIsFollowedByComplex = asciiEnd < length && asciiEnd > index;
+    if (asciiRunIsFollowedByComplex) {
+      complexStart = asciiEnd - 1;
+    }
+    for (let k = index; k < complexStart; k += 1) {
+      result.push(text[k]);
+    }
+
+    let complexEnd = asciiEnd;
+    while (complexEnd < length && !isPrintableAsciiCode(text.charCodeAt(complexEnd))) {
+      complexEnd += 1;
+    }
+    if (complexEnd > complexStart) {
+      pushComplexRunGraphemes(text.slice(complexStart, complexEnd), result);
+    }
+    index = complexEnd;
   }
   return result;
+}
+
+/**
+ * Makes a single screen row safe to write to the terminal.
+ *
+ * Only SGR styling and OSC 8 hyperlinks are kept; every other escape sequence
+ * (cursor movement, erase, title, …) is dropped. Line breaks are shown as "⏎",
+ * tabs become four spaces, and remaining control characters are removed, so the
+ * terminal cursor can never leave the row it was positioned on.
+ */
+export function sanitizeTerminalRow(text) {
+  if (!text) return "";
+  if (!CONTROL_CHAR_RE.test(text)) return text;
+
+  let output = "";
+  let plainStart = 0;
+  CONTROL_CHAR_GLOBAL_RE.lastIndex = 0;
+  let match = CONTROL_CHAR_GLOBAL_RE.exec(text);
+  while (match) {
+    const index = match.index;
+    output += text.slice(plainStart, index);
+    const ch = text[index];
+    let consumed = 1;
+
+    if (ch === "\x1b") {
+      const sequence = matchAnsiAt(text, index);
+      if (sequence) {
+        const keepSequence = SGR_SEQUENCE_RE.test(sequence) || sequence.startsWith(OSC8_PREFIX);
+        if (keepSequence) {
+          output += sequence;
+        }
+        consumed = sequence.length;
+      }
+    } else if (ch === "\t") {
+      output += TAB_REPLACEMENT;
+    } else if (ch === "\r" || ch === "\n") {
+      const isCrLf = ch === "\r" && text[index + 1] === "\n";
+      if (isCrLf) {
+        consumed = 2;
+      }
+      output += LINE_BREAK_MARKER;
+    }
+
+    plainStart = index + consumed;
+    CONTROL_CHAR_GLOBAL_RE.lastIndex = plainStart;
+    match = CONTROL_CHAR_GLOBAL_RE.exec(text);
+  }
+  output += text.slice(plainStart);
+  return output;
 }
 
 export function graphemeWidth(grapheme) {
@@ -184,8 +340,8 @@ export function displayWidth(text) {
     return plain.length;
   }
   let width = 0;
-  for (const item of graphemeSegmenter.segment(plain)) {
-    width += graphemeWidth(item.segment);
+  for (const grapheme of splitGraphemes(plain)) {
+    width += graphemeWidth(grapheme);
   }
   return width;
 }
@@ -204,27 +360,26 @@ export function truncateAnsi(text, maxWidth, ellipsis = "") {
 
   while (index < text.length) {
     if (text[index] === "\x1b") {
-      ANSI_REGEX.lastIndex = index;
-      const match = ANSI_REGEX.exec(text);
-      if (match && match.index === index) {
-        output += match[0];
+      const sequence = matchAnsiAt(text, index);
+      if (sequence) {
+        output += sequence;
         hasAnsi = true;
-        index += match[0].length;
+        index += sequence.length;
         continue;
       }
     }
 
-    const nextEsc = text.indexOf("\x1b", index);
+    const nextEsc = text.indexOf("\x1b", index + 1);
     const chunk = nextEsc === -1 ? text.slice(index) : text.slice(index, nextEsc);
     index = nextEsc === -1 ? text.length : nextEsc;
 
-    for (const seg of graphemeSegmenter.segment(chunk)) {
-      const w = graphemeWidth(seg.segment);
+    for (const grapheme of splitGraphemes(chunk)) {
+      const w = graphemeWidth(grapheme);
       if (visible + w > targetWidth) {
         const suffix = ellipsis || "";
         return hasAnsi ? `${output}${suffix}\x1b[0m` : `${output}${suffix}`;
       }
-      output += seg.segment;
+      output += grapheme;
       visible += w;
     }
   }
@@ -248,6 +403,12 @@ export function padStartVisible(text, targetWidth, fillChar = " ") {
   return fillChar.repeat(targetWidth - current) + text;
 }
 
+const ASCII_WORD_CHAR_RE = /^[\x21-\x7e]$/;
+
+function isAsciiWordChar(ch) {
+  return ASCII_WORD_CHAR_RE.test(ch);
+}
+
 /**
  * Wraps a single ANSI-styled line to at most `maxWidth` columns,
  * preserving active SGR styling across wrapped lines and breaking cleanly
@@ -263,21 +424,20 @@ export function wrapAnsiLine(line, maxWidth) {
   let index = 0;
   while (index < line.length) {
     if (line[index] === "\x1b") {
-      ANSI_REGEX.lastIndex = index;
-      const match = ANSI_REGEX.exec(line);
-      if (match && match.index === index) {
-        tokens.push({ ansi: match[0] });
-        index += match[0].length;
+      const sequence = matchAnsiAt(line, index);
+      if (sequence) {
+        tokens.push({ ansi: sequence });
+        index += sequence.length;
         continue;
       }
     }
-    const nextEsc = line.indexOf("\x1b", index);
+    const nextEsc = line.indexOf("\x1b", index + 1);
     const chunk = nextEsc === -1 ? line.slice(index) : line.slice(index, nextEsc);
     index = nextEsc === -1 ? line.length : nextEsc;
-    for (const seg of graphemeSegmenter.segment(chunk)) {
+    for (const grapheme of splitGraphemes(chunk)) {
       tokens.push({
-        text: seg.segment,
-        width: graphemeWidth(seg.segment),
+        text: grapheme,
+        width: graphemeWidth(grapheme),
       });
     }
   }
@@ -321,7 +481,6 @@ export function wrapAnsiLine(line, maxWidth) {
     }
 
     // Collect an ASCII word run (letters/digits/punctuation without whitespace)
-    const isAsciiWordChar = (ch) => /^[\x21-\x7e]$/.test(ch);
     if (isAsciiWordChar(token.text)) {
       let j = i;
       let wordWidth = 0;
@@ -386,4 +545,87 @@ export function wrapAnsiText(text, maxWidth) {
     }
   }
   return out;
+}
+
+/**
+ * Returns the plain text shown in screen columns [fromCol, toCol) of a styled row.
+ * A wide grapheme is included when its first column falls inside the range.
+ */
+export function sliceVisibleColumns(text, fromCol, toCol) {
+  const plain = stripAnsi(sanitizeTerminalRow(text));
+  let column = 0;
+  let output = "";
+  for (const grapheme of splitGraphemes(plain)) {
+    if (column >= toCol) break;
+    if (column >= fromCol) {
+      output += grapheme;
+    }
+    column += graphemeWidth(grapheme);
+  }
+  return output;
+}
+
+const INVERSE_ON = "\x1b[7m";
+const INVERSE_OFF = "\x1b[27m";
+
+/**
+ * Highlights screen columns [fromCol, toCol) of a styled row with reverse video
+ * while keeping the row's own colors. Inverse is re-applied after every SGR
+ * sequence inside the range because a reset ("\x1b[0m") would cancel it.
+ */
+export function highlightVisibleColumns(text, fromCol, toCol) {
+  const row = sanitizeTerminalRow(text || "");
+  if (toCol <= fromCol) return row;
+
+  let output = "";
+  let column = 0;
+  let inverseActive = false;
+  let index = 0;
+
+  while (index < row.length) {
+    if (row[index] === "\x1b") {
+      const sequence = matchAnsiAt(row, index);
+      if (sequence) {
+        output += sequence;
+        index += sequence.length;
+        const isSgr = SGR_SEQUENCE_RE.test(sequence);
+        if (inverseActive && isSgr) {
+          output += INVERSE_ON;
+        }
+        continue;
+      }
+    }
+
+    const nextEsc = row.indexOf("\x1b", index + 1);
+    const chunk = nextEsc === -1 ? row.slice(index) : row.slice(index, nextEsc);
+    index = nextEsc === -1 ? row.length : nextEsc;
+
+    for (const grapheme of splitGraphemes(chunk)) {
+      const insideRange = column >= fromCol && column < toCol;
+      if (insideRange && !inverseActive) {
+        output += INVERSE_ON;
+        inverseActive = true;
+      } else if (!insideRange && inverseActive) {
+        output += INVERSE_OFF;
+        inverseActive = false;
+      }
+      output += grapheme;
+      column += graphemeWidth(grapheme);
+    }
+  }
+
+  // Selection extends past the end of the text (whole-line or empty-line selection):
+  // show one highlighted cell so the selected line stays visible.
+  const selectionReachesPastText = column < toCol && column >= fromCol;
+  if (selectionReachesPastText) {
+    if (!inverseActive) {
+      output += INVERSE_ON;
+      inverseActive = true;
+    }
+    output += " ";
+  }
+  if (inverseActive) {
+    output += INVERSE_OFF;
+  }
+  return output;
 }

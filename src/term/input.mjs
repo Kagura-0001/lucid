@@ -163,13 +163,20 @@ export class InputParser {
         const col = Number.parseInt(mouseMatch[2], 10);
         const row = Number.parseInt(mouseMatch[3], 10);
         const pressed = mouseMatch[4] === "M";
+        // Strip modifier bits (4 = Shift, 8 = Meta, 16 = Ctrl); 32 marks motion.
+        const baseButton = button & ~(4 | 8 | 16);
+        const MOTION_BIT = 32;
 
-        if (button === 64) {
+        if (baseButton === 64) {
           this.emit({ type: "mouse", action: "wheelUp", col, row });
-        } else if (button === 65) {
+        } else if (baseButton === 65) {
           this.emit({ type: "mouse", action: "wheelDown", col, row });
-        } else if (pressed && (button & 3) === 0 && (button & 32) === 0) {
+        } else if (baseButton === MOTION_BIT) {
+          this.emit({ type: "mouse", action: "leftDrag", col, row });
+        } else if (baseButton === 0 && pressed) {
           this.emit({ type: "mouse", action: "leftDown", col, row });
+        } else if (baseButton === 0 && !pressed) {
+          this.emit({ type: "mouse", action: "leftUp", col, row });
         }
         return mouseMatch[0].length;
       }

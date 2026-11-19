@@ -13,6 +13,12 @@ import {
   tryLoadDroppedImage,
   tryReadClipboardImage,
 } from "./ui/files.mjs";
+import {
+  createSelection,
+  extractSelectionText,
+  highlightSelectionInViewport,
+  isSelectionEmpty,
+} from "./ui/selection.mjs";
 import { MultiAgentTracker, renderSwarmBoardView } from "./ui/swarm.mjs";
 import { createThemeStyler, listThemes } from "./ui/themes.mjs";
 import {
@@ -171,6 +177,11 @@ export class LucidApp {
     this.dismissedPopupKey = null;
     this.boardOpen = false;
     this.boardState = { selectedIdx: 0, tab: "board", scrollOffset: 0, maxDetailScroll: 0 };
+
+    // Mouse selection over the timeline (see ui/selection.mjs) and the layout of the
+    // last rendered frame, used to map screen rows to timeline lines.
+    this.selection = null;
+    this.timelineLayout = null;
 
     this.renderTimer = null;
     this.renderPriority = false;
@@ -984,7 +995,88 @@ export class LucidApp {
       this.scrollBy(3);
     } else if (event.action === "wheelDown") {
       this.scrollBy(-3);
+    } else if (event.action === "leftDown" || event.action === "leftDrag" || event.action === "leftUp") {
+      this.handleSelectionMouse(event);
     }
+  }
+
+  /**
+   * Maps a 1-based screen row to a timeline line index. Rows above or below the
+   * timeline viewport are clamped to its first/last row when `clamp` is set.
+   */
+  screenRowToTimelineLine(screenRow, clamp) {
+    const layout = this.timelineLayout;
+    if (!layout) return null;
+    let viewportRow = screenRow - 1 - layout.topRow;
+    const outside = viewportRow < 0 || viewportRow >= layout.height;
+    if (outside && !clamp) return null;
+    viewportRow = Math.max(0, Math.min(layout.height - 1, viewportRow));
+    return layout.firstLineIndex + viewportRow;
+  }
+
+  handleSelectionMouse(event) {
+    const col = Math.max(0, event.col - 1);
+
+    if (event.action === "leftDown") {
+      const line = this.screenRowToTimelineLine(event.row, false);
+      this.selection = line === null ? null : createSelection(line, col);
+      this.scheduleRender(true);
+      return;
+    }
+
+    if (!this.selection || !this.selection.dragging) return;
+
+    if (event.action === "leftDrag") {
+      // Dragging past the top or bottom edge scrolls the timeline one line at a time.
+      const layout = this.timelineLayout;
+      if (layout) {
+        const viewportRow = event.row - 1 - layout.topRow;
+        if (viewportRow < 0) {
+          this.scrollBy(1);
+        } else if (viewportRow >= layout.height) {
+          this.scrollBy(-1);
+        }
+      }
+      const line = this.screenRowToTimelineLine(event.row, true);
+      if (line !== null) {
+        this.selection.head = { line, col };
+      }
+      this.scheduleRender(true);
+      return;
+    }
+
+    // leftUp: finish the drag. A plain click (no movement) clears the selection;
+    // a real selection is copied right away, like terminal copy-on-select.
+    const line = this.screenRowToTimelineLine(event.row, true);
+    if (line !== null) {
+      this.selection.head = { line, col };
+    }
+    this.selection.dragging = false;
+    if (isSelectionEmpty(this.selection)) {
+      this.selection = null;
+    } else {
+      this.copySelection({ clearAfterCopy: false });
+    }
+    this.scheduleRender(true);
+  }
+
+  /**
+   * Copies the current mouse selection to the local clipboard via OSC 52.
+   * Returns true when something was copied.
+   */
+  copySelection({ clearAfterCopy }) {
+    const layout = this.timelineLayout;
+    if (!this.selection || !layout) return false;
+    const text = extractSelectionText(layout.lines, this.selection);
+    if (clearAfterCopy) {
+      this.selection = null;
+    }
+    if (!text) return false;
+    copyToClipboardOsc52(text, process.stdout);
+    const lineCount = text.split("\n").length;
+    this.showToast(`Copied ${text.length} chars (${lineCount} lines) via OSC 52`);
+    this.scheduleRender(true);
+    return true;
   }
 
   scrollBy(deltaLines) {
@@ -1143,6 +1235,18 @@ export class LucidApp {
   handleMainKey(key) {
     const { cols } = this.renderer.getSize();
     const inputWidth = Math.max(12, cols - 4);
+
+    // An active mouse selection takes priority: Ctrl+C copies it, Esc dismisses it.
+    if (this.selection && key.ctrl && key.name === "c") {
+      this.copySelection({ clearAfterCopy: true });
+      this.scheduleRender(true);
+      return;
+    }
+    if (this.selection && key.name === "escape") {
+      this.selection = null;
+      this.scheduleRender(true);
+      return;
+    }
 
     // Global shortcuts
     if (key.ctrl && key.name === "c") {
@@ -2050,6 +2154,8 @@ export class LucidApp {
   buildScreenFrame(cols, rows) {
     const headerLines = renderHeader(this.state, cols, this.style);
 
+    this.timelineLayout = null;
+
     if (this.boardOpen && !this.modal) {
       const boardHeight = Math.max(6, rows - headerLines.length);
       const renderedBoard = renderSwarmBoardView(
@@ -2089,6 +2195,16 @@ export class LucidApp {
 
     while (viewportRows.length < viewportHeight) {
       viewportRows.push("");
+    }
+
+    if (!this.modal) {
+      this.timelineLayout = {
+        topRow: headerLines.length,
+        height: viewportHeight,
+        firstLineIndex: startIdx,
+        lines: timelineLines,
+      };
+      viewportRows = highlightSelectionInViewport(viewportRows, startIdx, this.selection);
     }
 
     if (this.modal) {

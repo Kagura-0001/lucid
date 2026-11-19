@@ -174,6 +174,7 @@ flowchart LR
 | `Ctrl+B` / `/board` | Toggle Swarm & Subagent multi-pane board |
 | `Ctrl+O` / `/expand` | Toggle expanded vs compact tool outputs & diffs |
 | `Ctrl+T` / `/thoughts` | Toggle full thinking/reasoning blocks |
+| Mouse drag | Select timeline text; copied via OSC 52 on release. `Ctrl+C` copies the selection again, `Esc` clears it |
 | `Ctrl+Y` / `/copy` | Copy latest assistant reply to local clipboard via OSC 52 |
 | `Ctrl+G` / `/mouse` | Toggle mouse capture (OFF = native terminal drag-select) |
 | `Ctrl+V` / `/image <path>` / `/paste-image` | Attach clipboard image or image file (`@img.png` & drag-drop supported; `/unattach` clears) |
