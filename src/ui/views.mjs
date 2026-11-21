@@ -784,7 +784,8 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
       ["Ctrl+V  /  /image", "Attach clipboard image or image file (also @img.png / drag path)"],
       ["PgUp / PgDn / Wheel", "Scroll conversation history"],
       ["/model  /effort  /mode", "Switch model, thinking level, or mode"],
-      ["/resume  /new", "Resume session (/sessions) or start fresh"],
+      ["/resume  /new", "Resume live background / saved session or start fresh"],
+      ["/bg [prompt]", "Move session to background (survives SSH disconnect)"],
       ["/artifacts  /quota", "Preview session Markdown artifacts / check quota"],
       ["/theme  @path", "Switch transparent palette / attach workspace file"],
     ];

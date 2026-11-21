@@ -74,6 +74,8 @@ lucid                         # Start a fresh Antigravity session in cwd
 lucid -r                      # Open interactive session picker for cwd
 lucid -r <id-or-prefix>       # Resume a specific session by full ID or >=4-char prefix
 lucid -c                      # Continue the most recent conversation in cwd
+lucid bg "Run tests and fix"  # Run a task in the background without tmux
+lucid bg                      # List live background sessions (stop with: lucid bg stop <id|all>)
 lucid --theme tokyo-night     # Use Tokyo Night foreground accents (transparent bg)
 lucid --agent opencode        # Launch OpenCode ACP instead of agy
 lucid --cmd "gemini --experimental-acp"
@@ -220,7 +222,8 @@ flowchart LR
 | `Ctrl+L` | Force full screen repaint |
 | `PgUp` / `PgDn` / `Alt+↑` / `Alt+↓` / Wheel | Scroll conversation history |
 | `Ctrl+D` / `Ctrl+C` ×2 / `/quit` | Exit cleanly (`Ctrl+C` once clears composer or cancels turn) |
-| `/resume [id\|filter]` (`/sessions`) | Browse, filter, or directly resume a saved session |
+| `/resume [id\|filter]` (`/sessions`) | Browse, filter, or resume saved and live background sessions (live background sessions appear first) |
+| `/bg [prompt]` (`/detach`) | Move the current session to the background (also automatic on SSH disconnect); resume anytime via `/resume` or `lucid -r` |
 | `/new` | Start a fresh session |
 | `/model` · `/effort` · `/mode [name]` | Interactive pickers for model, thinking level, and mode (`/mode bypass` for session-level bypass) |
 | `/artifacts` | Browse & read session Markdown artifacts |

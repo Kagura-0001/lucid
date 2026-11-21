@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import { AgyStateWatcher, resolveAgyDataDir } from "./acp/agy_state.mjs";
+import { findLiveBgSession, listLiveBgSessions } from "./acp/bg_registry.mjs";
 import { AcpClient, fetchAgyQuota } from "./acp/client.mjs";
+import { HostAcpClient, spawnSessionHost } from "./acp/host_client.mjs";
 import { loadUserConfig, resolveAgentLaunch, saveUserConfig } from "./config.mjs";
 import { copyToClipboardOsc52, detectColorDepth } from "./term/ansi.mjs";
 import { InputParser } from "./term/input.mjs";
@@ -40,8 +42,9 @@ const LOCAL_COMMANDS = [
   { name: "model", description: "Switch active model", local: true },
   { name: "effort", description: "Switch thinking / reasoning level", local: true },
   { name: "mode", description: "Switch mode (default / accept-edits / auto / plan / bypass)", local: true },
-  { name: "resume", description: "Resume an existing conversation (/resume [id|filter])", local: true },
+  { name: "resume", description: "Resume a live background or saved conversation (/resume [id|filter])", local: true },
   { name: "sessions", description: "Browse & load existing conversations (alias of /resume)", local: true },
+  { name: "bg", description: "Move session to background (/bg [prompt]) — resume via /resume", local: true },
   { name: "new", description: "Start a fresh conversation session", local: true },
   { name: "board", description: "Open Swarm & Subagent multi-pane board (Ctrl+B)", local: true },
   { name: "artifacts", description: "Browse & read session Markdown artifacts", local: true },
@@ -220,6 +223,8 @@ export class LucidApp {
     this.spinnerTimer = null;
     this.lastCtrlCAt = 0;
     this.exiting = false;
+    this.exitNotice = "";
+    this.replayingSnapshot = false;
     this.startupOverridesApplied = false;
   }
 
@@ -327,12 +332,20 @@ export class LucidApp {
     this.onSignal = () => {
       this.shutdown(0);
     };
+    this.onSighup = () => {
+      // SSH disconnect or terminal close: detach hosted sessions so work keeps running.
+      if (this.acp?.isHosted && (this.state.busy || this.state.items.length > 0)) {
+        this.detachToBackground({ silent: true });
+      } else {
+        this.shutdown(0);
+      }
+    };
     this.onProcessExit = () => {
       this.restoreTerminalSync();
     };
     process.once("SIGINT", this.onSignal);
     process.once("SIGTERM", this.onSignal);
-    process.once("SIGHUP", this.onSignal);
+    process.once("SIGHUP", this.onSighup);
     process.on("exit", this.onProcessExit);
   }
 
@@ -345,38 +358,212 @@ export class LucidApp {
     this.renderer.leave({ sync: true });
   }
 
-  async connectAndStartSession() {
-    this.state.connecting = true;
-    this.scheduleRender();
-
-    this.acp = new AcpClient(this.launchSpec);
-
-    this.acp.on("sessionUpdate", (params) => {
+  bindAcpClient(client) {
+    client.on("sessionUpdate", (params) => {
+      if (client !== this.acp) return;
       this.handleSessionUpdate(params);
     });
 
-    this.acp.on("permissionRequest", (req) => {
+    client.on("permissionRequest", (req) => {
+      if (client !== this.acp) return;
       this.enqueuePermissionRequest(req);
     });
 
-    this.acp.on("disconnect", () => {
-      if (this.exiting) return;
+    client.on("promptDone", (info) => {
+      if (client !== this.acp) return;
+      if (info?.stopReason === "cancelled") {
+        this.pushNotice("info", "Turn cancelled.");
+      } else if (info?.error) {
+        this.pushNotice("error", info.error);
+      }
+      this.state.activePromptCount = typeof info?.activePromptCount === "number"
+        ? info.activePromptCount
+        : Math.max(0, this.state.activePromptCount - 1);
+      if (this.state.activePromptCount === 0) {
+        this.state.busy = false;
+        this.finalizeAllStreaming();
+      }
+      this.scheduleRender();
+    });
+
+    client.on("detached", (reason) => {
+      if (client !== this.acp || this.exiting) return;
+      this.exitNotice = reason ? `Detached: ${reason}` : "Detached from session host.";
+      this.shutdown(0, { detach: true });
+    });
+
+    client.on("disconnect", () => {
+      if (client !== this.acp || this.exiting) return;
       this.state.connected = false;
       this.state.busy = false;
       this.pushNotice("error", "ACP backend disconnected. Use /quit or restart lucid.");
       this.scheduleRender();
     });
+  }
+
+  applyHostSnapshot(snapshot) {
+    if (!snapshot) return;
+    const info = snapshot.agentInfo || snapshot.initResult?.agentInfo;
+    if (info?.name) {
+      this.state.agentLabel = info.version ? `${info.name} ${info.version}` : info.name;
+    }
+
+    this.state.items = [];
+    this.toolMap.clear();
+    this.state.multiAgent.reset();
+    this.state.stagedImages = [];
+    this.permissionQueue = [];
+    this.modal = null;
+    this.boardOpen = false;
+    this.activePlanItem = null;
+    this.state.scrollOffset = 0;
+
+    this.state.sessionId = snapshot.sessionId || "";
+    this.state.sessionTitle = snapshot.sessionTitle || "";
+    this.state.usage = snapshot.usage || null;
+    this.applySessionMetadata(snapshot.sessionMeta || {});
+    if (snapshot.modelLabel) this.state.modelLabel = snapshot.modelLabel;
+    if (snapshot.modeId) this.state.modeId = snapshot.modeId;
+    if (snapshot.bypassPermissions && !this.state.launchBypass) {
+      this.state.sessionBypass = true;
+      this.state.bypassPermissions = true;
+    }
+
+    // Replay buffered conversation events silently in one pass.
+    this.replayingSnapshot = true;
+    try {
+      for (const ev of snapshot.eventLog || []) {
+        if (ev.type === "userPrompt") {
+          this.finalizeAllStreaming();
+          this.state.items.push({
+            type: "user",
+            text: ev.text || "(image attachment)",
+            displayText: ev.displayText || undefined,
+            attachedPaths: ev.attachedPaths || [],
+            attachedImages: ev.attachedImages || [],
+          });
+        } else if (ev.type === "sessionUpdate") {
+          this.handleSessionUpdate(ev.params);
+        } else if (ev.type === "notice") {
+          this.pushNotice(ev.level || "info", ev.text || "");
+        }
+      }
+      if (!snapshot.busy) {
+        this.finalizeAllStreaming();
+      }
+    } finally {
+      this.replayingSnapshot = false;
+    }
+
+    this.state.busy = Boolean(snapshot.busy);
+    this.state.activePromptCount = snapshot.activePromptCount || (snapshot.busy ? 1 : 0);
+    this.state.turnStartedAt = snapshot.turnStartedAt || 0;
+
+    if (Array.isArray(snapshot.pendingPermissions) && this.acp?.makePermissionHandle) {
+      for (const perm of snapshot.pendingPermissions) {
+        this.enqueuePermissionRequest(this.acp.makePermissionHandle(perm.permId, perm.params));
+      }
+    }
+
+    if (this.state.sessionTitle) {
+      try {
+        process.stdout.write(`\x1b]0;lucid — ${this.state.sessionTitle}\x07`);
+      } catch {
+        // Ignore terminal title write errors
+      }
+    }
+    this.pollAgyState();
+    this.scheduleRender(true);
+  }
+
+  async attachToBgHost(bgMeta, { keepPreviousHost = false } = {}) {
+    const nextClient = new HostAcpClient({
+      hostId: bgMeta.hostId,
+      socketPath: bgMeta.socketPath,
+      launchSpec: this.launchSpec,
+    });
+    const prevClient = this.acp;
+    const prevSessionId = this.state.sessionId;
+    const prevHadWork = Boolean(this.state.busy || this.state.items.length > 0);
+
+    const snapshot = await nextClient.start(15000);
+    this.acp = nextClient;
+    this.bindAcpClient(nextClient);
+    this.state.connected = true;
+    this.applyHostSnapshot(snapshot);
+
+    if (prevClient && prevClient !== nextClient) {
+      if (keepPreviousHost && prevClient.isHosted && prevHadWork) {
+        await prevClient.detach();
+      } else {
+        await prevClient.stop(prevSessionId);
+      }
+    }
+
+    const statusTag = snapshot.busy ? "running" : "resumed";
+    this.showToast(`Attached to live session ${bgMeta.hostId} (${statusTag})`);
+    this.scheduleRender(true);
+  }
+
+  async startHostedOrDirectClient() {
+    if (!this.cliOptions.direct) {
+      try {
+        const spawned = spawnSessionHost({
+          cwd: this.cwd,
+          launchSpec: this.launchSpec,
+          addDirs: this.cliOptions.addDirs || [],
+          bypassPermissions: this.state.bypassPermissions,
+        });
+        const client = new HostAcpClient({
+          hostId: spawned.hostId,
+          socketPath: spawned.socketPath,
+          launchSpec: this.launchSpec,
+        });
+        this.acp = client;
+        this.bindAcpClient(client);
+        return await client.start(20000);
+      } catch {
+        // Fall back to direct child process if spawning/binding the host fails.
+      }
+    }
+    const direct = new AcpClient(this.launchSpec);
+    this.acp = direct;
+    this.bindAcpClient(direct);
+    return direct.start();
+  }
+
+  async connectAndStartSession() {
+    this.state.connecting = true;
+    this.scheduleRender();
 
     try {
-      const initResult = await this.acp.start();
-      const info = initResult?.agentInfo;
-      if (info?.name) {
-        this.state.agentLabel = info.version ? `${info.name} ${info.version}` : info.name;
+      // Check whether --session or --continue targets a live background session first.
+      let liveTarget = null;
+      if (!this.cliOptions.direct) {
+        if (this.cliOptions.session) {
+          liveTarget = findLiveBgSession(this.cliOptions.session);
+        } else if (this.cliOptions.continueLatest) {
+          const liveForCwd = listLiveBgSessions({ cwd: this.cwd });
+          if (liveForCwd.length > 0) {
+            liveTarget = liveForCwd[0];
+          }
+        }
       }
-      this.state.connected = true;
 
-      await this.openInitialSession();
-      await this.applyStartupOverrides();
+      if (liveTarget) {
+        await this.attachToBgHost(liveTarget);
+        this.startupOverridesApplied = true;
+      } else {
+        const initResult = await this.startHostedOrDirectClient();
+        const info = initResult?.agentInfo || initResult?.initResult?.agentInfo;
+        if (info?.name) {
+          this.state.agentLabel = info.version ? `${info.name} ${info.version}` : info.name;
+        }
+        this.state.connected = true;
+
+        await this.openInitialSession();
+        await this.applyStartupOverrides();
+      }
 
       this.state.connecting = false;
       this.scheduleRender();
@@ -512,8 +699,26 @@ export class LucidApp {
 
   async openResumePicker({ query = "", startup = false } = {}) {
     const q = (query || "").trim();
+    const liveBg = this.cliOptions.direct
+      ? []
+      : listLiveBgSessions({ cwd: this.cwd, excludeHostId: this.acp?.hostId || "" });
 
-    if (!this.acp.supportsSessionList()) {
+    // Direct match against a live background session ID or ACP session ID
+    if (q && liveBg.length > 0) {
+      const ql = q.toLowerCase();
+      const liveMatch =
+        liveBg.find((s) => s.hostId.toLowerCase() === ql || String(s.sessionId || "").toLowerCase() === ql) ||
+        (ql.length >= 3
+          ? liveBg.find((s) => s.hostId.toLowerCase().startsWith(ql) || String(s.sessionId || "").toLowerCase().startsWith(ql))
+          : null);
+      if (liveMatch) {
+        await this.attachToBgHost(liveMatch, { keepPreviousHost: !startup });
+        return;
+      }
+    }
+
+    const canListSaved = Boolean(this.acp && this.acp.supportsSessionList());
+    if (!canListSaved && liveBg.length === 0) {
       if (!startup && q && (this.acp.supportsSessionLoad() || this.acp.supportsSessionResume())) {
         await this.switchToSession(q, q);
         return;
@@ -530,8 +735,8 @@ export class LucidApp {
       if (!startup) {
         this.showToast("Loading sessions…");
       }
-      const sessions = await this.acp.listSessions(this.cwd);
-      if (sessions.length === 0) {
+      const sessions = canListSaved ? await this.acp.listSessions(this.cwd) : [];
+      if (sessions.length === 0 && liveBg.length === 0) {
         this.pushNotice("info", `No saved sessions found for ${this.cwd}.`);
         if (startup) {
           await this.createFreshSession();
@@ -540,7 +745,7 @@ export class LucidApp {
         return;
       }
 
-      if (q) {
+      if (q && sessions.length > 0) {
         const match = findSessionByIdOrPrefix(sessions, q);
         if (match) {
           await this.switchToSession(match.sessionId, match.title || match.sessionId.slice(0, 12));
@@ -551,16 +756,40 @@ export class LucidApp {
         }
       }
 
-      this.openPickerModal({
-        title: "Resume Conversation",
-        initialFilter: q,
-        items: sessions.map((s) => ({
+      const liveSessionIds = new Set(liveBg.map((s) => s.sessionId).filter(Boolean));
+      const formatBgTag = (status) => {
+        if (status === "waiting_permission") return "⚠ [bg permission]";
+        if (status === "running" || status === "starting") return "● [bg running]";
+        if (status === "done") return "✓ [bg done]";
+        return "◌ [bg idle]";
+      };
+
+      const liveItems = liveBg.map((s) => ({
+        label: `${formatBgTag(s.status)} ${s.title || s.hostId}`,
+        value: `bg:${s.hostId}`,
+        description: `${formatRelativeTime(new Date(s.updatedAt || s.startedAt).toISOString())} · ${s.hostId}`,
+        active: false,
+        bgMeta: s,
+      }));
+
+      const savedItems = sessions
+        .filter((s) => !liveSessionIds.has(s.sessionId))
+        .map((s) => ({
           label: s.title || s.sessionId.slice(0, 12),
           value: s.sessionId,
           description: `${formatRelativeTime(s.updatedAt)} · ${s.sessionId.slice(0, 8)}`,
           active: s.sessionId === this.state.sessionId,
-        })),
+        }));
+
+      this.openPickerModal({
+        title: liveItems.length > 0 ? "Resume Conversation (Live Background First)" : "Resume Conversation",
+        initialFilter: q,
+        items: [...liveItems, ...savedItems],
         onSelect: async (chosen) => {
+          if (chosen.bgMeta) {
+            await this.attachToBgHost(chosen.bgMeta, { keepPreviousHost: !startup });
+            return;
+          }
           await this.switchToSession(chosen.value, chosen.label);
           if (startup) {
             await this.applyStartupOverrides();
@@ -2013,7 +2242,7 @@ export class LucidApp {
   isLocalCommand(cmdName) {
     return (
       LOCAL_COMMANDS.some((c) => c.name === cmdName) ||
-      ["exit", "q", "thinking", "agents", "attach", "paste-image"].includes(cmdName)
+      ["exit", "q", "detach", "thinking", "agents", "attach", "paste-image"].includes(cmdName)
     );
   }
 
@@ -2082,6 +2311,11 @@ export class LucidApp {
   async runLocalCommand(cmdName, argText) {
     if (cmdName === "quit" || cmdName === "exit" || cmdName === "q") {
       await this.shutdown(0);
+      return;
+    }
+
+    if (cmdName === "bg" || cmdName === "detach") {
+      await this.detachToBackground({ promptText: argText });
       return;
     }
 
@@ -2428,6 +2662,9 @@ export class LucidApp {
   setSessionBypass(enabled) {
     this.state.sessionBypass = Boolean(enabled);
     this.state.bypassPermissions = this.state.launchBypass || this.state.sessionBypass;
+    if (this.acp && typeof this.acp.setBypassPermissions === "function") {
+      this.acp.setBypassPermissions(this.state.bypassPermissions);
+    }
   }
 
   async switchMode(targetId) {
@@ -2543,6 +2780,26 @@ export class LucidApp {
     }
     this.scheduleRender();
 
+    if (this.acp.isHosted) {
+      try {
+        await this.acp.sendPrompt(this.state.sessionId, blocks, {
+          text: text || "(image attachment)",
+          displayText: displayText || "",
+          attachedPaths,
+          attachedImages,
+        });
+      } catch (err) {
+        this.pushNotice("error", err.message || String(err));
+        this.state.activePromptCount = Math.max(0, this.state.activePromptCount - 1);
+        if (this.state.activePromptCount === 0) {
+          this.state.busy = false;
+          this.finalizeAllStreaming();
+        }
+        this.scheduleRender();
+      }
+      return;
+    }
+
     try {
       const result = await this.acp.sendPrompt(this.state.sessionId, blocks);
       if (result?.stopReason === "cancelled") {
@@ -2578,7 +2835,7 @@ export class LucidApp {
   }
 
   scheduleRender(priority = false) {
-    if (this.exiting) return;
+    if (this.exiting || this.replayingSnapshot) return;
     if (this.renderTimer) {
       if (!priority || this.renderPriority) return;
       clearTimeout(this.renderTimer);
@@ -2686,7 +2943,29 @@ export class LucidApp {
     this.renderer.render(frame.rows, frame.cursor);
   }
 
-  async shutdown(exitCode = 0) {
+  async detachToBackground({ silent = false, promptText = "" } = {}) {
+    if (!this.acp?.isHosted) {
+      if (!silent) {
+        this.showToast("Background detach is unavailable in --direct mode", "error");
+        this.scheduleRender(true);
+      }
+      return;
+    }
+    if (promptText && promptText.trim()) {
+      await this.sendUserPrompt(promptText.trim());
+    }
+    const hostId = this.acp.hostId || "";
+    const statusLabel = this.state.busy ? "running" : "idle";
+    if (!silent) {
+      this.exitNotice =
+        `Session moved to background (${hostId} · ${statusLabel}).\n` +
+        `Resume anytime: lucid -r ${hostId}  (or lucid -r)\n` +
+        `List / stop:    lucid bg  |  lucid bg stop ${hostId}`;
+    }
+    await this.shutdown(0, { detach: true });
+  }
+
+  async shutdown(exitCode = 0, { detach = false } = {}) {
     if (this.exiting) return;
     this.exiting = true;
 
@@ -2711,14 +2990,19 @@ export class LucidApp {
       this.agyStateTimer = null;
     }
 
-    // Cancel any pending permission requests
-    while (this.permissionQueue.length > 0) {
-      const req = this.permissionQueue.shift();
-      try {
-        req.cancel();
-      } catch {
-        // Ignore
+    // Cancel pending permission requests only on real shutdown; when detaching,
+    // keep them queued in the background host so re-attaching can approve them.
+    if (!detach) {
+      while (this.permissionQueue.length > 0) {
+        const req = this.permissionQueue.shift();
+        try {
+          req.cancel();
+        } catch {
+          // Ignore
+        }
       }
+    } else {
+      this.permissionQueue = [];
     }
 
     if (this.inputParser) {
@@ -2733,7 +3017,9 @@ export class LucidApp {
     if (this.onSignal) {
       process.off("SIGINT", this.onSignal);
       process.off("SIGTERM", this.onSignal);
-      process.off("SIGHUP", this.onSignal);
+    }
+    if (this.onSighup) {
+      process.off("SIGHUP", this.onSighup);
     }
     if (this.onProcessExit) {
       process.off("exit", this.onProcessExit);
@@ -2748,7 +3034,11 @@ export class LucidApp {
     this.renderer.leave();
 
     if (this.acp) {
-      await this.acp.stop(this.state.sessionId);
+      if (detach && typeof this.acp.detach === "function") {
+        await this.acp.detach();
+      } else {
+        await this.acp.stop(this.state.sessionId);
+      }
     }
 
     if (this.resolveRun) {

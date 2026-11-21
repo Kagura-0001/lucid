@@ -74,6 +74,8 @@ lucid                         # 在当前目录启动新的 Antigravity 会话
 lucid -r                      # 交互式选择并恢复当前目录的历史会话
 lucid -r <id-or-prefix>       # 通过完整会话 ID 或 >=4 位唯一前缀直接恢复
 lucid -c                      # 直接续接当前目录最近一次对话
+lucid bg "跑完评测并汇总"      # 不用 tmux 直接后台起任务，随时用 lucid -r 接回
+lucid bg                      # 查看所有后台会话（停止用 lucid bg stop <id|all>）
 lucid --theme tokyo-night     # 使用 Tokyo Night 前景色（透明底色）
 lucid --agent opencode        # 改用 OpenCode ACP 后端
 lucid --cmd "gemini --experimental-acp"
@@ -220,7 +222,8 @@ flowchart LR
 | `Ctrl+L` | 强制全屏重绘 |
 | `PgUp` / `PgDn` / `Alt+↑` / `Alt+↓` / 滚轮 | 滚动浏览历史消息 |
 | `Ctrl+D` / 连按两次 `Ctrl+C` / `/quit` | 安全退出（输入非空或生成中单按 `Ctrl+C` 为清空/中断） |
-| `/resume [id\|filter]` (`/sessions`) | 打开历史会话选择器，或按 ID/关键词过滤并恢复 |
+| `/resume [id\|filter]` (`/sessions`) | 浏览、过滤并恢复会话（正在后台运行的会话会自动置顶显示，选中直接连回实时输出） |
+| `/bg [prompt]` (`/detach`) | 将当前会话转入后台继续运行（SSH 意外断线也会自动转后台），随时用 `/resume` 或 `lucid -r` 接回 |
 | `/new` | 开启新对话 |
 | `/model` · `/effort` · `/mode [name]` | 交互式切换模型、思考档位与执行模式（`/mode bypass` 进入会话内全放行） |
 | `/artifacts` | 浏览并阅读当前会话记录到的 Markdown 产物 |

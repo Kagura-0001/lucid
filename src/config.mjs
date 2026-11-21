@@ -205,12 +205,23 @@ export function parseCliArgs(argv) {
     addDirs: [],
   };
 
+  let inBgSubcommand = false;
+  const bgPositional = [];
+
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    if (arg === "bg" && !inBgSubcommand && i === 0) {
+      inBgSubcommand = true;
+      continue;
+    }
     if (arg === "-h" || arg === "--help") {
       opts.help = true;
     } else if (arg === "-v" || arg === "--version") {
       opts.version = true;
+    } else if (arg === "--internal-host") {
+      opts.internalHost = argv[++i];
+    } else if (arg === "--direct") {
+      opts.direct = true;
     } else if (arg === "-r" || arg === "--resume") {
       const next = argv[i + 1];
       if (next && !next.startsWith("-")) {
@@ -250,9 +261,26 @@ export function parseCliArgs(argv) {
       opts.dangerouslySkipPermissions = true;
     } else if (arg === "--no-mouse") {
       opts.noMouse = true;
+    } else if (inBgSubcommand && !arg.startsWith("-")) {
+      bgPositional.push(arg);
     } else {
       throw new Error(`Unknown argument: ${arg} (run "lucid --help" for usage)`);
     }
   }
+
+  if (inBgSubcommand) {
+    const first = bgPositional[0] || "";
+    if (!first || first === "ls" || first === "list") {
+      opts.bgList = true;
+    } else if (first === "stop" || first === "kill") {
+      opts.bgStop = bgPositional[1] || "";
+      if (!opts.bgStop) {
+        throw new Error('Usage: lucid bg stop <id|all>');
+      }
+    } else {
+      opts.bgPrompt = bgPositional.join(" ");
+    }
+  }
+
   return opts;
 }
