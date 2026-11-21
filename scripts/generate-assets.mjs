@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { Composer } from "../src/ui/composer.mjs";
 import { renderDiffLines } from "../src/ui/diff.mjs";
 import { renderMarkdown } from "../src/ui/markdown.mjs";
-import { MultiAgentTracker, renderSwarmBoardView } from "../src/ui/swarm.mjs";
+import { MultiAgentTracker, renderSwarmBoardView, renderSwarmStrip } from "../src/ui/swarm.mjs";
 import { createThemeStyler, listThemes } from "../src/ui/themes.mjs";
 import { renderComposerBlock, renderHeader, renderTimeline } from "../src/ui/views.mjs";
 
@@ -353,7 +353,7 @@ function generatePreviewMainSvg() {
   const cols = 104;
   const style = createThemeStyler("tokyo-night", "truecolor");
   const composer = new Composer();
-  composer.setText("Add graceful shutdown and verify /healthz");
+  composer.setText("Also check these pod logs [Pasted text #1 +42 lines]");
 
   const state = {
     cwd: "/workspace/api-gateway",
@@ -414,7 +414,9 @@ function generatePreviewMainSvg() {
           "| Setting | Value | Purpose |",
           "| :--- | :--- | :--- |",
           "| `keepAliveTimeout` | `65_000 ms` | Prevent premature 502s behind ALB |",
-          "| `SIGTERM` hook | `server.close()` | Drain in-flight requests cleanly |",
+          "| `SIGTERM` hook | `server.close()`<br>then `process.exit(0)` | Drain in-flight requests cleanly |",
+          "",
+          "Drain budget per pod: $t_{\\text{drain}} \\le \\frac{T_{\\text{grace}}}{2} = 15\\,\\text{s}$, so $N_{\\text{req}} \\approx \\lambda \\cdot t_{\\text{drain}}$ requests finish in time.",
           "",
           "```ts",
           "process.on(\"SIGTERM\", () => server.close(() => process.exit(0)));",
@@ -733,52 +735,16 @@ function generateSwarmBoardSvg() {
   const boardHeight = 19;
   const style = createThemeStyler("tokyo-night", "truecolor");
   const tracker = new MultiAgentTracker();
+  const now = Date.now();
+  const minutesAgo = (minutes) => now - minutes * 60_000;
+  const clock = (minutes) => {
+    const d = new Date(minutesAgo(minutes));
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
 
-  tracker.ingestToolUpdate({
-    toolCallId: "sw-title",
-    name: "swarm",
-    status: "completed",
-    rawInput: { action: "title", title: "Release Audit" },
-  });
-  tracker.ingestToolUpdate({
-    toolCallId: "sw-1",
-    name: "swarm",
-    status: "completed",
-    rawInput: {
-      action: "add",
-      name: "researcher",
-      model: "Gemini 4",
-      workspace: "inherit",
-      brief: "Audit all ACP protocol handlers and capabilities in src/acp/.",
-    },
-    rawOutput: "researcher  waiting  Gemini 4",
-  });
-  tracker.ingestToolUpdate({
-    toolCallId: "sw-2",
-    name: "swarm",
-    status: "completed",
-    rawInput: {
-      action: "add",
-      name: "reviewer",
-      model: "Gemini 4 Neon",
-      workspace: "share",
-      brief: "Verify zero opaque background SGR codes across all 5 themes.",
-    },
-    rawOutput: "reviewer  working  Gemini 4 Neon",
-  });
-  tracker.ingestToolUpdate({
-    toolCallId: "sw-3",
-    name: "swarm",
-    status: "completed",
-    rawInput: {
-      action: "add",
-      name: "verifier",
-      model: "Gemini 4 Flash",
-      workspace: "inherit",
-      brief: "Run node --test suite and verify CLI flags.",
-    },
-    rawOutput: "verifier  waiting  Gemini 4 Flash",
-  });
+  // The subagent's invoke_subagent call arrives over ACP first; agy's on-disk
+  // state (below) then supplies live status, as in a real session.
   tracker.ingestToolUpdate({
     toolCallId: "sub-1",
     name: "invoke_subagent",
@@ -788,16 +754,74 @@ function generateSwarmBoardSvg() {
       Role: "Docs Auditor",
       Prompt: "Check README keybindings against src/app.mjs.",
     },
-    content: [{ type: "text", text: "All keybindings and slash commands verified." }],
   });
-  tracker.ingestToolUpdate({
-    toolCallId: "msg-1",
-    name: "send_message",
-    status: "completed",
-    rawInput: {
-      Recipient: "reviewer",
-      Message: "render_preview passed across all 5 themes (0 opaque bg).",
-    },
+
+  // Same shape AgyStateWatcher.poll() produces from agy's session directory.
+  tracker.applyAgyState({
+    swarmTitle: "Release Audit",
+    workers: [
+      {
+        name: "parser",
+        model: "Gemini 4 Neon",
+        workspace: "share",
+        state: "working",
+        activity: "run_command node --test test/markdown.test.mjs",
+        lastText: "Tables with `<br>` cells now split into real lines; fixing the math edge case next.",
+        task: "Fix markdown table and math rendering",
+        startedAt: minutesAgo(7.4),
+        updatedAt: now - 3000,
+        transcriptPath: "~/.gemini/antigravity-cli/brain/9f3c…/logs/transcript.jsonl",
+      },
+      {
+        name: "reviewer",
+        model: "Gemini 4 Neon",
+        workspace: "inherit",
+        state: "waiting",
+        activity: "swarm_wait",
+        lastText: "Reviewed #2; waiting for parser's fix.",
+        startedAt: minutesAgo(7.3),
+        updatedAt: minutesAgo(1.2),
+        transcriptPath: "~/.gemini/antigravity-cli/brain/2a71…/logs/transcript.jsonl",
+      },
+      {
+        name: "verifier",
+        model: "Gemini 4 Flash",
+        workspace: "inherit",
+        state: "working",
+        activity: "read_file renderer.mjs",
+        lastText: "",
+        startedAt: minutesAgo(7.1),
+        updatedAt: now - 8000,
+        transcriptPath: "~/.gemini/antigravity-cli/brain/c04e…/logs/transcript.jsonl",
+      },
+    ],
+    subagents: [
+      {
+        conversationId: "d1b5-docs",
+        role: "Docs Auditor",
+        typeName: "research",
+        state: "completed",
+        activity: "",
+        reply: "All keybindings and slash commands in README match src/app.mjs.",
+        startedAt: minutesAgo(4),
+        updatedAt: minutesAgo(2.5),
+        transcriptPath: "~/.gemini/antigravity-cli/brain/d1b5…/logs/transcript.jsonl",
+      },
+    ],
+    board: [
+      { seq: 1, agent: "coordinator", kind: "brief", time: clock(7.5), text: "@parser You own src/ui/markdown.mjs. Make tables with <br> cells and $...$ math render cleanly; post [done] with test output." },
+      { seq: 2, agent: "coordinator", kind: "brief", time: clock(7.4), text: "@reviewer Review parser's diff for width overflow and opaque backgrounds." },
+      { seq: 3, agent: "coordinator", kind: "brief", time: clock(7.3), text: "@verifier Run the full node --test suite and the render preview." },
+      { seq: 4, agent: "parser", time: clock(1.5), text: "@reviewer table <br> split is in; math fix in progress." },
+    ],
+    messages: [
+      {
+        id: "m1",
+        sender: "d1b5-docs",
+        timestamp: new Date(minutesAgo(2.5)).toISOString(),
+        content: "All keybindings and slash commands in README match src/app.mjs.",
+      },
+    ],
   });
 
   const headerLines = renderHeader(
@@ -813,16 +837,20 @@ function generateSwarmBoardSvg() {
     style,
   );
 
+  // Member detail of the busy worker: live action, last activity, brief, output.
   const renderedBoard = renderSwarmBoardView(
     tracker,
-    { selectedIdx: 0, tab: "board", scrollOffset: 0 },
+    { selectedIdx: 1, tab: "detail", scrollOffset: 0 },
     cols,
     boardHeight,
     style,
     3,
   );
 
-  const allRows = [...headerLines, ...renderedBoard.rows];
+  // The one-line status strip shown above the composer in the chat view.
+  const strip = renderSwarmStrip(tracker, cols, style, 3) || "";
+
+  const allRows = [...headerLines, ...renderedBoard.rows, style.border("─".repeat(cols)), strip];
   const fontSize = 12.6;
   const charWidth = 7.56;
   const lineHeight = 19;
@@ -841,7 +869,7 @@ function generateSwarmBoardSvg() {
     canvasBg: "#141824",
   });
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="lucid Swarm and Subagent Board">
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="lucid Swarm and Subagent Board with live member status">
   ${renderTerminalChrome({
     width,
     height,

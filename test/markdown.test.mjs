@@ -119,3 +119,9 @@ test("renders LaTeX inline/block formulas and HTML <br> breaks cleanly inside ta
     assert.ok(displayWidth(line) <= 140, `overflowed: ${stripAnsi(line)}`);
   }
 });
+
+test("<br> inside inline code is kept literally instead of splitting the line", () => {
+  const style = createThemeStyler("tokyo-night", "truecolor");
+  const plain = renderMarkdown("Tables with `<br>` cells now split.<br>Second line", 100, style).map(stripAnsi);
+  assert.deepEqual(plain, ["Tables with <br> cells now split.", "Second line"]);
+});

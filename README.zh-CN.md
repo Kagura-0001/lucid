@@ -104,7 +104,7 @@ lucid --cmd "gemini --experimental-acp"
 有 **Swarm Worker** 或 **Subagent** 在跑时，输入框上方会出现一行状态条，按名字列出每个成员的状态，正在干活的那个还会带上当前动作，例如：
 
 ```text
-⠋ Swarm "parser rewrite" 2 working 1 waiting · ⠋ parser run_command cargo test  ◌ verifier  ✓ Tmp Lister · ^B board
+⠋ Swarm "parser rewrite" · ⠋ parser run_command cargo test  ◌ verifier  ✓ Tmp Lister · ^B board
 ```
 
 按 **`Ctrl+B`**（或输入 `/board`）切入分栏视图：左侧是成员列表，右侧可看选中成员的任务说明、当前动作（`Now:`）、上次活动时间、最新输出和对话记录路径，或切到共享消息板。会话中生成的 Markdown 计划或报告会自动收集到 `/artifacts` 弹窗里供滚动阅读与一键复制。

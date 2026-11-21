@@ -104,7 +104,7 @@ Switch themes on the fly with `/theme` or at launch via `--theme <name>` (saved 
 While **Swarm** workers or **Subagents** are running, a strip above the composer names each member with its state, and the active one shows what it is doing:
 
 ```text
-⠋ Swarm "parser rewrite" 2 working 1 waiting · ⠋ parser run_command cargo test  ◌ verifier  ✓ Tmp Lister · ^B board
+⠋ Swarm "parser rewrite" · ⠋ parser run_command cargo test  ◌ verifier  ✓ Tmp Lister · ^B board
 ```
 
 Press **`Ctrl+B`** (or run `/board`) for the split-pane view: the roster on the left; on the right the selected member's brief, current action (`Now:`), last activity time, latest output and transcript path, or the shared message board. Generated Markdown plans or reports are indexed automatically under `/artifacts`.

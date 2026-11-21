@@ -157,7 +157,43 @@ function highlightCodeLine(line, lang, style) {
   return out;
 }
 
-const HTML_BR_RE = /<br\s*\/?>/i;
+const HTML_BR_AT_INDEX_RE = /<br\s*\/?>/iy;
+
+/**
+ * Splits a line on HTML <br> tags, leaving tags inside `code spans` untouched
+ * (e.g. "cells with `<br>` now split" stays one line).
+ */
+function splitOnHtmlBreaks(line) {
+  if (!/<br/i.test(line)) return [line];
+  const parts = [];
+  let current = "";
+  let index = 0;
+  while (index < line.length) {
+    if (line[index] === "`") {
+      let ticks = 1;
+      while (line[index + ticks] === "`") ticks += 1;
+      const delimiter = "`".repeat(ticks);
+      const closeIndex = line.indexOf(delimiter, index + ticks);
+      if (closeIndex !== -1) {
+        current += line.slice(index, closeIndex + ticks);
+        index = closeIndex + ticks;
+        continue;
+      }
+    }
+    HTML_BR_AT_INDEX_RE.lastIndex = index;
+    const brMatch = HTML_BR_AT_INDEX_RE.exec(line);
+    if (brMatch) {
+      parts.push(current);
+      current = "";
+      index += brMatch[0].length;
+      continue;
+    }
+    current += line[index];
+    index += 1;
+  }
+  parts.push(current);
+  return parts;
+}
 
 function findClosingInlineMathDollar(text, contentStart) {
   const len = text.length;
@@ -330,8 +366,7 @@ function renderTableBlock(rawLines, maxWidth, style) {
   if (colCount === 0) return [];
 
   const splitCellLines = (rawCell, isHeader) =>
-    String(rawCell || "")
-      .split(HTML_BR_RE)
+    splitOnHtmlBreaks(String(rawCell || ""))
       .map((part) => {
         const formatted = renderInlineMarkdown(part.trim(), style);
         return isHeader ? style.bold(formatted) : formatted;
@@ -608,7 +643,7 @@ export function renderMarkdown(markdownText, maxWidth, style) {
     }
 
     // Regular paragraph line (split explicit HTML <br> tags onto new lines)
-    for (const part of line.split(HTML_BR_RE)) {
+    for (const part of splitOnHtmlBreaks(line)) {
       const formatted = renderInlineMarkdown(part, style);
       out.push(...wrapAnsiLine(formatted, width));
     }

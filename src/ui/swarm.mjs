@@ -621,15 +621,13 @@ export function renderSwarmStrip(tracker, cols, style, spinnerFrame) {
 
   const prefixParts = [];
   if (counts.swarmCount > 0) {
+    // Per-member badges already show working / waiting / done, so the prefix
+    // only names the swarm; that leaves room for member names.
     const titlePart = counts.swarmTitle ? `Swarm "${counts.swarmTitle}"` : "Swarm";
     const icon = counts.working > 0
       ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
       : style.accent("◈");
-    const stats = [];
-    if (counts.working > 0) stats.push(style.warn(`${counts.working} working`));
-    if (counts.waiting > 0) stats.push(style.accentAlt(`${counts.waiting} waiting`));
-    if (counts.done > 0) stats.push(style.muted(`${counts.done} done`));
-    prefixParts.push(`${icon} ${style.bold(titlePart)}${stats.length > 0 ? ` ${stats.join(style.muted(", "))}` : ""}`);
+    prefixParts.push(`${icon} ${style.bold(titlePart)}`);
   } else if (counts.subagentsTotal > 0) {
     prefixParts.push(style.muted(`${counts.subagentsRunning}/${counts.subagentsTotal} subagents running`));
   }
@@ -641,27 +639,35 @@ export function renderSwarmStrip(tracker, cols, style, spinnerFrame) {
   suffixParts.push(style.muted("^B board"));
 
   const separator = style.border("  ·  ");
+  const separatorWidth = 5;
   const prefix = prefixParts.join(separator);
   const suffix = suffixParts.join(separator);
-  const reserved = displayWidth(prefix) + displayWidth(suffix) + 10;
+  // Leading space + prefix + suffix + the two separators around the member list.
+  const fixedWidth = 1 + displayWidth(prefix) + displayWidth(suffix) + separatorWidth * (prefix ? 2 : 1);
+  const memberBudget = Math.max(0, maxWidth - fixedWidth);
 
-  // Fit as many named members as the width allows; the active one shows its activity.
-  const memberPieces = [];
+  // Names first: show as many members as fit (reserving room for "+N"), then give
+  // whatever width is left to the first active member's current action.
+  const namePieces = members.map((member) => `${statusBadge(member.state, style, spinnerFrame)} ${member.name}`);
+  let shownCount = 0;
   let usedWidth = 0;
-  let hiddenCount = 0;
-  for (const member of members) {
-    const badge = statusBadge(member.state, style, spinnerFrame);
-    const activity = ACTIVE_STATES.has(member.state) && member.activity && memberPieces.length === 0
-      ? style.muted(` ${truncateAnsi(member.activity, 28, "…")}`)
-      : "";
-    const piece = `${badge} ${member.name}${activity}`;
-    const pieceWidth = displayWidth(piece) + 2;
-    if (usedWidth + pieceWidth > maxWidth - reserved) {
-      hiddenCount += 1;
-      continue;
-    }
-    memberPieces.push(piece);
+  for (let i = 0; i < namePieces.length; i += 1) {
+    const pieceWidth = displayWidth(namePieces[i]) + (shownCount > 0 ? 2 : 0);
+    const remainingAfter = namePieces.length - i - 1;
+    const overflowTagWidth = remainingAfter > 0 ? 2 + String(remainingAfter).length + 1 : 0;
+    if (usedWidth + pieceWidth + overflowTagWidth > memberBudget) break;
     usedWidth += pieceWidth;
+    shownCount += 1;
+  }
+  const hiddenCount = members.length - shownCount;
+  if (hiddenCount > 0) usedWidth += 2 + String(hiddenCount).length + 1;
+
+  const memberPieces = namePieces.slice(0, shownCount);
+  const activeIndex = members.slice(0, shownCount).findIndex((member) => ACTIVE_STATES.has(member.state) && member.activity);
+  const activityRoom = memberBudget - usedWidth - 1;
+  if (activeIndex >= 0 && activityRoom >= 8) {
+    const activity = truncateAnsi(members[activeIndex].activity, Math.min(activityRoom, 40), "…");
+    memberPieces[activeIndex] = `${memberPieces[activeIndex]} ${style.muted(activity)}`;
   }
   if (hiddenCount > 0) {
     memberPieces.push(style.muted(`+${hiddenCount}`));
