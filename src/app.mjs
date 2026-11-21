@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { AgyStateWatcher, resolveAgyDataDir } from "./acp/agy_state.mjs";
 import { AcpClient, fetchAgyQuota } from "./acp/client.mjs";
 import { loadUserConfig, resolveAgentLaunch, saveUserConfig } from "./config.mjs";
 import { copyToClipboardOsc52, detectColorDepth } from "./term/ansi.mjs";
@@ -203,6 +204,16 @@ export class LucidApp {
     this.lastAltScrollAt = 0;
     this.pendingChunkEvents = null;
 
+    // agy persists live Swarm / Subagent state on disk; the ACP stream does not
+    // report e.g. a background subagent finishing, so poll that state.
+    const launchesAgy = /(^|\/)agy$/.test(this.launchSpec.command || "");
+    this.agyStateWatcher = launchesAgy
+      ? new AgyStateWatcher({
+          dataDir: resolveAgyDataDir(this.launchSpec.args || [], this.userConfig.agyDataDir || ""),
+        })
+      : null;
+    this.agyStateTimer = null;
+
     this.renderTimer = null;
     this.renderPriority = false;
     this.spinnerTimer = null;
@@ -220,13 +231,19 @@ export class LucidApp {
     this.fileIndex.refresh();
     this.renderNow();
 
+    if (this.agyStateWatcher) {
+      this.agyStateTimer = setInterval(() => {
+        this.pollAgyState();
+      }, 1000);
+    }
+
     this.spinnerTimer = setInterval(() => {
       const hasToastExpired = this.state.toast && Date.now() >= this.state.toast.expiresAt;
       if (hasToastExpired) {
         this.state.toast = null;
         this.scheduleRender();
       }
-      if (this.state.connecting || this.state.busy || this.hasRunningTools()) {
+      if (this.state.connecting || this.state.busy || this.hasRunningTools() || this.hasMultiAgentActivity()) {
         this.state.spinnerFrame = (this.state.spinnerFrame + 1) % 10;
         this.scheduleRender();
       }
@@ -238,6 +255,29 @@ export class LucidApp {
     await new Promise((resolve) => {
       this.resolveRun = resolve;
     });
+  }
+
+  pollAgyState() {
+    if (!this.agyStateWatcher || this.exiting) return;
+    this.agyStateWatcher.setSession(this.state.sessionId);
+    let snapshot = null;
+    try {
+      snapshot = this.agyStateWatcher.poll();
+    } catch {
+      // On-disk state is best-effort; never let it break the UI.
+      return;
+    }
+    if (snapshot) {
+      this.state.multiAgent.applyAgyState(snapshot);
+      this.scheduleRender();
+    }
+  }
+
+  hasMultiAgentActivity() {
+    for (const member of [...this.state.multiAgent.workers.values(), ...this.state.multiAgent.subagents.values()]) {
+      if (member.state === "working" || member.state === "running") return true;
+    }
+    return false;
   }
 
   hasRunningTools() {
@@ -2656,6 +2696,10 @@ export class LucidApp {
     if (this.spinnerTimer) {
       clearInterval(this.spinnerTimer);
       this.spinnerTimer = null;
+    }
+    if (this.agyStateTimer) {
+      clearInterval(this.agyStateTimer);
+      this.agyStateTimer = null;
     }
 
     // Cancel any pending permission requests

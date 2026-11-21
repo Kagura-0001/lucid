@@ -171,7 +171,7 @@ flowchart LR
 | `Ctrl+J` / `Shift+Enter` / `Alt+Enter` / `\`+`Enter` | 输入框换行 |
 | `Esc` | 关闭弹窗 / 中断当前生成 / 回到对话底部 |
 | `Shift+Tab` | 循环切换执行模式（`default` / `accept-edits` / `auto` / `plan` / `bypass`）。`bypass` = auto 模式 + 自动批准所有工具权限，只在本次 lucid 会话有效，不写入配置 |
-| `Ctrl+B` / `/board` | 打开/关闭 Swarm 与 Subagent 多栏看板 |
+| `Ctrl+B` / `/board` | 打开/关闭 Swarm 与 Subagent 多栏看板。使用 agy 时，成员状态、当前动作、消息板直接读取 agy 落盘的实时状态（`~/.gemini/antigravity-cli/brain/<session>/.system_generated/`），后台 subagent 跑完也能及时变成 ✓ |
 | `Ctrl+O` / `/expand` | 切换工具输出与 Diff 展开/折叠 |
 | `Ctrl+T` / `/thoughts` | 切换思考过程（Thought）完整显示/折叠 |
 | 鼠标拖拽 | 在对话区选中文字，松开即通过 OSC 52 复制；有选区时 `Ctrl+C` 再复制一次，`Esc` 取消选区 |

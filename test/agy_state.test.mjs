@@ -1,0 +1,186 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { AgyStateWatcher, resolveAgyDataDir, summarizeTranscriptTail } from "../src/acp/agy_state.mjs";
+import { stripAnsi } from "../src/term/unicode.mjs";
+import { MultiAgentTracker, renderSwarmBoardView, renderSwarmStrip } from "../src/ui/swarm.mjs";
+import { createThemeStyler } from "../src/ui/themes.mjs";
+
+const SESSION = "11111111-aaaa-bbbb-cccc-000000000001";
+const SUBAGENT = "22222222-aaaa-bbbb-cccc-000000000002";
+const WORKER_A = "33333333-aaaa-bbbb-cccc-000000000003";
+const WORKER_B = "44444444-aaaa-bbbb-cccc-000000000004";
+
+function writeJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(value));
+}
+
+function writeTranscript(dataDir, conversationId, steps) {
+  const filePath = path.join(dataDir, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, steps.map((step) => JSON.stringify(step)).join("\n") + "\n");
+}
+
+/** Builds a fixture with the same layout agy writes (verified against a live session). */
+function buildFixture() {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "lucid-agy-"));
+  const sys = path.join(dataDir, "brain", SESSION, ".system_generated");
+
+  writeJson(path.join(sys, "subagents", `${SUBAGENT}.json`), {
+    conversationId: SUBAGENT,
+    subagentDescriptor: { typeName: "research", role: "Tmp Lister" },
+    state: "SUBAGENT_STATE_ALIVE",
+  });
+  // Swarm workers are also registered as subagents; they must not be listed twice.
+  writeJson(path.join(sys, "subagents", `${WORKER_A}.json`), {
+    conversationId: WORKER_A,
+    subagentDescriptor: { typeName: "swarm_worker", role: "Swarm Worker (parser)" },
+    state: "SUBAGENT_STATE_ALIVE",
+  });
+  writeJson(path.join(sys, "messages", "m1.json"), {
+    id: "m1",
+    recipient: SESSION,
+    sender: SUBAGENT,
+    timestamp: "2026-11-21T14:35:46.5Z",
+    renderDetails: { messageTitle: "Message from Tmp Lister (research)" },
+    content: "TMP-OK",
+  });
+  writeJson(path.join(sys, "messages", "m2.json"), {
+    id: "m2",
+    sender: "system",
+    timestamp: "2026-11-21T14:36:17Z",
+    content: "[Notice] stopped",
+  });
+  writeJson(path.join(sys, "swarm", "members.json"), {
+    title: "parser rewrite",
+    members: {
+      coordinator: { conversation_id: SESSION, role: "coordinator", phase: "RUNNING" },
+      parser: { conversation_id: WORKER_A, role: "worker", phase: "RUNNING", killed: false, model: "neon" },
+      verifier: { conversation_id: WORKER_B, role: "worker", phase: "RUNNING", killed: false, model: "neon" },
+      docs: { conversation_id: "55555555-x", role: "worker", phase: "KILLED", killed: true },
+    },
+  });
+  writeJson(path.join(sys, "swarm", "plan.json"), { goal: { title: "Rewrite" }, tasks: { parser: "Fix lexer" } });
+  fs.writeFileSync(
+    path.join(sys, "swarm", "board.jsonl"),
+    [
+      { seq: 1, agent: "coordinator", text: "@parser You own src/parser.rs", time: "2026-11-21 22:30:20", kind: "brief" },
+      { seq: 2, agent: "parser", text: "@coordinator [done] lexer fixed", time: "2026-11-21 22:31:00" },
+    ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+  );
+
+  // Subagent finished its turn after replying.
+  writeTranscript(dataDir, SUBAGENT, [
+    { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "send_message", args: { Message: "\"TMP-OK\"" } }] },
+    { step_index: 2, type: "GENERIC", status: "DONE" },
+    { step_index: 3, type: "PLANNER_RESPONSE", content: "TMP-OK" },
+  ]);
+  // parser is running a command right now.
+  writeTranscript(dataDir, WORKER_A, [
+    { step_index: 4, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "\"cargo test -p parser\"" } }] },
+  ]);
+  // verifier is parked on the board.
+  writeTranscript(dataDir, WORKER_B, [
+    { step_index: 9, type: "PLANNER_RESPONSE", tool_calls: [{ name: "swarm_wait", args: { since: "2" } }] },
+  ]);
+  return dataDir;
+}
+
+test("summarizeTranscriptTail distinguishes working, waiting and idle", () => {
+  assert.equal(summarizeTranscriptTail([{ type: "PLANNER_RESPONSE", content: "done" }]).phase, "idle");
+  const parked = summarizeTranscriptTail([{ type: "PLANNER_RESPONSE", tool_calls: [{ name: "swarm_wait", args: {} }] }]);
+  assert.equal(parked.phase, "waiting");
+  const reading = summarizeTranscriptTail([
+    { type: "PLANNER_RESPONSE", tool_calls: [{ name: "read_file", args: { AbsolutePath: "\"/repo/src/app.mjs\"" } }] },
+  ]);
+  assert.equal(reading.phase, "working");
+  assert.equal(reading.activity, "read_file app.mjs");
+  assert.equal(summarizeTranscriptTail([{ type: "GENERIC", status: "DONE" }]).activity, "thinking");
+
+  // Compact transcripts truncate long arguments, leaving invalid JSON strings.
+  const truncated = summarizeTranscriptTail([
+    { type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "\"python - <<'PY'\\nimport os, json" } }] },
+  ]);
+  assert.equal(truncated.activity, "run_command python - <<'PY'");
+});
+
+test("resolveAgyDataDir honours --app-data-dir and config override", () => {
+  assert.equal(resolveAgyDataDir([], "/custom"), "/custom");
+  assert.equal(resolveAgyDataDir(["acp", "--app-data-dir", "/abs/dir"]), "/abs/dir");
+  assert.ok(resolveAgyDataDir(["acp"]).endsWith(path.join(".gemini", "antigravity-cli")));
+});
+
+test("AgyStateWatcher reads live swarm + subagent state and the strip names members", () => {
+  const dataDir = buildFixture();
+  try {
+    const watcher = new AgyStateWatcher({ dataDir });
+    watcher.setSession(SESSION);
+    const snapshot = watcher.poll();
+    assert.ok(snapshot);
+    assert.equal(watcher.poll(), null, "an unchanged directory produces no new snapshot");
+
+    assert.equal(snapshot.swarmTitle, "parser rewrite");
+    const workerStates = Object.fromEntries(snapshot.workers.map((worker) => [worker.name, worker.state]));
+    assert.deepEqual(workerStates, { parser: "working", verifier: "waiting", docs: "killed" });
+    assert.equal(snapshot.workers.find((worker) => worker.name === "parser").activity, "run_command cargo test -p parser");
+
+    assert.equal(snapshot.subagents.length, 1, "swarm workers are not duplicated as subagents");
+    assert.equal(snapshot.subagents[0].role, "Tmp Lister");
+    assert.equal(snapshot.subagents[0].state, "completed");
+    assert.equal(snapshot.subagents[0].reply, "TMP-OK");
+    assert.equal(snapshot.messages.length, 1, "system notices are not shown as agent messages");
+
+    const tracker = new MultiAgentTracker();
+    // The invoke_subagent tool call arrives first via ACP; it must merge with the disk entry.
+    tracker.ingestToolUpdate({
+      toolCallId: "call_1",
+      name: "invoke_subagent",
+      rawInput: { TypeName: "research", Role: "Tmp Lister", Prompt: "Reply TMP-OK" },
+      status: "completed",
+    });
+    assert.equal([...tracker.subagents.values()][0].state, "running", "launch completing does not mean the subagent finished");
+
+    tracker.applyAgyState(snapshot);
+    assert.equal(tracker.subagents.size, 1);
+    const sub = [...tracker.subagents.values()][0];
+    assert.equal(sub.brief, "Reply TMP-OK");
+    assert.equal(sub.state, "completed");
+    assert.equal(tracker.workers.get("parser").brief, "You own src/parser.rs");
+    assert.deepEqual(tracker.boardMessages.map((message) => message.from), ["coordinator", "parser", "Tmp Lister"]);
+
+    const style = createThemeStyler("tokyo-night", "truecolor");
+    const strip = stripAnsi(renderSwarmStrip(tracker, 140, style, 0));
+    assert.ok(strip.includes('Swarm "parser rewrite"'), strip);
+    assert.ok(strip.includes("parser run_command cargo test"), strip);
+    assert.ok(strip.includes("verifier"), strip);
+    assert.ok(strip.includes("Tmp Lister"), strip);
+    assert.equal(strip.includes("docs"), false, "killed workers are left off the strip");
+
+    const board = renderSwarmBoardView(tracker, { selectedIdx: 1, tab: "detail", scrollOffset: 0 }, 120, 20, style, 0);
+    const boardText = board.rows.map(stripAnsi).join("\n");
+    assert.ok(boardText.includes("Now: run_command cargo test -p parser"), boardText);
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("subagent state flips to killed when agy rewrites its state file", () => {
+  const dataDir = buildFixture();
+  try {
+    const watcher = new AgyStateWatcher({ dataDir });
+    watcher.setSession(SESSION);
+    watcher.poll();
+    const recordPath = path.join(dataDir, "brain", SESSION, ".system_generated", "subagents", `${SUBAGENT}.json`);
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    record.state = "SUBAGENT_STATE_KILLED";
+    fs.writeFileSync(recordPath, JSON.stringify(record));
+    const next = watcher.poll();
+    assert.ok(next, "state change is detected even without a directory mtime change");
+    assert.equal(next.subagents[0].state, "killed");
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});

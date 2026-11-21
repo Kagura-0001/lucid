@@ -179,6 +179,17 @@ export class MultiAgentTracker {
       return;
     }
 
+    // 3b. Native swarm board posts by the coordinator
+    if (toolName === "post_message" && input && typeof input.text === "string") {
+      const mention = /^@([a-z0-9][a-z0-9_#-]*)/i.exec(input.text.trim());
+      this.pushBoardMessage({
+        from: "coordinator",
+        to: mention ? `@${mention[1]}` : input.channel ? `#${input.channel}` : "all",
+        body: input.text,
+      });
+      return;
+    }
+
     // 4. Track manage_subagents kill
     if (toolName === "manage_subagents" && input) {
       if (input.Action === "kill_all") {
@@ -371,14 +382,11 @@ export class MultiAgentTracker {
       }
     }
     if (status === "completed") {
-      sub.state = "completed";
-      sub.endedAt = sub.endedAt || Date.now();
-      if (output) {
-        this.pushBoardMessage({
-          from: sub.role,
-          to: "coordinator",
-          body: output.slice(0, 1200),
-        });
+      // invoke_subagent returns as soon as the background subagent is *launched*;
+      // the subagent itself keeps running. Real completion comes from agy's
+      // on-disk state (applyAgyState) or a later kill.
+      if (sub.state === "working") {
+        sub.state = "running";
       }
     } else if (status === "failed" || status === "error") {
       sub.state = "failed";
@@ -420,6 +428,130 @@ export class MultiAgentTracker {
     }
   }
 
+  /**
+   * Merges the authoritative state agy persists on disk (see acp/agy_state.mjs).
+   * Swarm workers and subagents found there replace the guesses made from tool
+   * calls; briefs captured from tool calls are kept.
+   */
+  applyAgyState(snapshot) {
+    if (!snapshot) return;
+    this.diskBacked = true;
+    if (snapshot.swarmTitle) {
+      this.swarmTitle = snapshot.swarmTitle;
+    }
+
+    // Briefs posted to the board: "@name ..." lines of kind "brief".
+    const briefByWorker = new Map();
+    for (const line of snapshot.board || []) {
+      const mention = /^@([a-z0-9][a-z0-9_-]*)/i.exec(String(line.text || ""));
+      if (line.kind === "brief" && mention) {
+        briefByWorker.set(mention[1], String(line.text).replace(/^@\S+\s*/, ""));
+      }
+    }
+
+    for (const diskWorker of snapshot.workers || []) {
+      const existing = this.workers.get(diskWorker.name);
+      const worker = existing || {
+        id: `swarm:${diskWorker.name}`,
+        kind: "swarm",
+        name: diskWorker.name,
+        brief: "",
+        output: "",
+        startedAt: Date.now(),
+        endedAt: null,
+      };
+      worker.model = diskWorker.model || worker.model || "";
+      worker.workspace = diskWorker.workspace || worker.workspace || "";
+      worker.state = diskWorker.state;
+      worker.activity = diskWorker.activity;
+      worker.task = diskWorker.task;
+      worker.conversationId = diskWorker.conversationId;
+      worker.transcriptPath = diskWorker.transcriptPath;
+      worker.brief = worker.brief || briefByWorker.get(diskWorker.name) || diskWorker.task || "";
+      if (diskWorker.lastText) worker.output = diskWorker.lastText;
+      worker.updatedAt = diskWorker.updatedAt || Date.now();
+      if (diskWorker.startedAt) worker.startedAt = diskWorker.startedAt;
+      const isFinished = worker.state === "killed" || worker.state === "stopped";
+      worker.endedAt = isFinished ? worker.endedAt || Date.now() : null;
+      this.workers.set(diskWorker.name, worker);
+    }
+
+    for (const diskSub of snapshot.subagents || []) {
+      const key = `conv:${diskSub.conversationId}`;
+      let sub = this.subagents.get(key);
+      if (!sub) {
+        // Adopt the entry created from the invoke_subagent tool call (same role),
+        // so its prompt/brief and start time carry over.
+        let adoptedKey = null;
+        for (const [candidateKey, candidate] of this.subagents) {
+          const isToolCallEntry = !candidateKey.startsWith("conv:");
+          if (isToolCallEntry && candidate.role === diskSub.role && !candidate.conversationId) {
+            adoptedKey = candidateKey;
+            break;
+          }
+        }
+        sub = adoptedKey ? this.subagents.get(adoptedKey) : null;
+        if (adoptedKey) this.subagents.delete(adoptedKey);
+        sub = sub || {
+          id: `sub:${key}`,
+          kind: "subagent",
+          name: diskSub.role,
+          role: diskSub.role,
+          typeName: diskSub.typeName,
+          model: "inherit",
+          workspace: "inherit",
+          brief: "",
+          output: "",
+          startedAt: Date.now(),
+          endedAt: null,
+        };
+        this.subagents.set(key, sub);
+      }
+      sub.conversationId = diskSub.conversationId;
+      sub.typeName = diskSub.typeName || sub.typeName;
+      sub.state = diskSub.state;
+      sub.activity = diskSub.activity;
+      sub.transcriptPath = diskSub.transcriptPath;
+      sub.output = diskSub.reply || diskSub.lastText || sub.output;
+      sub.updatedAt = diskSub.updatedAt || Date.now();
+      if (diskSub.startedAt) sub.startedAt = diskSub.startedAt;
+      const isFinished = ["completed", "killed", "failed", "idle"].includes(sub.state);
+      sub.endedAt = isFinished ? sub.endedAt || Date.now() : null;
+    }
+
+    // The board feed becomes the real swarm board plus messages from subagents.
+    const roleByConversation = new Map();
+    for (const [, sub] of this.subagents) {
+      if (sub.conversationId) roleByConversation.set(sub.conversationId, sub.role);
+    }
+    const feed = [];
+    for (const line of snapshot.board || []) {
+      const text = String(line.text || "");
+      const mention = /^@([a-z0-9][a-z0-9_#-]*)/i.exec(text);
+      feed.push({
+        id: `board_${line.seq}`,
+        time: Date.parse(String(line.time || "").replace(" ", "T")) || Date.now(),
+        from: line.agent || "coordinator",
+        to: mention ? `@${mention[1]}` : "all",
+        body: text,
+        seq: line.seq,
+      });
+    }
+    for (const message of snapshot.messages || []) {
+      feed.push({
+        id: `msg_${message.id || message.timestamp}`,
+        time: Date.parse(message.timestamp || "") || Date.now(),
+        from: roleByConversation.get(message.sender) || message.renderDetails?.messageTitle || message.sender,
+        to: "coordinator",
+        body: message.content,
+      });
+    }
+    if (feed.length > 0) {
+      feed.sort((a, b) => a.time - b.time);
+      this.boardMessages = feed.slice(-300);
+    }
+  }
+
   maybeTrackArtifact(input, update) {
     const filePath =
       input?.Path ||
@@ -454,6 +586,8 @@ function statusBadge(state, style, spinnerFrame) {
       return style.warn(spin);
     case "waiting":
       return style.accentAlt("◌");
+    case "idle":
+      return style.muted("◌");
     case "completed":
       return style.success("✓");
     case "failed":
@@ -467,47 +601,75 @@ function statusBadge(state, style, spinnerFrame) {
   }
 }
 
+const ACTIVE_STATES = new Set(["working", "running"]);
+const STRIP_STATE_ORDER = { working: 0, running: 0, waiting: 1, idle: 2, completed: 3, failed: 4, stopped: 5, killed: 6 };
+
 /**
  * Compact 1-line transparent indicator shown above composer ONLY when
  * Swarm workers, Subagents, or Artifacts are active in this session.
+ * Lists members by name (active ones first) so their state is visible
+ * without opening the board.
  */
 export function renderSwarmStrip(tracker, cols, style, spinnerFrame) {
   if (!tracker || !tracker.hasActivity()) return null;
   const counts = tracker.getSummaryCounts();
-  const parts = [];
+  const maxWidth = Math.max(20, cols - 2);
 
+  const members = [...tracker.workers.values(), ...tracker.subagents.values()]
+    .filter((member) => member.state !== "killed")
+    .sort((a, b) => (STRIP_STATE_ORDER[a.state] ?? 9) - (STRIP_STATE_ORDER[b.state] ?? 9));
+
+  const prefixParts = [];
   if (counts.swarmCount > 0) {
     const titlePart = counts.swarmTitle ? `Swarm "${counts.swarmTitle}"` : "Swarm";
-    const activeIcon = counts.working > 0
+    const icon = counts.working > 0
       ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
       : style.accent("◈");
     const stats = [];
     if (counts.working > 0) stats.push(style.warn(`${counts.working} working`));
     if (counts.waiting > 0) stats.push(style.accentAlt(`${counts.waiting} waiting`));
     if (counts.done > 0) stats.push(style.muted(`${counts.done} done`));
-    parts.push(`${activeIcon} ${style.bold(titlePart)} ${style.muted("·")} ${stats.join(style.muted(", "))}`);
+    prefixParts.push(`${icon} ${style.bold(titlePart)}${stats.length > 0 ? ` ${stats.join(style.muted(", "))}` : ""}`);
+  } else if (counts.subagentsTotal > 0) {
+    prefixParts.push(style.muted(`${counts.subagentsRunning}/${counts.subagentsTotal} subagents running`));
   }
 
-  if (counts.subagentsTotal > 0) {
-    const icon = counts.subagentsRunning > 0
-      ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
-      : style.success("✓");
-    const label = counts.subagentsRunning > 0
-      ? `${counts.subagentsRunning}/${counts.subagentsTotal} subagents running`
-      : `${counts.subagentsTotal} subagents`;
-    parts.push(`${icon} ${style.muted(label)}`);
-  }
-
+  const suffixParts = [];
   if (counts.artifactCount > 0) {
-    parts.push(style.accentAlt(`◇ ${counts.artifactCount} artifact${counts.artifactCount > 1 ? "s" : ""} (/artifacts)`));
+    suffixParts.push(style.accentAlt(`◇ ${counts.artifactCount} (/artifacts)`));
+  }
+  suffixParts.push(style.muted("^B board"));
+
+  const separator = style.border("  ·  ");
+  const prefix = prefixParts.join(separator);
+  const suffix = suffixParts.join(separator);
+  const reserved = displayWidth(prefix) + displayWidth(suffix) + 10;
+
+  // Fit as many named members as the width allows; the active one shows its activity.
+  const memberPieces = [];
+  let usedWidth = 0;
+  let hiddenCount = 0;
+  for (const member of members) {
+    const badge = statusBadge(member.state, style, spinnerFrame);
+    const activity = ACTIVE_STATES.has(member.state) && member.activity && memberPieces.length === 0
+      ? style.muted(` ${truncateAnsi(member.activity, 28, "…")}`)
+      : "";
+    const piece = `${badge} ${member.name}${activity}`;
+    const pieceWidth = displayWidth(piece) + 2;
+    if (usedWidth + pieceWidth > maxWidth - reserved) {
+      hiddenCount += 1;
+      continue;
+    }
+    memberPieces.push(piece);
+    usedWidth += pieceWidth;
+  }
+  if (hiddenCount > 0) {
+    memberPieces.push(style.muted(`+${hiddenCount}`));
   }
 
-  if (counts.swarmCount > 0 || counts.subagentsTotal > 0 || counts.boardCount > 0) {
-    parts.push(style.muted("^B board"));
-  }
-
+  const parts = [prefix, memberPieces.join("  "), suffix].filter(Boolean);
   if (parts.length === 0) return null;
-  return ` ${truncateAnsi(parts.join(style.border("  ·  ")), cols - 2, "…")}`;
+  return ` ${truncateAnsi(parts.join(separator), maxWidth, "…")}`;
 }
 
 /**
@@ -568,6 +730,15 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
     if (m.startedAt) metaParts.push(`elapsed: ${formatAge(m.startedAt, m.endedAt)}`);
     if (metaParts.length > 0) {
       out.push(style.muted(metaParts.join("  ·  ")));
+    }
+    if (m.activity && (m.state === "working" || m.state === "running" || m.state === "waiting")) {
+      out.push(`${style.accent("Now:")} ${truncateAnsi(m.activity, Math.max(16, rightWidth - 6), "…")}`);
+    }
+    if (m.transcriptPath && m.updatedAt) {
+      out.push(style.muted(`last activity ${formatAge(m.updatedAt, Date.now())} ago`));
+    }
+    if (m.transcriptPath) {
+      out.push(style.muted(truncateAnsi(`log: ${m.transcriptPath}`, rightWidth, "…")));
     }
     out.push(style.border("─".repeat(Math.min(rightWidth, 64))));
 
