@@ -52,7 +52,8 @@ const LOCAL_COMMANDS = [
   { name: "mouse", description: "Toggle mouse wheel capture (OFF = native drag-select)", local: true },
   { name: "expand", description: "Toggle expanded tool outputs & diffs", local: true },
   { name: "thoughts", description: "Toggle, fold, or hide thinking blocks (/thoughts [fold|show|hide])", local: true },
-  { name: "quota", description: "Check Antigravity quota (read-only)", local: true },
+  { name: "usage", description: "Show context usage & Antigravity quota", local: true },
+  { name: "quota", description: "Check Antigravity quota (alias of /usage)", local: true },
   { name: "clear", description: "Clear visible timeline (keeps session alive)", local: true },
   { name: "help", description: "Show keyboard shortcuts & commands", local: true },
   { name: "quit", description: "Exit lucid cleanly", local: true },
@@ -382,7 +383,7 @@ export class LucidApp {
 
       // Non-blocking background quota check for Antigravity
       if (this.launchSpec.supportsQuotaCli) {
-        fetchAgyQuota(6000).then((quota) => {
+        fetchAgyQuota(15000).then((quota) => {
           if (quota?.badge && !this.exiting) {
             this.state.quotaText = quota.badge;
             this.scheduleRender();
@@ -2234,18 +2235,26 @@ export class LucidApp {
       return;
     }
 
-    if (cmdName === "quota") {
+    if (cmdName === "quota" || cmdName === "usage") {
+      if (this.state.usage && this.state.usage.size > 0) {
+        const pct = Math.min(100, Math.round((this.state.usage.used / this.state.usage.size) * 100));
+        this.pushNotice("info", `Context window: ${this.state.usage.used.toLocaleString()} / ${this.state.usage.size.toLocaleString()} tokens (${pct}%)`);
+      }
       if (!this.launchSpec.supportsQuotaCli) {
-        this.showToast("Quota check is only available for Antigravity (agy)", "error");
+        if (!this.state.usage) {
+          this.showToast("Quota check is only available for Antigravity (agy)", "error");
+        }
+        this.scheduleRender();
         return;
       }
       this.showToast("Checking Antigravity quota…");
-      const quota = await fetchAgyQuota(10000);
+      const quota = await fetchAgyQuota(15000);
       if (quota) {
         this.state.quotaText = quota.badge;
         for (const line of quota.lines) {
           this.pushNotice("info", line);
         }
+        this.showToast(`Quota updated (${quota.badge})`);
       } else {
         this.pushNotice("warn", "Could not fetch quota (API key mode or CLI unavailable).");
       }

@@ -258,10 +258,10 @@ export class AcpClient extends EventEmitter {
 }
 
 /**
- * Optional read-only Antigravity CLI quota probe (`agy -p "/quota" --output-format json`).
+ * Optional read-only Antigravity CLI quota probe (`agy -p "/usage" --output-format json`).
  * Never starts an agent turn or spends quota. Returns `{ badge, lines }` or null.
  */
-export function fetchAgyQuota(timeoutMs = 8000) {
+export function fetchAgyQuota(timeoutMs = 15000) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (val) => {
@@ -272,7 +272,7 @@ export function fetchAgyQuota(timeoutMs = 8000) {
 
     let proc;
     try {
-      proc = spawn("agy", ["-p", "/quota", "--output-format", "json"], {
+      proc = spawn("agy", ["-p", "/usage", "--output-format", "json"], {
         stdio: ["ignore", "pipe", "ignore"],
         env: process.env,
       });
@@ -318,10 +318,83 @@ export function fetchAgyQuota(timeoutMs = 8000) {
   });
 }
 
+function formatUsageBar(fraction, width = 16) {
+  const clamped = Math.max(0, Math.min(1, Number(fraction) || 0));
+  const filled = Math.round(clamped * width);
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+}
+
+function formatResetEta(resetTimeIso, description = "") {
+  if (resetTimeIso) {
+    const ms = Date.parse(resetTimeIso) - Date.now();
+    if (!Number.isNaN(ms) && ms > 0) {
+      const totalMins = Math.round(ms / 60000);
+      const days = Math.floor(totalMins / (60 * 24));
+      const hours = Math.floor((totalMins % (60 * 24)) / 60);
+      const mins = totalMins % 60;
+      if (days > 0) return `resets in ${days}d ${hours}h`;
+      if (hours > 0) return `resets in ${hours}h ${mins}m`;
+      return `resets in ${mins}m`;
+    }
+  }
+  const match = /refresh in ([^.]+)/i.exec(String(description || ""));
+  return match ? `resets in ${match[1].trim()}` : "";
+}
+
 export function parseQuotaPayload(payload) {
   if (!payload || typeof payload !== "object") return null;
 
-  // Official agy -p "/quota" --output-format json shape:
+  // Structured agy -p "/usage" / "/quota" --output-format json shape:
+  // { status: "SUCCESS", command: { name: "usage", data: { groups: [{ name, buckets: [...] }] } } }
+  const groups = payload.command?.data?.groups;
+  if (Array.isArray(groups) && groups.length > 0) {
+    let gemini5h = "";
+    let geminiWk = "";
+    let claude5h = "";
+    let claudeWk = "";
+    const detailLines = [];
+
+    for (const group of groups) {
+      const groupName = String(group?.name || "Models");
+      const gLower = groupName.toLowerCase();
+      const buckets = Array.isArray(group?.buckets) ? group.buckets : [];
+      // Show 5h before weekly within each group for readability.
+      const ordered = [...buckets].sort((a, b) => (a.window === "5h" ? -1 : b.window === "5h" ? 1 : 0));
+      for (const bucket of ordered) {
+        const frac = typeof bucket?.remaining_fraction === "number" ? bucket.remaining_fraction : null;
+        if (frac === null) continue;
+        const pct = `${Math.round(frac * 100)}%`;
+        const win = String(bucket.window || bucket.name || "");
+        const bar = formatUsageBar(frac);
+        const eta = formatResetEta(bucket.reset_time, bucket.description);
+        const etaSuffix = eta ? `  (${eta})` : "";
+        detailLines.push(`${groupName} · ${win.padEnd(6)} ${bar} ${pct.padStart(4)}${etaSuffix}`);
+
+        const wLower = win.toLowerCase();
+        if (gLower.includes("gemini")) {
+          if (wLower.includes("5h") || wLower.includes("five")) gemini5h = pct;
+          if (wLower.includes("week")) geminiWk = pct;
+        } else if (gLower.includes("claude") || gLower.includes("gpt")) {
+          if (wLower.includes("5h") || wLower.includes("five")) claude5h = pct;
+          if (wLower.includes("week")) claudeWk = pct;
+        }
+      }
+    }
+
+    if (detailLines.length > 0) {
+      const badgeParts = [];
+      if (gemini5h) badgeParts.push(`5h ${gemini5h}`);
+      if (geminiWk) badgeParts.push(`wk ${geminiWk}`);
+      if (badgeParts.length === 0 && claude5h) badgeParts.push(`5h ${claude5h}`);
+      if (badgeParts.length === 0 && claudeWk) badgeParts.push(`wk ${claudeWk}`);
+      return {
+        badge: badgeParts.join(" · ") || detailLines[0].slice(0, 40),
+        lines: detailLines,
+      };
+    }
+  }
+
+  // Fallback tab-separated response shape:
   // { status: "SUCCESS", response: "Gemini Models\tWeekly Limit Remaining\t97%\t2026-...\n..." }
   if (typeof payload.response === "string" && payload.response.trim()) {
     const rawLines = payload.response.trim().split(/\r?\n/).filter(Boolean);

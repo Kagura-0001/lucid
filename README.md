@@ -225,7 +225,7 @@ flowchart LR
 | `/model` · `/effort` · `/mode [name]` | Interactive pickers for model, thinking level, and mode (`/mode bypass` for session-level bypass) |
 | `/artifacts` | Browse & read session Markdown artifacts |
 | `/theme [name]` | Switch transparent palette |
-| `/quota` | Check Antigravity quota (read-only CLI probe) |
+| `/usage` · `/quota` | Show session context usage & Antigravity quota (read-only CLI probe) |
 | `/clear` · `/help` | Clear visible timeline (keeps session alive) · show shortcuts modal |
 | `@path` | Fuzzy search & attach workspace file |
 

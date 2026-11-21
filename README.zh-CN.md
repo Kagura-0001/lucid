@@ -225,7 +225,7 @@ flowchart LR
 | `/model` · `/effort` · `/mode [name]` | 交互式切换模型、思考档位与执行模式（`/mode bypass` 进入会话内全放行） |
 | `/artifacts` | 浏览并阅读当前会话记录到的 Markdown 产物 |
 | `/theme [name]` | 切换透明主题 |
-| `/quota` | 查询 Antigravity 额度（只读，不消耗对话配额） |
+| `/usage` · `/quota` | 查看当前会话上下文占用与 Antigravity 额度（只读，不消耗对话配额） |
 | `/clear` · `/help` | 清屏当前时间线（保留会话） · 打开快捷键说明 |
 | `@path` | 模糊搜索并附加工作区文件 |
 

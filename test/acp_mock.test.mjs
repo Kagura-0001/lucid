@@ -207,4 +207,32 @@ test("parseQuotaPayload formats official agy /quota JSON response cleanly", () =
   });
   assert.equal(parsed.badge, "5h 88% · wk 97%");
   assert.equal(parsed.lines.length, 3);
+
+  const structured = parseQuotaPayload({
+    status: "SUCCESS",
+    command: {
+      name: "usage",
+      data: {
+        groups: [
+          {
+            name: "Gemini Models",
+            buckets: [
+              { window: "weekly", remaining_fraction: 0.953, description: "refresh in 6 days, 16 hours." },
+              { window: "5h", remaining_fraction: 0.866, description: "refresh in 2 hours, 42 minutes." },
+            ],
+          },
+          {
+            name: "Claude and GPT models",
+            buckets: [
+              { window: "5h", remaining_fraction: 0.414, description: "refresh in 2 hours, 59 minutes." },
+            ],
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(structured.badge, "5h 87% · wk 95%");
+  assert.equal(structured.lines.length, 3);
+  assert.ok(structured.lines[0].includes("5h") && structured.lines[0].includes("87%"));
+  assert.ok(structured.lines[0].includes("resets in 2 hours, 42 minutes"));
 });
