@@ -776,7 +776,7 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
       ["Enter", "Send prompt (or steer while running)"],
       ["Ctrl+J / Shift+Enter", "Insert newline in composer"],
       ["Esc", "Cancel running turn / close popup or modal"],
-      ["Shift+Tab", "Cycle execution mode (default / accept-edits / auto / plan)"],
+      ["Shift+Tab", "Cycle execution mode (default / accept-edits / auto / plan / bypass)"],
       ["Ctrl+B / /board", "Toggle Swarm & Subagent multi-pane board"],
       ["Ctrl+O  /  Ctrl+T", "Toggle tool details  /  fold or expand thoughts (/thoughts)"],
       ["Mouse drag", "Select timeline text, copied on release (Ctrl+C copies again, Esc clears)"],

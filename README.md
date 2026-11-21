@@ -170,7 +170,7 @@ flowchart LR
 | `Enter` | Send prompt (or steer a running turn mid-stream) |
 | `Ctrl+J` / `Shift+Enter` / `Alt+Enter` / `\`+`Enter` | Insert newline in composer |
 | `Esc` | Close popup/modal, cancel running turn, or jump back to bottom |
-| `Shift+Tab` | Cycle execution mode (`default` / `accept-edits` / `auto` / `plan`) |
+| `Shift+Tab` | Cycle execution mode (`default` / `accept-edits` / `auto` / `plan` / `bypass`). `bypass` = auto mode + every tool permission auto-approved, for this lucid session only (never saved) |
 | `Ctrl+B` / `/board` | Toggle Swarm & Subagent multi-pane board |
 | `Ctrl+O` / `/expand` | Toggle expanded vs compact tool outputs & diffs |
 | `Ctrl+T` / `/thoughts` | Toggle full thinking/reasoning blocks |

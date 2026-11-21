@@ -275,6 +275,52 @@ test("bypass mode auto-answers permission requests and shows a header badge", as
   assert.ok(header.includes("bypass"));
 });
 
+test("Shift+Tab cycles into a session-level Bypass mode and back out", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const app = new LucidApp({ cwd: "/tmp" });
+  app.scheduleRender = () => {};
+  app.state.connected = true;
+  app.state.sessionId = "s1";
+  app.state.modes = [
+    { id: "default", name: "Default" },
+    { id: "auto", name: "Auto" },
+    { id: "plan", name: "Plan" },
+  ];
+  app.state.modeId = "plan";
+  const setModeCalls = [];
+  app.acp = { setMode: async (_sid, modeId) => { setModeCalls.push(modeId); return {}; } };
+  const savedConfig = app.userConfig;
+  savedConfig.mode = "plan";
+
+  // A permission dialog is already waiting when the user switches to Bypass.
+  let approved = null;
+  app.enqueuePermissionRequest({
+    params: { options: [{ optionId: "ok", name: "Allow once", kind: "allow_once" }] },
+    selectOption: (optionId) => { approved = optionId; },
+    cancel: () => {},
+  });
+  assert.equal(app.modal?.type, "permission");
+
+  await app.cycleMode(); // plan -> bypass
+  assert.equal(app.state.sessionBypass, true);
+  assert.equal(app.state.bypassPermissions, true);
+  assert.equal(app.state.modeId, "auto", "bypass runs the agent in auto mode");
+  assert.deepEqual(setModeCalls, ["auto"]);
+  assert.equal(approved, "ok", "pending dialog is approved on entering bypass");
+  assert.equal(app.modal, null);
+  assert.equal(savedConfig.mode, "plan", "bypass is never persisted to config");
+
+  await app.cycleMode(); // bypass -> default
+  assert.equal(app.state.sessionBypass, false);
+  assert.equal(app.state.bypassPermissions, false);
+  assert.equal(app.state.modeId, "default");
+
+  // Launched with --bypass: Bypass is not offered as a separate mode.
+  const launched = new LucidApp({ cwd: "/tmp", dangerouslySkipPermissions: true });
+  launched.state.modes = app.state.modes;
+  assert.equal(launched.getModeCycle().some((entry) => entry.id === "bypass"), false);
+});
+
 test("when mouseCapture is OFF, Alternate Scroll Up/Down bursts scroll timeline instead of moving composer cursor", async () => {
   const { LucidApp } = await import("../src/app.mjs");
   const app = new LucidApp({ cwd: "/tmp", noMouse: true });

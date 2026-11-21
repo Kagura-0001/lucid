@@ -31,10 +31,14 @@ import {
   renderTimeline,
 } from "./ui/views.mjs";
 
+// lucid's session-level bypass: agent "auto" mode plus auto-approval of every
+// tool permission request. Lives only in this lucid process, never persisted.
+const BYPASS_MODE_ID = "bypass";
+
 const LOCAL_COMMANDS = [
   { name: "model", description: "Switch active model", local: true },
   { name: "effort", description: "Switch thinking / reasoning level", local: true },
-  { name: "mode", description: "Switch mode (default / accept-edits / auto / plan)", local: true },
+  { name: "mode", description: "Switch mode (default / accept-edits / auto / plan / bypass)", local: true },
   { name: "resume", description: "Resume an existing conversation (/resume [id|filter])", local: true },
   { name: "sessions", description: "Browse & load existing conversations (alias of /resume)", local: true },
   { name: "new", description: "Start a fresh conversation session", local: true },
@@ -142,6 +146,10 @@ export class LucidApp {
     this.state = {
       cwd: this.cwd,
       agentLabel: this.launchSpec.name,
+      // launchBypass: agy itself was started with --dangerously-skip-permissions.
+      // sessionBypass: user switched to the Bypass mode inside this session.
+      launchBypass: (this.launchSpec.args || []).includes("--dangerously-skip-permissions"),
+      sessionBypass: false,
       bypassPermissions: (this.launchSpec.args || []).includes("--dangerously-skip-permissions"),
       connected: false,
       connecting: true,
@@ -908,19 +916,45 @@ export class LucidApp {
   enqueuePermissionRequest(req) {
     // Bypass mode: agy already auto-approves, but if any agent still asks, answer
     // with its own "allow" option instead of interrupting the user.
-    if (this.state.bypassPermissions) {
-      const options = Array.isArray(req.params?.options) ? req.params.options : [];
-      const allowOption =
-        options.find((option) => option.kind === "allow_always") ||
-        options.find((option) => option.kind === "allow_once") ||
-        options.find((option) => /allow|approve|yes/i.test(`${option.optionId} ${option.name || ""}`));
-      if (allowOption) {
-        req.selectOption(allowOption.optionId);
-        return;
-      }
+    if (this.state.bypassPermissions && this.autoApprovePermission(req)) {
+      return;
     }
     this.permissionQueue.push(req);
     if (!this.modal || this.modal.type !== "permission") {
+      this.openNextPermissionModal();
+    }
+  }
+
+  /**
+   * Answers a permission request with the agent's own "allow" option.
+   * Returns false when the request offers no allow-like option.
+   */
+  autoApprovePermission(req) {
+    const options = Array.isArray(req.params?.options) ? req.params.options : [];
+    const allowOption =
+      options.find((option) => option.kind === "allow_always") ||
+      options.find((option) => option.kind === "allow_once") ||
+      options.find((option) => /allow|approve|yes/i.test(`${option.optionId} ${option.name || ""}`));
+    if (!allowOption) return false;
+    req.selectOption(allowOption.optionId);
+    return true;
+  }
+
+  /**
+   * Approves every queued permission request (used when switching to Bypass while
+   * a permission dialog is already open).
+   */
+  approvePendingPermissions() {
+    const stillPending = [];
+    for (const req of this.permissionQueue) {
+      if (!this.autoApprovePermission(req)) {
+        stillPending.push(req);
+      }
+    }
+    this.permissionQueue = stillPending;
+    const permissionModalOpen = this.modal && this.modal.type === "permission";
+    if (permissionModalOpen) {
+      this.modal = null;
       this.openNextPermissionModal();
     }
   }
@@ -2282,66 +2316,112 @@ export class LucidApp {
     }
 
     if (cmdName === "mode") {
-      if (this.state.modes.length === 0) {
+      const cycle = this.getModeCycle();
+      if (cycle.length === 0) {
         this.pushNotice("warn", "No execution modes exposed by this ACP agent.");
         this.scheduleRender();
         return;
       }
       if (argText) {
-        const resolvedId = this.resolveModeId(argText);
-        const match = this.state.modes.find((m) => m.id === resolvedId);
-        if (match) {
-          const res = await this.acp.setMode(this.state.sessionId, match.id);
-          this.applySessionMetadata(res);
-          this.state.modeId = match.id;
-          this.userConfig.mode = match.id;
-          saveUserConfig(this.userConfig);
-          this.showToast(`Mode → ${match.name || match.id}`);
-          this.scheduleRender();
+        const requested = argText.trim().toLowerCase();
+        const targetId = requested === BYPASS_MODE_ID || requested === "yolo"
+          ? BYPASS_MODE_ID
+          : this.resolveModeId(requested);
+        const target = cycle.find((entry) => entry.id === targetId);
+        if (target) {
+          await this.switchMode(target.id);
         } else {
-          this.pushNotice("warn", `Unknown mode "${argText}". Available: ${this.state.modes.map((m) => m.id).join(", ")}`);
+          this.pushNotice("warn", `Unknown mode "${argText}". Available: ${cycle.map((entry) => entry.id).join(", ")}`);
           this.scheduleRender();
         }
         return;
       }
+      const currentId = this.currentModeCycleId();
       this.openPickerModal({
         title: "Execution Mode",
-        items: this.state.modes.map((m) => ({
-          label: m.name || m.id,
-          value: m.id,
-          description: m.description || "",
-          active: m.id === this.state.modeId,
+        items: cycle.map((entry) => ({
+          label: entry.name,
+          value: entry.id,
+          description: entry.description,
+          active: entry.id === currentId,
         })),
         onSelect: async (chosen) => {
-          const res = await this.acp.setMode(this.state.sessionId, chosen.value);
-          this.applySessionMetadata(res);
-          this.state.modeId = chosen.value;
-          this.userConfig.mode = chosen.value;
-          saveUserConfig(this.userConfig);
-          this.showToast(`Mode → ${chosen.label}`);
-          this.scheduleRender();
+          await this.switchMode(chosen.value);
         },
       });
     }
   }
 
-  async cycleMode() {
-    if (!this.state.connected || !this.state.sessionId || this.state.modes.length < 2) {
-      return;
+  /**
+   * Modes offered by Shift+Tab and /mode: the agent's own modes, plus lucid's
+   * session-level Bypass unless agy was already launched with bypass.
+   */
+  getModeCycle() {
+    const cycle = this.state.modes.map((mode) => ({
+      id: mode.id,
+      name: mode.name || mode.id,
+      description: mode.description || "",
+    }));
+    if (!this.state.launchBypass) {
+      cycle.push({
+        id: BYPASS_MODE_ID,
+        name: "Bypass",
+        description: "auto mode + approve every tool permission (this session only)",
+      });
     }
-    const curIdx = this.state.modes.findIndex((m) => m.id === this.state.modeId);
-    const next = this.state.modes[(curIdx + 1) % this.state.modes.length];
+    return cycle;
+  }
+
+  currentModeCycleId() {
+    return this.state.sessionBypass ? BYPASS_MODE_ID : this.state.modeId;
+  }
+
+  setSessionBypass(enabled) {
+    this.state.sessionBypass = Boolean(enabled);
+    this.state.bypassPermissions = this.state.launchBypass || this.state.sessionBypass;
+  }
+
+  async switchMode(targetId) {
     try {
-      const res = await this.acp.setMode(this.state.sessionId, next.id);
-      this.applySessionMetadata(res);
-      this.state.modeId = next.id;
-      this.userConfig.mode = next.id;
-      saveUserConfig(this.userConfig);
-      this.showToast(`Mode → ${next.name || next.id}`);
+      if (targetId === BYPASS_MODE_ID) {
+        // Run the agent in its autonomous mode and let lucid approve every request.
+        const autoModeId = this.resolveModeId("auto");
+        if (autoModeId && autoModeId !== this.state.modeId && this.state.sessionId) {
+          const res = await this.acp.setMode(this.state.sessionId, autoModeId);
+          this.applySessionMetadata(res);
+          this.state.modeId = autoModeId;
+        }
+        this.setSessionBypass(true);
+        this.approvePendingPermissions();
+        // Deliberately not saved to config: bypass ends with this lucid session.
+        this.showToast("Mode → Bypass (every tool permission auto-approved this session)", "error");
+      } else {
+        const res = await this.acp.setMode(this.state.sessionId, targetId);
+        this.applySessionMetadata(res);
+        this.state.modeId = targetId;
+        this.setSessionBypass(false);
+        this.userConfig.mode = targetId;
+        saveUserConfig(this.userConfig);
+        const target = this.state.modes.find((mode) => mode.id === targetId);
+        this.showToast(`Mode → ${target?.name || targetId}`);
+      }
     } catch (err) {
       this.showToast(`Mode switch failed: ${err.message}`, "error");
     }
     this.scheduleRender();
+  }
+
+  async cycleMode() {
+    if (!this.state.connected || !this.state.sessionId) {
+      return;
+    }
+    const cycle = this.getModeCycle();
+    if (cycle.length < 2) {
+      return;
+    }
+    const currentIndex = cycle.findIndex((entry) => entry.id === this.currentModeCycleId());
+    const next = cycle[(currentIndex + 1) % cycle.length];
+    await this.switchMode(next.id);
   }
 
   setTheme(themeName) {

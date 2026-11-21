@@ -170,7 +170,7 @@ flowchart LR
 | `Enter` | 发送消息（生成过程中输入内容回车可直接引导当前轮次） |
 | `Ctrl+J` / `Shift+Enter` / `Alt+Enter` / `\`+`Enter` | 输入框换行 |
 | `Esc` | 关闭弹窗 / 中断当前生成 / 回到对话底部 |
-| `Shift+Tab` | 循环切换执行模式（`default` / `accept-edits` / `auto` / `plan`） |
+| `Shift+Tab` | 循环切换执行模式（`default` / `accept-edits` / `auto` / `plan` / `bypass`）。`bypass` = auto 模式 + 自动批准所有工具权限，只在本次 lucid 会话有效，不写入配置 |
 | `Ctrl+B` / `/board` | 打开/关闭 Swarm 与 Subagent 多栏看板 |
 | `Ctrl+O` / `/expand` | 切换工具输出与 Diff 展开/折叠 |
 | `Ctrl+T` / `/thoughts` | 切换思考过程（Thought）完整显示/折叠 |
