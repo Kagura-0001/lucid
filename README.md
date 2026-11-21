@@ -35,11 +35,14 @@ Most coding agent TUIs stamp opaque black or dark-gray rectangles behind message
 | Feature | What lucid does |
 | :--- | :--- |
 | **Zero Opaque Blocks** | Every surface—markdown, inline `code`, fenced code blocks, tables, diffs, modals, and the composer—leaves your terminal background untouched (enforced by automated tests across all 5 themes). |
-| **Remote SSH + `tmux` Native** | DEC synchronized output (`?2026h`/`l`) + row-level differential rendering eliminate streaming flicker and cut SSH bandwidth. Copy replies in one keystroke (`Ctrl+Y`) via OSC 52 with automatic `tmux` passthrough. |
-| **Instant Mouse Toggle** | Press `Ctrl+G` (or `/mouse`) anytime to toggle mouse wheel capture OFF for native terminal drag-select, then toggle right back ON. |
+| **Remote SSH + `tmux` Native** | DEC synchronized output (`?2026h`/`l`) + row-level differential rendering eliminate streaming flicker. Scrolling uses the terminal's hardware scroll region so only newly revealed rows travel over SSH (~90% fewer bytes per frame), and every row is sanitized before it is written, so heredocs, long commands and wrapped paths can never corrupt the screen. |
+| **Select-to-Copy Mouse** | Drag over the conversation to select; it is copied on release via OSC 52 (with automatic `tmux` passthrough), and `Ctrl+C` copies the selection again. `Ctrl+Y` copies the latest reply; `Ctrl+G` switches to native terminal drag-select while the wheel keeps scrolling the conversation. |
 | **First-Class Antigravity (`agy`)** | Connects to `agy acp --stdio`, reusing your Google login, models, thinking effort (`thought_level`), execution modes, saved history (`/resume` / `-r` / `-c`), inline permissions, and read-only `/quota`. |
-| **Multi-Agent Swarm Board** | Press `Ctrl+B` (`/board`) to inspect Swarm workers, delegated subagents, shared message board feeds, and Markdown artifacts (`/artifacts`) in a split-pane overlay. |
-| **Zero Runtime Dependencies** | Pure Node.js (`>= 20`) ESM. Instant startup, accurate CJK/emoji width alignment via `Intl.Segmenter`, and zero `node_modules` bloat. |
+| **Permission Modes on a Key** | Starts in `auto` mode; `Shift+Tab` switches into a session-only `bypass` that auto-approves every tool permission, and `--bypass` launches with everything approved. |
+| **Live Multi-Agent Status** | A strip above the composer lists every Swarm worker / subagent by name with its state and current action; `Ctrl+B` (`/board`) opens the split-pane board with briefs, output and the shared message board. With agy, state is read from agy's live on-disk session data, so a background subagent finishing shows up as ✓. |
+| **Math & Rich Markdown** | Inline and display LaTeX (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`) renders as Unicode (subscripts, fractions, Greek, operators), `<br>` inside table cells becomes a real line break, and prices like `$5` are left alone. |
+| **Collapsed Long Pastes** | Pastes over 4 lines or 300 characters become a `[Pasted text #1 +11 lines]` chip in the composer, removed with one `Backspace` and expanded to the full text on send. |
+| **Zero Runtime Dependencies** | Pure Node.js (`>= 20`) ESM. Instant startup, grapheme-accurate CJK/emoji widths, and linear-time wrapping so even very long replies stay fast. |
 
 ---
 
@@ -98,7 +101,15 @@ Switch themes on the fly with `/theme` or at launch via `--theme <name>` (saved 
 
 ## Swarm Board, Artifacts & Multimodal Input
 
-Press **`Ctrl+B`** (or run `/board`) to inspect active **Swarm** workers, **Subagents**, and their shared board messages side by side without leaving your terminal. Generated Markdown plans or reports are indexed automatically under `/artifacts`.
+While **Swarm** workers or **Subagents** are running, a strip above the composer names each member with its state, and the active one shows what it is doing:
+
+```text
+⠋ Swarm "parser rewrite" 2 working 1 waiting · ⠋ parser run_command cargo test  ◌ verifier  ✓ Tmp Lister · ^B board
+```
+
+Press **`Ctrl+B`** (or run `/board`) for the split-pane view: the roster on the left; on the right the selected member's brief, current action (`Now:`), last activity time, latest output and transcript path, or the shared message board. Generated Markdown plans or reports are indexed automatically under `/artifacts`.
+
+> ACP only carries the main conversation: `invoke_subagent` completes as soon as the subagent is launched, and nothing reports its progress or reply. With agy, lucid therefore polls the session state agy writes locally once a second (`subagents/`, `messages/`, `swarm/` and each member's transcript under `~/.gemini/antigravity-cli/brain/<session>/.system_generated/`); unchanged files cost almost nothing. Set `"agyDataDir"` in the config if agy's data lives elsewhere.
 
 <p align="center">
   <img src="assets/swarm-board.svg" alt="lucid Swarm and Subagent multi-pane board view" width="920" />
@@ -107,6 +118,28 @@ Press **`Ctrl+B`** (or run `/board`) to inspect active **Swarm** workers, **Suba
 **Context & Image Attachments:**
 - **`@path`**: Fuzzy-search workspace files (respects `.gitignore` via `git ls-files`) and embed them as ACP `resource` context blocks.
 - **`Ctrl+V` / `/image <path>` / `@screenshot.png` / Drag & Drop**: Stage local clipboard images or file paths (PNG, JPEG, WebP, GIF up to 20 MB) as ACP `image` blocks. Use `/unattach` to clear staged images.
+
+---
+
+## Permissions & Execution Modes
+
+| How | Effect | Scope |
+| :--- | :--- | :--- |
+| Default | Switches the agent to its `auto` mode at start; a mode chosen via `Shift+Tab` / `/mode` is remembered in the config | Persistent |
+| `Shift+Tab` to `bypass` (or `/mode bypass`) | Agent runs in `auto` mode and lucid approves every tool permission request, including a dialog already on screen; a red `bypass` badge appears in the header | This lucid session only, never saved; `Shift+Tab` again restores prompts |
+| `lucid --bypass` (`--yolo` / `--dangerously-skip-permissions`) | Passes `--dangerously-skip-permissions` to `agy acp`, so agy itself approves everything | Whole process; cannot be turned off mid-session |
+| Config `"dangerouslySkipPermissions": true` | Same as always launching with `--bypass` | Persistent |
+
+> In bypass the agent can delete files and run any command without asking. The session-level bypass can only approve what agy asks about; an action agy refuses outright (e.g. sandbox rules) is not overridden.
+
+---
+
+## Mouse, Copy & Scrolling
+
+- **Mouse capture on (default):** the wheel scrolls the conversation; drag to select text and it is copied on release (OSC 52). The selection is anchored to content, so scrolling or streaming output does not shift it. Hold `Shift` (iTerm2: `Option`) to use the terminal's own selection instead.
+- **Mouse capture off (`Ctrl+G` / `--no-mouse`):** dragging is handled natively by the terminal with zero latency; lucid enables alternate-scroll mode so the wheel still scrolls the conversation. With an empty composer even a single `↑` / `↓` scrolls; use `Ctrl+P` / `Ctrl+N` for prompt history.
+- **OSC 52 copy** needs terminal support: VS Code, Windows Terminal, kitty and WezTerm work out of the box; iTerm2 needs "Applications in terminal may access clipboard"; inside `tmux` set `set -g set-clipboard on`.
+- In the VS Code terminal, trackpad scrolling waits until a full line of movement accumulates before sending a wheel event, so the first nudge feels slow; raising `terminal.integrated.mouseWheelScrollSensitivity` to 2–3 helps.
 
 ---
 
@@ -134,10 +167,14 @@ flowchart LR
         UI["Transparent Views & Themes<br/>(Zero Opaque SGR Bg · Intl.Segmenter)"]
         IN["InputParser & Composer<br/>(Slash / @file / Paste / Mouse Toggle)"]
         SW["MultiAgentTracker<br/>(Swarm Board · Subagents · Artifacts)"]
+        ST["AgyStateWatcher<br/>(polls agy on-disk state every 1s)"]
         ACP["AcpClient<br/>(JSON-RPC 2.0 Client)"]
     end
 
     ACP <-->|"NDJSON over stdio<br/>(session/new · list · load · resume · prompt)"| AG["ACP Coding Agent<br/>(agy acp · gemini · opencode · goose · custom)"]
+    AG -.->|"writes"| DISK["~/.gemini/antigravity-cli/brain/{session}/<br/>subagents · messages · swarm · member transcripts"]
+    DISK -.->|"reads"| ST
+    ST --> SW
 ```
 
 ---
@@ -155,7 +192,7 @@ flowchart LR
 | `--cmd "<command>"` | Launch a custom ACP stdio command |
 | `-t, --theme <name>` | Color theme (`transparent`, `tokyo-night`, `catppuccin`, `solarized`, `mono`) |
 | `-m, --model <id>` | Override initial model |
-| `--mode <mode>` | Override initial execution mode (`default`, `accept-edits`, `auto`, `plan`) |
+| `--mode <mode>` | Override initial execution mode (`default`, `accept-edits`, `auto`, `plan`); otherwise the config's `mode` is used (default `auto`) |
 | `--cwd <dir>` | Set workspace directory (defaults to current directory) |
 | `--add-dir <dir>` | Add extra workspace directory (repeatable, `agy`) |
 | `--sandbox` | Pass `--sandbox` to `agy acp` |
@@ -171,7 +208,7 @@ flowchart LR
 | `Ctrl+J` / `Shift+Enter` / `Alt+Enter` / `\`+`Enter` | Insert newline in composer |
 | `Esc` | Close popup/modal, cancel running turn, or jump back to bottom |
 | `Shift+Tab` | Cycle execution mode (`default` / `accept-edits` / `auto` / `plan` / `bypass`). `bypass` = auto mode + every tool permission auto-approved, for this lucid session only (never saved) |
-| `Ctrl+B` / `/board` | Toggle Swarm & Subagent multi-pane board. With agy, member state, current action and the message board are read live from agy's on-disk session state (`~/.gemini/antigravity-cli/brain/<session>/.system_generated/`), so a background subagent finishing shows up as ✓ |
+| `Ctrl+B` / `/board` | Toggle the Swarm & Subagent multi-pane board |
 | `Ctrl+O` / `/expand` | Toggle expanded vs compact tool outputs & diffs |
 | `Ctrl+T` / `/thoughts` | Toggle full thinking/reasoning blocks |
 | Mouse drag | Select timeline text; copied via OSC 52 on release. `Ctrl+C` copies the selection again, `Esc` clears it |
@@ -179,12 +216,13 @@ flowchart LR
 | `Ctrl+G` / `/mouse` | Toggle mouse capture (OFF = native terminal drag-select; wheel still scrolls via alternate-scroll mode) |
 | `Ctrl+P` / `Ctrl+N` | Previous / next prompt from history |
 | `Ctrl+V` / `/image <path>` / `/paste-image` | Attach clipboard image or image file (`@img.png` & drag-drop supported; `/unattach` clears) |
+| Paste long text | Over 4 lines or 300 chars collapses into a `[Pasted text #N +K lines]` chip; `Backspace` removes it whole; `Ctrl+O` shows the full text in the timeline |
 | `Ctrl+L` | Force full screen repaint |
 | `PgUp` / `PgDn` / `Alt+↑` / `Alt+↓` / Wheel | Scroll conversation history |
 | `Ctrl+D` / `Ctrl+C` ×2 / `/quit` | Exit cleanly (`Ctrl+C` once clears composer or cancels turn) |
 | `/resume [id\|filter]` (`/sessions`) | Browse, filter, or directly resume a saved session |
 | `/new` | Start a fresh session |
-| `/model` · `/effort` · `/mode` | Interactive pickers for model, thinking level, and mode |
+| `/model` · `/effort` · `/mode [name]` | Interactive pickers for model, thinking level, and mode (`/mode bypass` for session-level bypass) |
 | `/artifacts` | Browse & read session Markdown artifacts |
 | `/theme [name]` | Switch transparent palette |
 | `/quota` | Check Antigravity quota (read-only CLI probe) |
@@ -204,7 +242,7 @@ Preferences are stored automatically at `~/.config/lucid/config.json` (respects 
   "mode": "auto",
   "dangerouslySkipPermissions": false,
   "mouseCapture": true,
-  "showThoughts": false,
+  "thoughtMode": "fold",
   "expandTools": false,
   "customAgents": {
     "my-agent": {
@@ -216,6 +254,8 @@ Preferences are stored automatically at `~/.config/lucid/config.json` (respects 
   }
 }
 ```
+
+Optional keys: `"agyDataDir"` points at agy's data directory (default `~/.gemini/antigravity-cli`, or the `--app-data-dir` launch argument); `thoughtMode` is `fold`, `expanded` or `hidden`.
 
 For optimal **24-bit TrueColor** and **OSC 52 clipboard** support inside `tmux` over Remote SSH:
 
@@ -247,18 +287,21 @@ lucid/
 │   ├── app.mjs                # Main event loop, session lifecycle, commands, modals
 │   ├── config.mjs             # CLI arg parser, agent presets, user config persistence
 │   ├── acp/
+│   │   ├── agy_state.mjs      # Live Swarm/Subagent state from agy's on-disk session data
 │   │   ├── client.mjs         # ACP protocol client & read-only quota probe
 │   │   └── jsonrpc.mjs        # NDJSON stdio JSON-RPC 2.0 transport
 │   ├── term/
 │   │   ├── ansi.mjs           # TrueColor/ANSI-256/ANSI-16 color mapper & OSC 52
 │   │   ├── input.mjs          # Raw keyboard (Kitty CSI-u), paste, and SGR mouse parser
-│   │   ├── renderer.mjs       # Synchronized output (?2026h/l) row-diff screen renderer
-│   │   └── unicode.mjs        # Grapheme-aware CJK/emoji width & ANSI wrapping
+│   │   ├── renderer.mjs       # Synchronized row-diff renderer, scroll-region shifting, row sanitizing
+│   │   └── unicode.mjs        # Linear-time grapheme widths, ANSI wrapping, selection slicing
 │   └── ui/
 │       ├── composer.mjs       # Multiline editor, cursor layout, slash/@ triggers
 │       ├── diff.mjs           # Transparent inline unified diff renderer
 │       ├── files.mjs          # Workspace file index & image/resource ACP block builder
-│       ├── markdown.mjs       # Streaming Markdown + lightweight syntax highlighter
+│       ├── markdown.mjs       # Streaming Markdown (tables with <br>, math) + syntax highlighter
+│       ├── math.mjs           # LaTeX math → Unicode renderer
+│       ├── selection.mjs      # Mouse text selection, highlight & copy extraction
 │       ├── swarm.mjs          # Multi-agent Swarm, Subagent & Artifact tracker + board UI
 │       ├── themes.mjs         # 5 zero-opaque-background color palettes
 │       └── views.mjs          # Header, timeline, autocomplete popup, and overlay modals

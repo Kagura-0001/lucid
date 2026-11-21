@@ -35,11 +35,14 @@
 | 特性 | 说明 |
 | :--- | :--- |
 | **零不透明底块** | 对话流、行内 `code`、代码块、Markdown 表格、Diff、弹窗和输入框全部透明贴合你的终端底色，并通过自动化测试校验全 5 套主题零背景色码泄露。 |
-| **Remote SSH + `tmux` 深度适配** | 基于 DEC 同步输出（`?2026h`/`l`）+ 行级差分刷新，彻底告别流式输出闪烁并降低 SSH 带宽占用；按 `Ctrl+Y` 通过 OSC 52（自动兼容 `tmux` 透传）一键复制最新回复到本地剪贴板。 |
-| **鼠标模式随手切换** | 按 `Ctrl+G`（或 `/mouse`）随时关闭滚轮捕获，切回终端原生鼠标拖拽选中复制；再按一次恢复滚轮翻页。 |
+| **Remote SSH + `tmux` 深度适配** | DEC 同步输出（`?2026h`/`l`）+ 行级差分刷新，流式输出不闪烁；滚动时用终端硬件滚动区域只补发新露出的行（每帧数据量约减少 90%），每一行写出前都会清理控制字符，长命令、heredoc、超长路径不会把屏幕画花。 |
+| **鼠标选中即复制** | 在对话区拖拽选中，松开即通过 OSC 52（自动兼容 `tmux` 透传）复制到本地剪贴板，有选区时 `Ctrl+C` 再复制一次；`Ctrl+Y` 复制最新整条回复；`Ctrl+G` 随时切回终端原生拖拽选中，滚轮照样能滚对话区。 |
 | **原生支持 Antigravity (`agy`)** | 直连 `agy acp --stdio`，直接复用你的 Google 登录态、模型列表、思考强度（`thought_level`）、执行模式、权限审批弹窗、历史会话恢复（`/resume` / `-r` / `-c`）与只读 `/quota` 查询。 |
-| **多 Agent Swarm 看板** | 按 `Ctrl+B`（`/board`）打开分栏看板，实时查看 Swarm Worker、子 Agent 状态、共享消息板与 `/artifacts` Markdown 产物。 |
-| **零外部运行时依赖** | 纯 Node.js（`>= 20`）ESM 实现，秒级启动；内置基于 `Intl.Segmenter` 的中日韩字符与 Emoji 精确列宽计算，不折行错位。 |
+| **权限模式随手切** | 默认 `auto` 模式；`Shift+Tab` 可在会话内切到 `bypass`（自动批准所有工具权限，仅本次会话有效），也可以用 `--bypass` 启动整段全放行。 |
+| **多 Agent Swarm 看板** | 输入框上方直接列出每个 Swarm Worker / Subagent 的名字、状态和正在执行的动作；`Ctrl+B`（`/board`）打开分栏看板看任务说明、输出和共享消息板。使用 agy 时状态读取自 agy 落盘的实时数据，后台 Subagent 跑完会及时显示 ✓。 |
+| **公式与富 Markdown** | 行内 / 块级 LaTeX（`$...$`、`$$...$$`、`\(...\)`、`\[...\]`）渲染为 Unicode（下标、分数、希腊字母、运算符），表格单元格里的 `<br>` 会真正换行，`$5` 这类价格不会被误判成公式。 |
+| **长粘贴自动折叠** | 粘贴超过 4 行或 300 字符时，输入框里折叠成 `[Pasted text #1 +11 lines]` 标签，一次 `Backspace` 整块删除，发送时自动展开成完整原文。 |
+| **零外部运行时依赖** | 纯 Node.js（`>= 20`）ESM 实现，秒级启动；中日韩字符与 Emoji 按字形计算列宽，长文本换行耗时随长度线性增长，几万字的回复也不卡。 |
 
 ---
 
@@ -98,7 +101,15 @@ lucid --cmd "gemini --experimental-acp"
 
 ## Swarm 看板、产物浏览与多模态附件
 
-按 **`Ctrl+B`**（或输入 `/board`）可切入分栏视图，一边盯着 **Swarm Worker** 和 **Subagent** 的运行状态，一边刷共享消息板；会话中生成的 Markdown 计划或报告会自动收集到 `/artifacts` 弹窗里供滚动阅读与一键复制。
+有 **Swarm Worker** 或 **Subagent** 在跑时，输入框上方会出现一行状态条，按名字列出每个成员的状态，正在干活的那个还会带上当前动作，例如：
+
+```text
+⠋ Swarm "parser rewrite" 2 working 1 waiting · ⠋ parser run_command cargo test  ◌ verifier  ✓ Tmp Lister · ^B board
+```
+
+按 **`Ctrl+B`**（或输入 `/board`）切入分栏视图：左侧是成员列表，右侧可看选中成员的任务说明、当前动作（`Now:`）、上次活动时间、最新输出和对话记录路径，或切到共享消息板。会话中生成的 Markdown 计划或报告会自动收集到 `/artifacts` 弹窗里供滚动阅读与一键复制。
+
+> ACP 协议只传主对话的内容：`invoke_subagent` 在子代理刚启动时就报完成，子代理之后的进展和回复不会出现在 ACP 里。所以使用 agy 时，lucid 每秒读取一次 agy 写在本地的会话状态（`~/.gemini/antigravity-cli/brain/<会话ID>/.system_generated/` 下的 `subagents/`、`messages/`、`swarm/` 以及各成员的对话记录），文件没变化时几乎不耗时。数据目录不在默认位置时，可在配置里写 `"agyDataDir"`。
 
 <p align="center">
   <img src="assets/swarm-board.svg" alt="lucid Swarm 与 Subagent 多栏看板界面" width="920" />
@@ -107,6 +118,28 @@ lucid --cmd "gemini --experimental-acp"
 **上下文与图片附件：**
 - **`@path`**：输入 `@` 模糊检索工作区文件（遵循 `.gitignore`），作为 ACP `resource` 上下文块发给模型。
 - **`Ctrl+V` / `/image <path>` / `@img.png` / 拖拽路径粘贴**：读取本地剪贴板图片或指定路径图片（支持 PNG / JPEG / WebP / GIF，最大 20 MB），以 ACP `image` 块发送；可用 `/unattach` 清空待发图片。
+
+---
+
+## 权限与执行模式
+
+| 方式 | 效果 | 生效范围 |
+| :--- | :--- | :--- |
+| 默认 | 启动后自动切到 agent 的 `auto` 模式；用 `Shift+Tab` / `/mode` 换过的模式会记到配置里 | 一直有效 |
+| `Shift+Tab` 切到 `bypass`（或 `/mode bypass`） | agent 用 `auto` 模式运行，lucid 自动批准所有工具权限请求，已经弹着的权限框也会直接批掉；顶栏显示红色 `bypass` | 只在本次 lucid 会话有效，不写入配置；再按 `Shift+Tab` 恢复询问 |
+| `lucid --bypass`（`--yolo` / `--dangerously-skip-permissions`） | 给 `agy acp` 传 `--dangerously-skip-permissions`，由 agy 自己全部放行 | 整个进程；会话中途关不掉 |
+| 配置 `"dangerouslySkipPermissions": true` | 等同于每次都带 `--bypass` 启动 | 长期 |
+
+> bypass 下 agent 删文件、跑任意命令都不会再询问。会话内的 bypass 只能批准 agy 发来询问的操作，agy 因沙箱等原因直接拒绝、没有来问的操作，lucid 也绕不过去。
+
+---
+
+## 鼠标、复制与滚动
+
+- **鼠标接管开启（默认）**：滚轮滚动对话区；拖拽选中对话文字，松开自动复制（OSC 52），选区跟着内容走，滚动或有新输出时不会错位。想用终端原生选择时按住 `Shift` 拖拽（iTerm2 为 `Option`）。
+- **鼠标接管关闭（`Ctrl+G` / `--no-mouse`）**：拖拽交给终端原生处理，延迟最低；lucid 会开启终端的 alternate-scroll 模式，滚轮照样滚对话区。输入框为空时单个 `↑` / `↓` 也会滚动，翻历史输入用 `Ctrl+P` / `Ctrl+N`。
+- **OSC 52 复制**需要终端支持：VS Code、Windows Terminal、kitty、WezTerm 可直接用；iTerm2 需打开“允许终端程序访问剪贴板”；`tmux` 里需 `set -g set-clipboard on`。
+- 在 VS Code 终端里用触控板滚动时，VS Code 会先攒够一行的滑动量才发出滚轮事件，起步会略慢；可把 `terminal.integrated.mouseWheelScrollSensitivity` 调到 2～3。
 
 ---
 
@@ -134,10 +167,14 @@ flowchart LR
         UI["透明视图与主题系统<br/>（零背景色块 · Intl.Segmenter 宽字符对齐）"]
         IN["InputParser 与输入框<br/>（斜杠补全 · @文件检索 · 粘贴 · 鼠标开关）"]
         SW["MultiAgentTracker<br/>（Swarm 看板 · Subagent · Artifacts）"]
+        ST["AgyStateWatcher<br/>（每秒读取 agy 落盘状态）"]
         ACP["AcpClient<br/>（JSON-RPC 2.0 客户端）"]
     end
 
     ACP <-->|"stdio NDJSON<br/>(session/new · list · load · resume · prompt)"| AG["ACP 编程 Agent<br/>(agy acp · gemini · opencode · goose · 自定义)"]
+    AG -.->|"写入"| DISK["~/.gemini/antigravity-cli/brain/{会话ID}/<br/>subagents · messages · swarm · 成员对话记录"]
+    DISK -.->|"读取"| ST
+    ST --> SW
 ```
 
 ---
@@ -155,7 +192,7 @@ flowchart LR
 | `--cmd "<command>"` | 启动自定义 ACP stdio 命令 |
 | `-t, --theme <name>` | 指定透明主题（`transparent`, `tokyo-night`, `catppuccin`, `solarized`, `mono`） |
 | `-m, --model <id>` | 启动后切换指定模型 |
-| `--mode <mode>` | 启动后切换执行模式（`default`, `accept-edits`, `auto`, `plan`） |
+| `--mode <mode>` | 启动后切换执行模式（`default`, `accept-edits`, `auto`, `plan`）；不传时使用配置里的 `mode`（默认 `auto`） |
 | `--cwd <dir>` | 指定工作区目录（默认为当前目录） |
 | `--add-dir <dir>` | 追加额外工作区目录（可重复传入，适用于 `agy`） |
 | `--sandbox` | 向 `agy acp` 传递 `--sandbox` |
@@ -171,7 +208,7 @@ flowchart LR
 | `Ctrl+J` / `Shift+Enter` / `Alt+Enter` / `\`+`Enter` | 输入框换行 |
 | `Esc` | 关闭弹窗 / 中断当前生成 / 回到对话底部 |
 | `Shift+Tab` | 循环切换执行模式（`default` / `accept-edits` / `auto` / `plan` / `bypass`）。`bypass` = auto 模式 + 自动批准所有工具权限，只在本次 lucid 会话有效，不写入配置 |
-| `Ctrl+B` / `/board` | 打开/关闭 Swarm 与 Subagent 多栏看板。使用 agy 时，成员状态、当前动作、消息板直接读取 agy 落盘的实时状态（`~/.gemini/antigravity-cli/brain/<session>/.system_generated/`），后台 subagent 跑完也能及时变成 ✓ |
+| `Ctrl+B` / `/board` | 打开/关闭 Swarm 与 Subagent 多栏看板 |
 | `Ctrl+O` / `/expand` | 切换工具输出与 Diff 展开/折叠 |
 | `Ctrl+T` / `/thoughts` | 切换思考过程（Thought）完整显示/折叠 |
 | 鼠标拖拽 | 在对话区选中文字，松开即通过 OSC 52 复制；有选区时 `Ctrl+C` 再复制一次，`Esc` 取消选区 |
@@ -179,12 +216,13 @@ flowchart LR
 | `Ctrl+G` / `/mouse` | 切换鼠标滚轮捕获（关闭后可用终端原生拖拽复制，滚轮仍通过 alternate-scroll 滚动对话区） |
 | `Ctrl+P` / `Ctrl+N` | 上一条 / 下一条历史输入 |
 | `Ctrl+V` / `/image <path>` / `/paste-image` | 附带剪贴板或本地图片（支持 `@img.png` 与路径拖放；`/unattach` 清空） |
+| 粘贴长文本 | 超过 4 行或 300 字符时折叠成 `[Pasted text #N +K lines]` 标签；`Backspace` 整块删除；`Ctrl+O` 展开后可在时间线查看原文 |
 | `Ctrl+L` | 强制全屏重绘 |
 | `PgUp` / `PgDn` / `Alt+↑` / `Alt+↓` / 滚轮 | 滚动浏览历史消息 |
 | `Ctrl+D` / 连按两次 `Ctrl+C` / `/quit` | 安全退出（输入非空或生成中单按 `Ctrl+C` 为清空/中断） |
 | `/resume [id\|filter]` (`/sessions`) | 打开历史会话选择器，或按 ID/关键词过滤并恢复 |
 | `/new` | 开启新对话 |
-| `/model` · `/effort` · `/mode` | 交互式切换模型、思考档位与执行模式 |
+| `/model` · `/effort` · `/mode [name]` | 交互式切换模型、思考档位与执行模式（`/mode bypass` 进入会话内全放行） |
 | `/artifacts` | 浏览并阅读当前会话记录到的 Markdown 产物 |
 | `/theme [name]` | 切换透明主题 |
 | `/quota` | 查询 Antigravity 额度（只读，不消耗对话配额） |
@@ -204,7 +242,7 @@ flowchart LR
   "mode": "auto",
   "dangerouslySkipPermissions": false,
   "mouseCapture": true,
-  "showThoughts": false,
+  "thoughtMode": "fold",
   "expandTools": false,
   "customAgents": {
     "my-agent": {
@@ -216,6 +254,8 @@ flowchart LR
   }
 }
 ```
+
+可选项：`"agyDataDir"` 指定 agy 数据目录（默认 `~/.gemini/antigravity-cli`，或启动参数里的 `--app-data-dir`）；`thoughtMode` 取 `fold` / `expanded` / `hidden`。
 
 在 Remote SSH + `tmux` 下获得完整 **24-bit TrueColor** 和 **OSC 52 剪贴板复制**，推荐在 `~/.tmux.conf` 中开启：
 
