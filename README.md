@@ -159,7 +159,7 @@ flowchart LR
 | `--cwd <dir>` | Set workspace directory (defaults to current directory) |
 | `--add-dir <dir>` | Add extra workspace directory (repeatable, `agy`) |
 | `--sandbox` | Pass `--sandbox` to `agy acp` |
-| `--dangerously-skip-permissions` | Pass `--dangerously-skip-permissions` to `agy acp` |
+| `--dangerously-skip-permissions` / `--bypass` / `--yolo` | Pass `--dangerously-skip-permissions` to `agy acp` (also settable as `"dangerouslySkipPermissions": true` in config) |
 | `--no-mouse` | Disable mouse wheel capture so native drag-select is always active |
 | `-v, --version` / `-h, --help` | Print version or help |
 
@@ -176,7 +176,8 @@ flowchart LR
 | `Ctrl+T` / `/thoughts` | Toggle full thinking/reasoning blocks |
 | Mouse drag | Select timeline text; copied via OSC 52 on release. `Ctrl+C` copies the selection again, `Esc` clears it |
 | `Ctrl+Y` / `/copy` | Copy latest assistant reply to local clipboard via OSC 52 |
-| `Ctrl+G` / `/mouse` | Toggle mouse capture (OFF = native terminal drag-select) |
+| `Ctrl+G` / `/mouse` | Toggle mouse capture (OFF = native terminal drag-select; wheel still scrolls via alternate-scroll mode) |
+| `Ctrl+P` / `Ctrl+N` | Previous / next prompt from history |
 | `Ctrl+V` / `/image <path>` / `/paste-image` | Attach clipboard image or image file (`@img.png` & drag-drop supported; `/unattach` clears) |
 | `Ctrl+L` | Force full screen repaint |
 | `PgUp` / `PgDn` / `Alt+↑` / `Alt+↓` / Wheel | Scroll conversation history |
@@ -200,6 +201,8 @@ Preferences are stored automatically at `~/.config/lucid/config.json` (respects 
 {
   "theme": "tokyo-night",
   "agent": "agy",
+  "mode": "auto",
+  "dangerouslySkipPermissions": false,
   "mouseCapture": true,
   "showThoughts": false,
   "expandTools": false,

@@ -552,7 +552,18 @@ export function wrapAnsiText(text, maxWidth) {
  * A wide grapheme is included when its first column falls inside the range.
  */
 export function sliceVisibleColumns(text, fromCol, toCol) {
+  if (!text || toCol <= fromCol) return "";
+  if (!text.includes("\x1b") && PRINTABLE_ASCII_RE.test(text)) {
+    const start = Math.max(0, fromCol);
+    const end = Math.min(text.length, toCol);
+    return start < end ? text.slice(start, end) : "";
+  }
   const plain = stripAnsi(sanitizeTerminalRow(text));
+  if (PRINTABLE_ASCII_RE.test(plain)) {
+    const start = Math.max(0, fromCol);
+    const end = Math.min(plain.length, toCol);
+    return start < end ? plain.slice(start, end) : "";
+  }
   let column = 0;
   let output = "";
   for (const grapheme of splitGraphemes(plain)) {
@@ -576,6 +587,19 @@ const INVERSE_OFF = "\x1b[27m";
 export function highlightVisibleColumns(text, fromCol, toCol) {
   const row = sanitizeTerminalRow(text || "");
   if (toCol <= fromCol) return row;
+
+  // Fast path for plain printable ASCII rows (no ANSI escapes, 1 col per char).
+  if (!row.includes("\x1b") && PRINTABLE_ASCII_RE.test(row)) {
+    const start = Math.max(0, fromCol);
+    const end = Math.min(row.length, toCol);
+    if (start > row.length) return row;
+    const before = row.slice(0, start);
+    const selected = row.slice(start, end);
+    const after = row.slice(end);
+    const tailPad = row.length < toCol && row.length >= fromCol ? " " : "";
+    if (!selected && !tailPad) return row;
+    return `${before}${INVERSE_ON}${selected}${tailPad}${INVERSE_OFF}${after}`;
+  }
 
   let output = "";
   let column = 0;

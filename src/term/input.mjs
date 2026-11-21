@@ -130,6 +130,11 @@ export class InputParser {
       if (this.buffer === "\x1b") {
         this.buffer = "";
         this.emit({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+      } else if (this.buffer.startsWith("\x1b[M")) {
+        // Incomplete X10 mouse report (for example, two raw high coordinate bytes
+        // merged into one UTF-8 character at end of stream). Discard instead of
+        // leaking coordinate bytes into the text composer.
+        this.buffer = "";
       } else if (this.buffer.startsWith("\x1b")) {
         // Fallback: flush raw escape then continue parsing remainder
         this.buffer = this.buffer.slice(1);
@@ -137,6 +142,24 @@ export class InputParser {
         this.processBuffer();
       }
     }, 35);
+  }
+
+  emitMouseButton(button, col, row, pressed) {
+    // Strip modifier bits (4 = Shift, 8 = Meta, 16 = Ctrl); 32 marks motion.
+    const baseButton = button & ~(4 | 8 | 16);
+    const MOTION_BIT = 32;
+
+    if (baseButton === 64) {
+      this.emit({ type: "mouse", action: "wheelUp", col, row });
+    } else if (baseButton === 65) {
+      this.emit({ type: "mouse", action: "wheelDown", col, row });
+    } else if (baseButton === MOTION_BIT) {
+      this.emit({ type: "mouse", action: "leftDrag", col, row });
+    } else if (baseButton === 0 && pressed) {
+      this.emit({ type: "mouse", action: "leftDown", col, row });
+    } else if ((baseButton === 0 && !pressed) || baseButton === 3) {
+      this.emit({ type: "mouse", action: "leftUp", col, row });
+    }
   }
 
   tryParseEscapeSequence() {
@@ -148,6 +171,43 @@ export class InputParser {
     // CSI sequences: \x1b[ ...
     if (second === "[") {
       if (buf.length === 2) return 0;
+
+      // X10 / Normal Mouse: \x1b[M <Cb> <Cx> <Cy>
+      // Terminals fall back to this format whenever mode 1000/1002 is enabled
+      // without SGR mode 1006. Handle it before the generic CSI regex so \x1b[M
+      // is never stripped while leaving raw coordinate bytes in the text buffer.
+      if (buf[2] === "M") {
+        // Valid X10 payload bytes are always >= 0x20, so an ESC means the
+        // previous report was shorter (e.g. two high bytes merged by UTF-8
+        // decoding) and a new escape sequence has already started.
+        const maxEnd = Math.min(buf.length, 6);
+        for (let idx = 3; idx < maxEnd; idx += 1) {
+          if (buf[idx] === "\x1b") {
+            return idx;
+          }
+        }
+        if (buf.length < 6) {
+          return 0;
+        }
+        const cbCode = buf.charCodeAt(3);
+        const cxCode = buf.charCodeAt(4);
+        const cyCode = buf.charCodeAt(5);
+        const allValidCoords =
+          cbCode >= 32 &&
+          cxCode >= 32 &&
+          cyCode >= 32 &&
+          cbCode !== 0xfffd &&
+          cxCode !== 0xfffd &&
+          cyCode !== 0xfffd;
+        if (allValidCoords) {
+          const button = cbCode - 32;
+          const col = cxCode - 32;
+          const row = cyCode - 32;
+          const isRelease = (button & 3) === 3 && (button & 64) === 0;
+          this.emitMouseButton(button, col, row, !isRelease);
+        }
+        return 6;
+      }
 
       // SGR Mouse: \x1b[<b;x;yM or m
       if (buf[2] === "<") {
@@ -163,21 +223,7 @@ export class InputParser {
         const col = Number.parseInt(mouseMatch[2], 10);
         const row = Number.parseInt(mouseMatch[3], 10);
         const pressed = mouseMatch[4] === "M";
-        // Strip modifier bits (4 = Shift, 8 = Meta, 16 = Ctrl); 32 marks motion.
-        const baseButton = button & ~(4 | 8 | 16);
-        const MOTION_BIT = 32;
-
-        if (baseButton === 64) {
-          this.emit({ type: "mouse", action: "wheelUp", col, row });
-        } else if (baseButton === 65) {
-          this.emit({ type: "mouse", action: "wheelDown", col, row });
-        } else if (baseButton === MOTION_BIT) {
-          this.emit({ type: "mouse", action: "leftDrag", col, row });
-        } else if (baseButton === 0 && pressed) {
-          this.emit({ type: "mouse", action: "leftDown", col, row });
-        } else if (baseButton === 0 && !pressed) {
-          this.emit({ type: "mouse", action: "leftUp", col, row });
-        }
+        this.emitMouseButton(button, col, row, pressed);
         return mouseMatch[0].length;
       }
 

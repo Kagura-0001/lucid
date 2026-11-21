@@ -17,6 +17,15 @@ export function createSelection(line, col) {
   };
 }
 
+export function cloneSelection(selection) {
+  if (!selection) return null;
+  return {
+    anchor: { line: selection.anchor.line, col: selection.anchor.col },
+    head: { line: selection.head.line, col: selection.head.col },
+    dragging: Boolean(selection.dragging),
+  };
+}
+
 function comparePositions(a, b) {
   if (a.line !== b.line) return a.line - b.line;
   return a.col - b.col;
@@ -68,6 +77,48 @@ export function highlightSelectionInViewport(viewportRows, firstLineIndex, selec
     if (!columns) return row;
     return highlightVisibleColumns(row, columns.fromCol, columns.toCol);
   });
+}
+
+function sameColumnRange(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.fromCol === b.fromCol && a.toCol === b.toCol;
+}
+
+/**
+ * Updates only the viewport rows whose highlight changed between `prevSelection`
+ * and `nextSelection`, writing into `frameRows` in place starting at `topRow`.
+ * Returns the number of rows touched.
+ */
+export function patchSelectionInFrame({
+  frameRows,
+  viewportRawRows,
+  topRow,
+  firstLineIndex,
+  prevSelection,
+  nextSelection,
+}) {
+  const prevRange = prevSelection && !isSelectionEmpty(prevSelection) ? orderedSelectionRange(prevSelection) : null;
+  const nextRange = nextSelection && !isSelectionEmpty(nextSelection) ? orderedSelectionRange(nextSelection) : null;
+  if (!prevRange && !nextRange) {
+    return 0;
+  }
+
+  let touched = 0;
+  for (let offset = 0; offset < viewportRawRows.length; offset += 1) {
+    const lineIndex = firstLineIndex + offset;
+    const prevCols = prevRange ? selectedColumnsOnLine(prevRange, lineIndex) : null;
+    const nextCols = nextRange ? selectedColumnsOnLine(nextRange, lineIndex) : null;
+    if (sameColumnRange(prevCols, nextCols)) {
+      continue;
+    }
+    const rawRow = viewportRawRows[offset];
+    frameRows[topRow + offset] = nextCols
+      ? highlightVisibleColumns(rawRow, nextCols.fromCol, nextCols.toCol)
+      : rawRow;
+    touched += 1;
+  }
+  return touched;
 }
 
 function leadingSpaceCount(text) {

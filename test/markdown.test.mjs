@@ -82,3 +82,40 @@ test("computeLineDiff and renderDiffLines produce clean transparent diffs", () =
     assert.ok(displayWidth(line) <= 70);
   }
 });
+
+test("renders LaTeX inline/block formulas and HTML <br> breaks cleanly inside tables", () => {
+  const sample = [
+    "| 做法 | 每个 bin 的分母 $N_i$ | 短 QA 拿到的梯度份额 | 跳绳拿到的梯度份额 |",
+    "| :--- | :--- | :--- | :--- |",
+    "| 纯 bin：1 个纯短 QA bin + 1 个纯跳绳 bin | 短 QA bin $N_1 = 40$<br>跳绳 bin $N_2 = 1200$ | 50%（1 个完整 bin 份额）<br>单 token 权重 $\\propto \\frac{1}{40}$ | 50%（1 个完整 bin 份额）<br>单 token 权重 $\\propto \\frac{1}{1200}$ |",
+    "| 混打 bin：2 个 bin，每个装 2 短 QA + 2 跳绳 | 每个 bin 都是<br>$N_{\\text{混}} = 20 + 600 = 620$ | 3.2%（$\\frac{20}{620}$，暴跌 15.5 倍）<br>单 token 权重 $\\propto \\frac{1}{620}$ | 96.8%（$\\frac{600}{620}$，暴涨 1.94 倍）<br>单 token 权重 $\\propto \\frac{1}{620}$ |",
+    "",
+    "$$",
+    "L = \\sum_{i=1}^{n} \\frac{1}{N_i} \\cdot \\ell_i",
+    "$$",
+    "",
+    "价格对比：原价 $5 和 $10 不应误判为公式，变量 \\$HOME 也应原样保留。",
+  ].join("\n");
+
+  const style = createThemeStyler("tokyo-night", "truecolor");
+  const lines = renderMarkdown(sample, 140, style);
+  const plain = lines.map(stripAnsi).join("\n");
+
+  assert.equal(plain.includes("<br>"), false, "HTML <br> should split into lines, not render literally");
+  assert.equal(plain.includes("\\frac"), false, "LaTeX \\frac should be rendered");
+  assert.equal(plain.includes("\\propto"), false, "LaTeX \\propto should be rendered");
+  assert.equal(plain.includes("\\text"), false, "LaTeX \\text should be rendered");
+  assert.ok(plain.includes("Nᵢ"), plain);
+  assert.ok(plain.includes("N₁ = 40"), plain);
+  assert.ok(plain.includes("N₂ = 1200"), plain);
+  assert.ok(plain.includes("N_混 = 20 + 600 = 620"), plain);
+  assert.ok(plain.includes("∝ 1/40"), plain);
+  assert.ok(plain.includes("20/620"), plain);
+  assert.ok(plain.includes("∑ᵢ₌₁ⁿ"), plain);
+  assert.ok(plain.includes("$5 和 $10"), "currency should not be mangled as math");
+  assert.ok(plain.includes("$HOME"), "escaped dollar should remain literal");
+
+  for (const line of lines) {
+    assert.ok(displayWidth(line) <= 140, `overflowed: ${stripAnsi(line)}`);
+  }
+});

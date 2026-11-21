@@ -1,5 +1,10 @@
 import { graphemeWidth, splitGraphemes } from "../term/unicode.mjs";
 
+export const PASTED_TOKEN_REGEX = /\[Pasted text #\d+ [^\]]+\]/g;
+const LONG_PASTE_LINE_THRESHOLD = 4;
+const LONG_PASTE_CHAR_THRESHOLD = 300;
+const MAX_PASTED_REGISTRY = 100;
+
 export class Composer {
   constructor() {
     this.text = "";
@@ -8,6 +13,8 @@ export class Composer {
     this.historyIndex = -1;
     this.historyDraft = "";
     this.scrollTop = 0;
+    this.pastedRegistry = new Map();
+    this.nextPasteId = 1;
   }
 
   getGraphemes() {
@@ -57,9 +64,81 @@ export class Composer {
     this.historyIndex = -1;
   }
 
+  /**
+   * Inserts bracketed-paste content. Long or multi-line pastes are collapsed
+   * into a compact placeholder chip (like Claude Code / Codex) while the full
+   * text is kept in `pastedRegistry` and expanded on submit.
+   */
+  insertPaste(str) {
+    if (!str) {
+      return { collapsed: false, token: null, lineCount: 0, charCount: 0 };
+    }
+    const normalized = String(str).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const lineCount = normalized.split("\n").length;
+    const charCount = normalized.length;
+
+    if (lineCount >= LONG_PASTE_LINE_THRESHOLD || charCount >= LONG_PASTE_CHAR_THRESHOLD) {
+      const id = this.nextPasteId;
+      this.nextPasteId += 1;
+      const summary = lineCount >= 2 ? `+${lineCount - 1} lines` : `${charCount} chars`;
+      const token = `[Pasted text #${id} ${summary}]`;
+      this.pastedRegistry.set(token, normalized);
+      if (this.pastedRegistry.size > MAX_PASTED_REGISTRY) {
+        const oldestKey = this.pastedRegistry.keys().next().value;
+        this.pastedRegistry.delete(oldestKey);
+      }
+      this.insert(token);
+      return { collapsed: true, token, lineCount, charCount };
+    }
+
+    this.insert(normalized);
+    return { collapsed: false, token: null, lineCount, charCount };
+  }
+
+  /**
+   * Expands any collapsed `[Pasted text #N ...]` placeholders back to their
+   * original full text before sending to the agent.
+   */
+  expandText(sourceText = this.text) {
+    const raw = String(sourceText ?? "");
+    if (this.pastedRegistry.size === 0 || !raw.includes("[Pasted text #")) {
+      return raw;
+    }
+    return raw.replace(PASTED_TOKEN_REGEX, (match) =>
+      this.pastedRegistry.has(match) ? this.pastedRegistry.get(match) : match,
+    );
+  }
+
+  findPastedTokenBoundary(graphemes, direction) {
+    if (this.pastedRegistry.size === 0) return null;
+    for (const token of this.pastedRegistry.keys()) {
+      const tokenLen = token.length; // tokens are pure ASCII
+      if (direction === "before") {
+        const start = this.cursor - tokenLen;
+        if (start >= 0 && graphemes.slice(start, this.cursor).join("") === token) {
+          return { start, length: tokenLen };
+        }
+      } else {
+        const end = this.cursor + tokenLen;
+        if (end <= graphemes.length && graphemes.slice(this.cursor, end).join("") === token) {
+          return { start: this.cursor, length: tokenLen };
+        }
+      }
+    }
+    return null;
+  }
+
   backspace() {
     if (this.cursor <= 0) return false;
     const graphemes = this.getGraphemes();
+    const tokenHit = this.findPastedTokenBoundary(graphemes, "before");
+    if (tokenHit) {
+      graphemes.splice(tokenHit.start, tokenHit.length);
+      this.text = graphemes.join("");
+      this.cursor = tokenHit.start;
+      this.historyIndex = -1;
+      return true;
+    }
     graphemes.splice(this.cursor - 1, 1);
     this.text = graphemes.join("");
     this.cursor -= 1;
@@ -70,6 +149,13 @@ export class Composer {
   deleteForward() {
     const graphemes = this.getGraphemes();
     if (this.cursor >= graphemes.length) return false;
+    const tokenHit = this.findPastedTokenBoundary(graphemes, "after");
+    if (tokenHit) {
+      graphemes.splice(tokenHit.start, tokenHit.length);
+      this.text = graphemes.join("");
+      this.historyIndex = -1;
+      return true;
+    }
     graphemes.splice(this.cursor, 1);
     this.text = graphemes.join("");
     this.historyIndex = -1;

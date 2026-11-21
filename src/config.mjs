@@ -52,6 +52,8 @@ export const AGENT_PRESETS = {
 export const DEFAULT_CONFIG = {
   theme: "transparent",
   agent: "agy",
+  mode: "auto",
+  dangerouslySkipPermissions: false,
   mouseCapture: true,
   thoughtMode: "fold",
   showThoughts: false,
@@ -180,7 +182,7 @@ export function resolveAgentLaunch(options, userConfig) {
   if (options.sandbox && (agentKey === "agy" || agentKey === "antigravity")) {
     args.push("--sandbox");
   }
-  if (options.dangerouslySkipPermissions && (agentKey === "agy" || agentKey === "antigravity")) {
+  if ((options.dangerouslySkipPermissions || userConfig.dangerouslySkipPermissions) && (agentKey === "agy" || agentKey === "antigravity")) {
     args.push("--dangerously-skip-permissions");
   }
   if (Array.isArray(options.addDirs) && (agentKey === "agy" || agentKey === "antigravity")) {
@@ -244,7 +246,7 @@ export function parseCliArgs(argv) {
       opts.addDirs.push(argv[++i]);
     } else if (arg === "--sandbox") {
       opts.sandbox = true;
-    } else if (arg === "--dangerously-skip-permissions") {
+    } else if (arg === "--dangerously-skip-permissions" || arg === "--bypass" || arg === "--yolo") {
       opts.dangerouslySkipPermissions = true;
     } else if (arg === "--no-mouse") {
       opts.noMouse = true;

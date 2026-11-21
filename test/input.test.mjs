@@ -53,3 +53,41 @@ test("InputParser handles UTF-8 CJK text and lone Escape timeout", async () => {
   assert.equal(events[1].type, "key");
   assert.equal(events[1].name, "escape");
 });
+
+test("InputParser decodes X10 mouse reports and never leaks coordinate bytes into text", async () => {
+  const events = [];
+  const parser = new InputParser((e) => events.push(e));
+
+  // Normal X10 press, drag, release, and wheel (including split across chunks).
+  parser.feed("\x1b[M m");
+  parser.feed("L\x1b[M@nM\x1b[M#nM\x1b[M`!#\x1b[Ma!#");
+
+  // Wide-terminal raw high-byte column (> 95) followed by regular text.
+  parser.feed(Buffer.from([0x1b, 0x5b, 0x4d, 0x20, 0xc3, 0x36]));
+  parser.feed("ok");
+
+  // Two raw high bytes that merge into one UTF-8 codepoint, followed by another report.
+  parser.feed(Buffer.from([0x1b, 0x5b, 0x4d, 0x20, 0xc3, 0x85]));
+  parser.feed("\x1b[M#mL");
+
+  // Standalone merged 5-char X10 packet at end of stream should be discarded on flush.
+  parser.feed(Buffer.from([0x1b, 0x5b, 0x4d, 0x20, 0xc3, 0x85]));
+  await new Promise((r) => setTimeout(r, 60));
+  parser.destroy();
+
+  const textEvents = events.filter((e) => e.type === "text");
+  assert.deepEqual(textEvents, [{ type: "text", text: "ok" }]);
+
+  const mouseEvents = events.filter((e) => e.type === "mouse");
+  assert.deepEqual(
+    mouseEvents.map((e) => `${e.action}@${e.col},${e.row}`),
+    [
+      "leftDown@77,44",
+      "leftDrag@78,45",
+      "leftUp@78,45",
+      "wheelUp@1,3",
+      "wheelDown@1,3",
+      "leftUp@77,44",
+    ],
+  );
+});

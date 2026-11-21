@@ -159,7 +159,7 @@ flowchart LR
 | `--cwd <dir>` | 指定工作区目录（默认为当前目录） |
 | `--add-dir <dir>` | 追加额外工作区目录（可重复传入，适用于 `agy`） |
 | `--sandbox` | 向 `agy acp` 传递 `--sandbox` |
-| `--dangerously-skip-permissions` | 向 `agy acp` 传递 `--dangerously-skip-permissions` |
+| `--dangerously-skip-permissions` / `--bypass` / `--yolo` | 向 `agy acp` 传递 `--dangerously-skip-permissions`（也可在配置里写 `"dangerouslySkipPermissions": true`） |
 | `--no-mouse` | 启动时禁用鼠标滚轮捕获，始终保持原生拖拽选中 |
 | `-v, --version` / `-h, --help` | 查看版本号或帮助信息 |
 
@@ -176,7 +176,8 @@ flowchart LR
 | `Ctrl+T` / `/thoughts` | 切换思考过程（Thought）完整显示/折叠 |
 | 鼠标拖拽 | 在对话区选中文字，松开即通过 OSC 52 复制；有选区时 `Ctrl+C` 再复制一次，`Esc` 取消选区 |
 | `Ctrl+Y` / `/copy` | 通过 OSC 52 复制最新一条助手回复到本地剪贴板 |
-| `Ctrl+G` / `/mouse` | 切换鼠标滚轮捕获（关闭后即可使用终端原生拖拽复制） |
+| `Ctrl+G` / `/mouse` | 切换鼠标滚轮捕获（关闭后可用终端原生拖拽复制，滚轮仍通过 alternate-scroll 滚动对话区） |
+| `Ctrl+P` / `Ctrl+N` | 上一条 / 下一条历史输入 |
 | `Ctrl+V` / `/image <path>` / `/paste-image` | 附带剪贴板或本地图片（支持 `@img.png` 与路径拖放；`/unattach` 清空） |
 | `Ctrl+L` | 强制全屏重绘 |
 | `PgUp` / `PgDn` / `Alt+↑` / `Alt+↓` / 滚轮 | 滚动浏览历史消息 |
@@ -200,6 +201,8 @@ flowchart LR
 {
   "theme": "tokyo-night",
   "agent": "agy",
+  "mode": "auto",
+  "dangerouslySkipPermissions": false,
   "mouseCapture": true,
   "showThoughts": false,
   "expandTools": false,

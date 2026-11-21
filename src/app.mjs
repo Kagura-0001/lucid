@@ -14,10 +14,12 @@ import {
   tryReadClipboardImage,
 } from "./ui/files.mjs";
 import {
+  cloneSelection,
   createSelection,
   extractSelectionText,
   highlightSelectionInViewport,
   isSelectionEmpty,
+  patchSelectionInFrame,
 } from "./ui/selection.mjs";
 import { MultiAgentTracker, renderSwarmBoardView } from "./ui/swarm.mjs";
 import { createThemeStyler, listThemes } from "./ui/themes.mjs";
@@ -179,9 +181,18 @@ export class LucidApp {
     this.boardState = { selectedIdx: 0, tab: "board", scrollOffset: 0, maxDetailScroll: 0 };
 
     // Mouse selection over the timeline (see ui/selection.mjs) and the layout of the
-    // last rendered frame, used to map screen rows to timeline lines.
+    // last rendered frame, used to map screen rows to timeline lines and patch
+    // selection highlights incrementally without rebuilding the timeline.
     this.selection = null;
     this.timelineLayout = null;
+    this.selectionPatchQueued = false;
+    this.selectionPatchTimer = null;
+    this.lastSelectionPatchAt = 0;
+    this.scrollFlushQueued = false;
+    this.scrollFlushTimer = null;
+    this.lastScrollFlushAt = 0;
+    this.lastAltScrollAt = 0;
+    this.pendingChunkEvents = null;
 
     this.renderTimer = null;
     this.renderPriority = false;
@@ -236,11 +247,24 @@ export class LucidApp {
     this.renderer.enter({ mouseCapture: this.state.mouseCapture });
 
     this.inputParser = new InputParser((event) => {
-      this.handleInputEvent(event);
+      if (this.pendingChunkEvents) {
+        this.pendingChunkEvents.push(event);
+      } else {
+        this.handleInputEvent(event);
+      }
     });
 
     this.onStdinData = (chunk) => {
-      this.inputParser.feed(chunk);
+      const batch = [];
+      this.pendingChunkEvents = batch;
+      try {
+        this.inputParser.feed(chunk);
+      } finally {
+        this.pendingChunkEvents = null;
+      }
+      if (batch.length > 0) {
+        this.dispatchInputBatch(batch);
+      }
     };
     process.stdin.on("data", this.onStdinData);
 
@@ -253,8 +277,22 @@ export class LucidApp {
     this.onSignal = () => {
       this.shutdown(0);
     };
+    this.onProcessExit = () => {
+      this.restoreTerminalSync();
+    };
+    process.once("SIGINT", this.onSignal);
     process.once("SIGTERM", this.onSignal);
     process.once("SIGHUP", this.onSignal);
+    process.on("exit", this.onProcessExit);
+  }
+
+  restoreTerminalSync() {
+    try {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    } catch {
+      // Ignore
+    }
+    this.renderer.leave({ sync: true });
   }
 
   async connectAndStartSession() {
@@ -317,21 +355,56 @@ export class LucidApp {
     const created = await this.acp.createSession(this.cwd, this.cliOptions.addDirs || []);
     this.state.sessionId = created.sessionId;
     this.applySessionMetadata(created);
+    if (this.startupOverridesApplied) {
+      await this.applyPreferredMode({ silentIfUnavailable: true });
+    }
+  }
+
+  resolveModeId(requestedMode) {
+    const raw = String(requestedMode || "").trim().toLowerCase();
+    if (!raw) return "";
+    if (this.state.modes.length === 0) return raw;
+    const exact = this.state.modes.find((m) => String(m.id || "").toLowerCase() === raw);
+    if (exact) return exact.id;
+    if (raw === "bypass" || raw === "yolo") {
+      const bypassMatch = this.state.modes.find((m) => /bypass|auto/i.test(String(m.id || "")));
+      if (bypassMatch) return bypassMatch.id;
+    }
+    return "";
+  }
+
+  async applyPreferredMode({ explicitMode = "", silentIfUnavailable = false } = {}) {
+    if (!this.state.sessionId) return;
+    const requested = explicitMode || this.userConfig.mode || "";
+    if (!requested) return;
+    const resolvedId = this.resolveModeId(requested);
+    if (!resolvedId) {
+      if (!silentIfUnavailable) {
+        this.pushNotice("warn", `Unknown mode "${requested}". Available: ${this.state.modes.map((m) => m.id).join(", ")}`);
+      }
+      return;
+    }
+    if (resolvedId === this.state.modeId) return;
+    try {
+      const res = await this.acp.setMode(this.state.sessionId, resolvedId);
+      this.applySessionMetadata(res);
+      this.state.modeId = resolvedId;
+    } catch (err) {
+      if (!silentIfUnavailable) {
+        this.pushNotice("warn", `Could not set mode "${requested}": ${err.message}`);
+      }
+    }
   }
 
   async applyStartupOverrides() {
     if (this.startupOverridesApplied || !this.state.sessionId) return;
     this.startupOverridesApplied = true;
 
-    if (this.cliOptions.mode) {
-      try {
-        const res = await this.acp.setMode(this.state.sessionId, this.cliOptions.mode);
-        this.applySessionMetadata(res);
-        this.state.modeId = this.cliOptions.mode;
-      } catch (err) {
-        this.pushNotice("warn", `Could not set mode "${this.cliOptions.mode}": ${err.message}`);
-      }
-    }
+    const explicitMode = this.cliOptions.mode || "";
+    await this.applyPreferredMode({
+      explicitMode,
+      silentIfUnavailable: !explicitMode,
+    });
 
     if (this.cliOptions.model) {
       try {
@@ -895,6 +968,52 @@ export class LucidApp {
     this.scheduleRender();
   }
 
+  /**
+   * Dispatches a synchronous stdin batch. When mouse capture is OFF, terminals
+   * in Alternate Scroll Mode (?1007h) translate wheel notches into bursts of
+   * plain Up/Down arrow keys; detect those bursts and scroll the timeline
+   * instead of sliding the composer cursor or cycling prompt history.
+   */
+  dispatchInputBatch(events) {
+    const isPlainVerticalArrow = (ev) =>
+      ev &&
+      ev.type === "key" &&
+      !ev.ctrl &&
+      !ev.alt &&
+      !ev.shift &&
+      (ev.name === "up" || ev.name === "down");
+
+    let i = 0;
+    while (i < events.length) {
+      const ev = events[i];
+      if (!this.state.mouseCapture && !this.modal && !this.boardOpen && !this.popup && isPlainVerticalArrow(ev)) {
+        let j = i + 1;
+        while (j < events.length && isPlainVerticalArrow(events[j]) && events[j].name === ev.name) {
+          j += 1;
+        }
+        const runLen = j - i;
+        const now = Date.now();
+        const continuingAltScroll = now - this.lastAltScrollAt < 180;
+        // In an empty composer, Up/Down has nothing to move through, so treat even a
+        // single arrow as a wheel line. Terminals like VS Code (xterm.js) send one
+        // arrow per scrolled line, so slow trackpad starts arrive as single arrows.
+        // Prompt history stays available via Ctrl+P / Ctrl+N.
+        const composerIsEmpty = this.state.composer.isEmpty();
+
+        if (runLen >= 2 || continuingAltScroll || composerIsEmpty) {
+          const direction = ev.name === "up" ? 1 : -1;
+          this.lastAltScrollAt = now;
+          this.scrollBy(direction * runLen);
+          i = j;
+          continue;
+        }
+      }
+
+      this.handleInputEvent(ev);
+      i += 1;
+    }
+  }
+
   handleInputEvent(event) {
     if (this.exiting) return;
 
@@ -921,7 +1040,10 @@ export class LucidApp {
           this.scheduleRender(true);
           return;
         }
-        this.state.composer.insert(event.text);
+        const pasted = this.state.composer.insertPaste(event.text);
+        if (pasted.collapsed) {
+          this.showToast(`Pasted ${pasted.lineCount} lines (${pasted.charCount} chars) — full text sent on Enter`);
+        }
         this.updatePopupState();
         this.scheduleRender(true);
       }
@@ -1014,13 +1136,68 @@ export class LucidApp {
     return layout.firstLineIndex + viewportRow;
   }
 
+  scheduleSelectionPatch() {
+    if (this.exiting || this.selectionPatchQueued || this.selectionPatchTimer) return;
+    // Leading-edge + trailing-edge pacing (~45 fps cap): first drag event paints
+    // at 0ms on the current tick; rapid sweeping coalesces into ~22ms frames so
+    // SSH PTY buffers never back up with queued highlight writes.
+    const minIntervalMs = 22;
+    const elapsed = Date.now() - this.lastSelectionPatchAt;
+    if (elapsed >= minIntervalMs) {
+      this.selectionPatchQueued = true;
+      queueMicrotask(() => {
+        this.selectionPatchQueued = false;
+        this.flushSelectionPatch();
+      });
+    } else {
+      this.selectionPatchTimer = setTimeout(() => {
+        this.selectionPatchTimer = null;
+        this.flushSelectionPatch();
+      }, minIntervalMs - elapsed);
+    }
+  }
+
+  flushSelectionPatch() {
+    if (this.selectionPatchTimer) {
+      clearTimeout(this.selectionPatchTimer);
+      this.selectionPatchTimer = null;
+    }
+    if (this.exiting) return;
+    const layout = this.timelineLayout;
+    if (!layout || this.modal || this.boardOpen) {
+      this.scheduleRender(true);
+      return;
+    }
+    const { cols, rows } = this.renderer.getSize();
+    if (cols !== layout.cols || rows !== layout.rows) {
+      this.renderNow();
+      return;
+    }
+    const touched = patchSelectionInFrame({
+      frameRows: layout.frameRows,
+      viewportRawRows: layout.viewportRawRows,
+      topRow: layout.topRow,
+      firstLineIndex: layout.firstLineIndex,
+      prevSelection: layout.renderedSelection,
+      nextSelection: this.selection,
+    });
+    layout.renderedSelection = cloneSelection(this.selection);
+    if (touched > 0) {
+      this.lastSelectionPatchAt = Date.now();
+      this.renderer.render(layout.frameRows, layout.cursor);
+    }
+  }
+
   handleSelectionMouse(event) {
     const col = Math.max(0, event.col - 1);
 
     if (event.action === "leftDown") {
+      const hadVisibleSelection = !isSelectionEmpty(this.selection);
       const line = this.screenRowToTimelineLine(event.row, false);
       this.selection = line === null ? null : createSelection(line, col);
-      this.scheduleRender(true);
+      if (hadVisibleSelection) {
+        this.scheduleSelectionPatch();
+      }
       return;
     }
 
@@ -1029,6 +1206,7 @@ export class LucidApp {
     if (event.action === "leftDrag") {
       // Dragging past the top or bottom edge scrolls the timeline one line at a time.
       const layout = this.timelineLayout;
+      const prevScroll = this.state.scrollOffset;
       if (layout) {
         const viewportRow = event.row - 1 - layout.topRow;
         if (viewportRow < 0) {
@@ -1037,16 +1215,27 @@ export class LucidApp {
           this.scrollBy(-1);
         }
       }
+      const scrolled = this.state.scrollOffset !== prevScroll;
       const line = this.screenRowToTimelineLine(event.row, true);
+      let headChanged = false;
       if (line !== null) {
-        this.selection.head = { line, col };
+        const prevHead = this.selection.head;
+        if (prevHead.line !== line || prevHead.col !== col) {
+          this.selection.head = { line, col };
+          headChanged = true;
+        }
       }
-      this.scheduleRender(true);
+      if (scrolled) {
+        this.scheduleRender(true);
+      } else if (headChanged) {
+        this.scheduleSelectionPatch();
+      }
       return;
     }
 
     // leftUp: finish the drag. A plain click (no movement) clears the selection;
     // a real selection is copied right away, like terminal copy-on-select.
+    const hadVisibleSelection = !isSelectionEmpty(this.selection);
     const line = this.screenRowToTimelineLine(event.row, true);
     if (line !== null) {
       this.selection.head = { line, col };
@@ -1054,10 +1243,13 @@ export class LucidApp {
     this.selection.dragging = false;
     if (isSelectionEmpty(this.selection)) {
       this.selection = null;
+      if (hadVisibleSelection) {
+        this.scheduleSelectionPatch();
+      }
     } else {
+      this.flushSelectionPatch();
       this.copySelection({ clearAfterCopy: false });
     }
-    this.scheduleRender(true);
   }
 
   /**
@@ -1070,6 +1262,7 @@ export class LucidApp {
     const text = extractSelectionText(layout.lines, this.selection);
     if (clearAfterCopy) {
       this.selection = null;
+      this.flushSelectionPatch();
     }
     if (!text) return false;
     copyToClipboardOsc52(text, process.stdout);
@@ -1083,8 +1276,94 @@ export class LucidApp {
     const next = Math.max(0, Math.min(this.state.maxScrollOffset, this.state.scrollOffset + deltaLines));
     if (next !== this.state.scrollOffset) {
       this.state.scrollOffset = next;
-      this.scheduleRender(true);
+      this.scheduleScrollFlush();
     }
+  }
+
+  /**
+   * Fast-path viewport scroll: leading-edge 0ms on the first wheel notch,
+   * coalescing rapid wheel bursts at ~24ms (~40 fps) so SSH PTY buffers never
+   * back up, and using VT100 scroll-region shifting to transmit only newly
+   * revealed rows instead of the whole viewport.
+   */
+  scheduleScrollFlush() {
+    if (this.exiting || this.scrollFlushQueued || this.scrollFlushTimer) return;
+    const minIntervalMs = 24;
+    const elapsed = Date.now() - this.lastScrollFlushAt;
+    if (elapsed >= minIntervalMs) {
+      this.scrollFlushQueued = true;
+      queueMicrotask(() => {
+        this.scrollFlushQueued = false;
+        this.flushScroll();
+      });
+    } else {
+      this.scrollFlushTimer = setTimeout(() => {
+        this.scrollFlushTimer = null;
+        this.flushScroll();
+      }, minIntervalMs - elapsed);
+    }
+  }
+
+  flushScroll() {
+    if (this.scrollFlushTimer) {
+      clearTimeout(this.scrollFlushTimer);
+      this.scrollFlushTimer = null;
+    }
+    if (this.exiting) return;
+    const layout = this.timelineLayout;
+    if (!layout || this.modal || this.boardOpen) {
+      this.scheduleRender(true);
+      return;
+    }
+    const { cols, rows } = this.renderer.getSize();
+    if (cols !== layout.cols || rows !== layout.rows) {
+      this.renderNow();
+      return;
+    }
+
+    const timelineLines = layout.lines;
+    const viewportHeight = layout.height;
+    const maxScroll = Math.max(0, timelineLines.length - viewportHeight);
+    this.state.maxScrollOffset = maxScroll;
+    if (this.state.scrollOffset > maxScroll) {
+      this.state.scrollOffset = maxScroll;
+    }
+
+    const delta = this.state.scrollOffset - layout.renderedScrollOffset;
+    if (delta === 0) return;
+
+    const endIdx = timelineLines.length - this.state.scrollOffset;
+    const startIdx = Math.max(0, endIdx - viewportHeight);
+    const rawViewportRows = timelineLines.slice(startIdx, endIdx);
+    while (rawViewportRows.length < viewportHeight) {
+      rawViewportRows.push("");
+    }
+    const visibleRows = highlightSelectionInViewport(rawViewportRows, startIdx, this.selection);
+
+    for (let offset = 0; offset < viewportHeight; offset += 1) {
+      layout.frameRows[layout.topRow + offset] = visibleRows[offset];
+    }
+
+    // Update fixed footer line in-place when no toast is active.
+    const hasActiveToast = Boolean(this.state.toast && Date.now() < this.state.toast.expiresAt);
+    if (!hasActiveToast && layout.frameRows.length > 0 && layout.defaultFooterLine) {
+      layout.frameRows[layout.frameRows.length - 1] =
+        this.state.scrollOffset > 0
+          ? ` ${this.style.accentAlt(`↓ ${this.state.scrollOffset} lines below · End / Esc to jump to bottom`)}`
+          : layout.defaultFooterLine;
+    }
+
+    layout.firstLineIndex = startIdx;
+    layout.viewportRawRows = rawViewportRows;
+    layout.renderedScrollOffset = this.state.scrollOffset;
+    layout.renderedSelection = cloneSelection(this.selection);
+
+    this.lastScrollFlushAt = Date.now();
+    this.renderer.render(layout.frameRows, layout.cursor, {
+      topRow: layout.topRow,
+      height: viewportHeight,
+      delta,
+    });
   }
 
   handleModalInput(event) {
@@ -1239,12 +1518,11 @@ export class LucidApp {
     // An active mouse selection takes priority: Ctrl+C copies it, Esc dismisses it.
     if (this.selection && key.ctrl && key.name === "c") {
       this.copySelection({ clearAfterCopy: true });
-      this.scheduleRender(true);
       return;
     }
     if (this.selection && key.name === "escape") {
       this.selection = null;
-      this.scheduleRender(true);
+      this.scheduleSelectionPatch();
       return;
     }
 
@@ -1504,6 +1782,18 @@ export class LucidApp {
       this.scheduleRender(true);
       return;
     }
+    if (key.ctrl && key.name === "p") {
+      this.state.composer.historyPrev();
+      this.updatePopupState();
+      this.scheduleRender(true);
+      return;
+    }
+    if (key.ctrl && key.name === "n") {
+      this.state.composer.historyNext();
+      this.updatePopupState();
+      this.scheduleRender(true);
+      return;
+    }
     if (key.name === "up") {
       this.state.composer.moveUpOrHistory(inputWidth);
       this.updatePopupState();
@@ -1607,27 +1897,28 @@ export class LucidApp {
   }
 
   submitComposer() {
-    const raw = this.state.composer.text.trim();
-    if (!raw && this.state.stagedImages.length === 0) return;
+    const displayRaw = this.state.composer.text.trim();
+    const fullRaw = this.state.composer.expandText(displayRaw).trim();
+    if (!fullRaw && this.state.stagedImages.length === 0) return;
 
-    if (raw) {
-      this.state.composer.pushHistory(raw);
+    if (displayRaw) {
+      this.state.composer.pushHistory(displayRaw);
     }
     this.state.composer.clear();
     this.popup = null;
     this.state.scrollOffset = 0;
 
-    if (raw.startsWith("/") && !raw.includes("\n")) {
-      const spaceIdx = raw.indexOf(" ");
-      const cmdName = (spaceIdx === -1 ? raw.slice(1) : raw.slice(1, spaceIdx)).toLowerCase();
-      const argText = spaceIdx === -1 ? "" : raw.slice(spaceIdx + 1).trim();
+    if (fullRaw.startsWith("/") && !fullRaw.includes("\n")) {
+      const spaceIdx = fullRaw.indexOf(" ");
+      const cmdName = (spaceIdx === -1 ? fullRaw.slice(1) : fullRaw.slice(1, spaceIdx)).toLowerCase();
+      const argText = spaceIdx === -1 ? "" : fullRaw.slice(spaceIdx + 1).trim();
       if (this.isLocalCommand(cmdName)) {
         this.runLocalCommand(cmdName, argText);
         return;
       }
     }
 
-    this.sendUserPrompt(raw);
+    this.sendUserPrompt(fullRaw, displayRaw !== fullRaw ? displayRaw : "");
   }
 
   isLocalCommand(cmdName) {
@@ -1983,11 +2274,14 @@ export class LucidApp {
         return;
       }
       if (argText) {
-        const match = this.state.modes.find((m) => m.id === argText.toLowerCase());
+        const resolvedId = this.resolveModeId(argText);
+        const match = this.state.modes.find((m) => m.id === resolvedId);
         if (match) {
           const res = await this.acp.setMode(this.state.sessionId, match.id);
           this.applySessionMetadata(res);
           this.state.modeId = match.id;
+          this.userConfig.mode = match.id;
+          saveUserConfig(this.userConfig);
           this.showToast(`Mode → ${match.name || match.id}`);
           this.scheduleRender();
         } else {
@@ -2008,6 +2302,8 @@ export class LucidApp {
           const res = await this.acp.setMode(this.state.sessionId, chosen.value);
           this.applySessionMetadata(res);
           this.state.modeId = chosen.value;
+          this.userConfig.mode = chosen.value;
+          saveUserConfig(this.userConfig);
           this.showToast(`Mode → ${chosen.label}`);
           this.scheduleRender();
         },
@@ -2025,6 +2321,8 @@ export class LucidApp {
       const res = await this.acp.setMode(this.state.sessionId, next.id);
       this.applySessionMetadata(res);
       this.state.modeId = next.id;
+      this.userConfig.mode = next.id;
+      saveUserConfig(this.userConfig);
       this.showToast(`Mode → ${next.name || next.id}`);
     } catch (err) {
       this.showToast(`Mode switch failed: ${err.message}`, "error");
@@ -2066,7 +2364,7 @@ export class LucidApp {
     this.showToast("No assistant reply to copy yet", "error");
   }
 
-  async sendUserPrompt(text) {
+  async sendUserPrompt(text, displayText = "") {
     if (!this.state.connected || !this.state.sessionId) {
       this.pushNotice("error", "Not connected to an ACP session yet.");
       this.scheduleRender();
@@ -2090,6 +2388,7 @@ export class LucidApp {
     this.state.items.push({
       type: "user",
       text: text || "(image attachment)",
+      displayText: displayText || undefined,
       attachedPaths,
       attachedImages,
     });
@@ -2197,14 +2496,9 @@ export class LucidApp {
       viewportRows.push("");
     }
 
+    const rawViewportRows = viewportRows;
     if (!this.modal) {
-      this.timelineLayout = {
-        topRow: headerLines.length,
-        height: viewportHeight,
-        firstLineIndex: startIdx,
-        lines: timelineLines,
-      };
-      viewportRows = highlightSelectionInViewport(viewportRows, startIdx, this.selection);
+      viewportRows = highlightSelectionInViewport(rawViewportRows, startIdx, this.selection);
     }
 
     if (this.modal) {
@@ -2221,6 +2515,23 @@ export class LucidApp {
           row: composerStartRow + composerBlock.cursorOffsetRow,
           col: composerBlock.cursorCol,
         };
+
+    if (!this.modal) {
+      this.timelineLayout = {
+        cols,
+        rows,
+        topRow: headerLines.length,
+        height: viewportHeight,
+        firstLineIndex: startIdx,
+        lines: timelineLines,
+        viewportRawRows: rawViewportRows,
+        frameRows: allRows,
+        cursor,
+        defaultFooterLine: composerBlock.defaultFooterLine || "",
+        renderedScrollOffset: this.state.scrollOffset,
+        renderedSelection: cloneSelection(this.selection),
+      };
+    }
 
     return { rows: allRows, cursor };
   }
@@ -2239,6 +2550,14 @@ export class LucidApp {
     if (this.renderTimer) {
       clearTimeout(this.renderTimer);
       this.renderTimer = null;
+    }
+    if (this.selectionPatchTimer) {
+      clearTimeout(this.selectionPatchTimer);
+      this.selectionPatchTimer = null;
+    }
+    if (this.scrollFlushTimer) {
+      clearTimeout(this.scrollFlushTimer);
+      this.scrollFlushTimer = null;
     }
     if (this.spinnerTimer) {
       clearInterval(this.spinnerTimer);
@@ -2263,6 +2582,14 @@ export class LucidApp {
     }
     if (this.onResize) {
       process.stdout.off("resize", this.onResize);
+    }
+    if (this.onSignal) {
+      process.off("SIGINT", this.onSignal);
+      process.off("SIGTERM", this.onSignal);
+      process.off("SIGHUP", this.onSignal);
+    }
+    if (this.onProcessExit) {
+      process.off("exit", this.onProcessExit);
     }
     try {
       if (process.stdin.isTTY) process.stdin.setRawMode(false);

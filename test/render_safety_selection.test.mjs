@@ -11,9 +11,16 @@ import {
   wrapAnsiLine,
 } from "../src/term/unicode.mjs";
 import { renderMarkdown } from "../src/ui/markdown.mjs";
-import { createSelection, extractSelectionText, highlightSelectionInViewport } from "../src/ui/selection.mjs";
+import {
+  cloneSelection,
+  createSelection,
+  extractSelectionText,
+  highlightSelectionInViewport,
+  patchSelectionInFrame,
+} from "../src/ui/selection.mjs";
 import { createThemeStyler } from "../src/ui/themes.mjs";
-import { renderTimeline } from "../src/ui/views.mjs";
+import { Composer } from "../src/ui/composer.mjs";
+import { renderComposerBlock, renderTimeline } from "../src/ui/views.mjs";
 
 const HEREDOC_COMMAND = [
   "python3 - <<'EOF'",
@@ -68,6 +75,12 @@ test("renderer never writes raw newlines and erases each changed row before draw
   sink.output = "";
   renderer.leave();
   assert.ok(sink.output.includes("\x1b[?7h"), "autowrap is restored on exit");
+  assert.ok(sink.output.includes("\x1b[?1000l"), "mouse button tracking is disabled on exit");
+  assert.ok(sink.output.includes("\x1b[?1002l"), "mouse drag tracking is disabled on exit");
+  assert.ok(
+    sink.output.indexOf("\x1b[?1002l") < sink.output.indexOf("\x1b[?1006l"),
+    "tracking modes are disabled before SGR encoding mode",
+  );
 });
 
 test("tool header shows only the first line of a multi-line command", () => {
@@ -145,4 +158,209 @@ test("selection extracts dedented plain text and highlights only the selected co
   assert.ok(highlighted[1].includes("\x1b[0m\x1b[7m"), "inverse survives the row's own reset");
   assert.equal(stripAnsi(highlighted[2]), "  second line ");
   assert.equal(stripAnsi(highlighted[3]), "  third");
+});
+
+test("patchSelectionInFrame only updates rows whose selected column range changed", () => {
+  const viewportRawRows = ["  line 0", "  line 1", "  line 2", "  line 3", "  line 4"];
+  const frameRows = ["HEADER", ...viewportRawRows, "FOOTER"];
+  const sel1 = createSelection(1, 2);
+  sel1.head = { line: 3, col: 5 };
+
+  const touchedInitial = patchSelectionInFrame({
+    frameRows,
+    viewportRawRows,
+    topRow: 1,
+    firstLineIndex: 0,
+    prevSelection: null,
+    nextSelection: sel1,
+  });
+  assert.equal(touchedInitial, 3);
+  const row1Before = frameRows[2];
+  const row2Before = frameRows[3];
+
+  // Extending the selection horizontally on line 3 should only touch line 3.
+  const sel2 = cloneSelection(sel1);
+  sel2.head = { line: 3, col: 7 };
+  const touchedExtend = patchSelectionInFrame({
+    frameRows,
+    viewportRawRows,
+    topRow: 1,
+    firstLineIndex: 0,
+    prevSelection: sel1,
+    nextSelection: sel2,
+  });
+  assert.equal(touchedExtend, 1);
+  assert.equal(frameRows[2], row1Before);
+  assert.equal(frameRows[3], row2Before);
+
+  // Clearing the selection restores the exact original row references.
+  const touchedClear = patchSelectionInFrame({
+    frameRows,
+    viewportRawRows,
+    topRow: 1,
+    firstLineIndex: 0,
+    prevSelection: sel2,
+    nextSelection: null,
+  });
+  assert.equal(touchedClear, 3);
+  assert.equal(frameRows[2], viewportRawRows[1]);
+  assert.equal(frameRows[4], viewportRawRows[3]);
+});
+
+test("toast renders in the fixed footer line without shifting composer block height", () => {
+  const style = createThemeStyler("tokyo-night", "truecolor");
+  const baseState = {
+    cwd: "/tmp",
+    busy: false,
+    spinnerFrame: 0,
+    scrollOffset: 0,
+    mouseCapture: true,
+    expandTools: false,
+    thoughtMode: "fold",
+    composer: new Composer(),
+    toast: null,
+  };
+  const withoutToast = renderComposerBlock(baseState, 100, style);
+  const withToast = renderComposerBlock(
+    {
+      ...baseState,
+      toast: { text: "Copied 42 chars (2 lines) via OSC 52", level: "info", expiresAt: Date.now() + 5000 },
+    },
+    100,
+    style,
+  );
+  assert.equal(withToast.lines.length, withoutToast.lines.length);
+  assert.ok(stripAnsi(withToast.lines.at(-1)).includes("Copied 42 chars"));
+});
+
+test("default config uses auto mode and supports --bypass / dangerouslySkipPermissions", async () => {
+  const { DEFAULT_CONFIG, parseCliArgs, resolveAgentLaunch } = await import("../src/config.mjs");
+  assert.equal(DEFAULT_CONFIG.mode, "auto");
+
+  const parsed = parseCliArgs(["--bypass"]);
+  assert.equal(parsed.dangerouslySkipPermissions, true);
+
+  const launchFromCli = resolveAgentLaunch(parsed, DEFAULT_CONFIG);
+  assert.ok(launchFromCli.args.includes("--dangerously-skip-permissions"));
+
+  const launchFromConfig = resolveAgentLaunch({}, { ...DEFAULT_CONFIG, dangerouslySkipPermissions: true });
+  assert.ok(launchFromConfig.args.includes("--dangerously-skip-permissions"));
+});
+
+test("when mouseCapture is OFF, Alternate Scroll Up/Down bursts scroll timeline instead of moving composer cursor", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const app = new LucidApp({ cwd: "/tmp", noMouse: true });
+  app.scheduleRender = () => {};
+  app.state.maxScrollOffset = 50;
+  app.state.scrollOffset = 0;
+  app.state.composer.pushHistory("previous prompt");
+
+  // Simulate a terminal Alternate Scroll (?1007h) wheel-up notch: 3x Up in one stdin batch
+  app.dispatchInputBatch([
+    { type: "key", name: "up", ctrl: false, alt: false, shift: false },
+    { type: "key", name: "up", ctrl: false, alt: false, shift: false },
+    { type: "key", name: "up", ctrl: false, alt: false, shift: false },
+  ]);
+
+  assert.equal(app.state.scrollOffset, 3);
+  assert.equal(app.state.composer.text, "", "wheel burst must not load prompt history into composer");
+
+  // Scrolling back down to bottom returns scrollOffset to 0
+  app.dispatchInputBatch([
+    { type: "key", name: "down", ctrl: false, alt: false, shift: false },
+    { type: "key", name: "down", ctrl: false, alt: false, shift: false },
+    { type: "key", name: "down", ctrl: false, alt: false, shift: false },
+  ]);
+  assert.equal(app.state.scrollOffset, 0);
+});
+
+test("when mouseCapture is OFF, a single slow wheel arrow scrolls immediately if the composer is empty", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const app = new LucidApp({ cwd: "/tmp", noMouse: true });
+  app.scheduleRender = () => {};
+  app.scheduleScrollFlush = () => {};
+  app.state.maxScrollOffset = 50;
+  app.state.composer.pushHistory("previous prompt");
+
+  const up = { type: "key", name: "up", ctrl: false, alt: false, shift: false };
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.scrollOffset, 1, "first single arrow must scroll, not wait for a burst");
+  assert.equal(app.state.composer.text, "", "must not load history");
+
+  // With a draft in the composer and no recent scrolling, a single Up is a real keypress.
+  app.lastAltScrollAt = 0;
+  app.state.composer.setText("draft line one\ndraft line two");
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.scrollOffset, 1);
+  assert.equal(app.state.composer.text, "draft line one\ndraft line two");
+});
+
+test("renderer uses VT100 scroll region to send only newly revealed rows when scrolling", () => {
+  const sink = createSink(60, 10);
+  const renderer = new TerminalRenderer(sink);
+  renderer.enter({ mouseCapture: false });
+
+  const frame1 = [
+    "HEADER",
+    "------",
+    "line 10",
+    "line 11",
+    "line 12",
+    "line 13",
+    "line 14",
+    "line 15",
+    "------",
+    "FOOTER",
+  ];
+  renderer.render(frame1, null);
+
+  // Scroll UP by 2 lines (older lines 8 & 9 appear at top; lines 10..13 shift down)
+  sink.output = "";
+  const frame2 = [
+    "HEADER",
+    "------",
+    "line 8",
+    "line 9",
+    "line 10",
+    "line 11",
+    "line 12",
+    "line 13",
+    "------",
+    "FOOTER",
+  ];
+  renderer.render(frame2, null, { topRow: 2, height: 6, delta: 2 });
+
+  assert.ok(sink.output.includes("\x1b[3;8r\x1b[3;1H\x1b[2L\x1b[r"), "emits DECSTBM + IL scroll shift");
+  assert.ok(sink.output.includes("line 8"));
+  assert.ok(sink.output.includes("line 9"));
+  assert.equal(sink.output.includes("line 10"), false, "shifted row must not be retransmitted");
+  assert.equal(sink.output.includes("line 13"), false, "shifted row must not be retransmitted");
+
+  // Scroll DOWN by 2 lines (returns to frame1 via DL)
+  sink.output = "";
+  renderer.render(frame1, null, { topRow: 2, height: 6, delta: -2 });
+  assert.ok(sink.output.includes("\x1b[3;8r\x1b[3;1H\x1b[2M\x1b[r"), "emits DECSTBM + DL scroll shift");
+  assert.ok(sink.output.includes("line 14"));
+  assert.ok(sink.output.includes("line 15"));
+  assert.equal(sink.output.includes("line 10"), false, "shifted row must not be retransmitted");
+  assert.equal(sink.output.includes("line 13"), false, "shifted row must not be retransmitted");
+});
+
+test("scrolling away from bottom keeps composer block height constant", () => {
+  const style = createThemeStyler("tokyo-night", "truecolor");
+  const baseState = {
+    cwd: "/tmp",
+    busy: false,
+    spinnerFrame: 0,
+    scrollOffset: 0,
+    mouseCapture: true,
+    expandTools: false,
+    thoughtMode: "fold",
+    composer: new Composer(),
+    toast: null,
+  };
+  const atBottom = renderComposerBlock(baseState, 100, style);
+  const scrolledUp = renderComposerBlock({ ...baseState, scrollOffset: 12 }, 100, style);
+  assert.equal(scrolledUp.lines.length, atBottom.lines.length);
+  assert.ok(stripAnsi(scrolledUp.lines.at(-1)).includes("↓ 12 lines below"));
 });

@@ -44,6 +44,8 @@ Examples:
 `);
 }
 
+let activeApp = null;
+
 async function main() {
   const opts = parseCliArgs(process.argv.slice(2));
 
@@ -57,17 +59,29 @@ async function main() {
   }
 
   const app = new LucidApp(opts);
+  activeApp = app;
 
-  process.on("uncaughtException", async (err) => {
+  const handleFatal = async (label, err) => {
+    app.restoreTerminalSync();
     await app.shutdown(1);
-    process.stderr.write(`lucid fatal error: ${err?.stack || err}\n`);
+    process.stderr.write(`lucid ${label}: ${err?.stack || err}\n`);
     process.exit(1);
+  };
+
+  process.on("uncaughtException", (err) => {
+    handleFatal("fatal error", err);
+  });
+  process.on("unhandledRejection", (err) => {
+    handleFatal("unhandled rejection", err);
   });
 
   await app.run();
 }
 
 main().catch((err) => {
+  if (activeApp) {
+    activeApp.restoreTerminalSync();
+  }
   process.stderr.write(`Error: ${err?.message || err}\n`);
   process.exit(1);
 });

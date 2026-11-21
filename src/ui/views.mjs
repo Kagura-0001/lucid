@@ -1,5 +1,6 @@
 import path from "node:path";
 import { displayWidth, padEndVisible, truncateAnsi, wrapAnsiLine, wrapAnsiText } from "../term/unicode.mjs";
+import { PASTED_TOKEN_REGEX } from "./composer.mjs";
 import { renderDiffLines } from "./diff.mjs";
 import { formatBytes } from "./files.mjs";
 import { renderMarkdown } from "./markdown.mjs";
@@ -271,12 +272,36 @@ function renderPlanItem(item, maxWidth, style) {
   return lines;
 }
 
-function renderUserItem(item, contentWidth, style) {
+function stylePastedTokens(line, baseStyleFn, style) {
+  if (!line || !line.includes("[Pasted text #")) {
+    return baseStyleFn(line);
+  }
+  let out = "";
+  let lastIndex = 0;
+  PASTED_TOKEN_REGEX.lastIndex = 0;
+  let match = PASTED_TOKEN_REGEX.exec(line);
+  while (match) {
+    if (match.index > lastIndex) {
+      out += baseStyleFn(line.slice(lastIndex, match.index));
+    }
+    out += style.accentAlt(match[0]);
+    lastIndex = match.index + match[0].length;
+    match = PASTED_TOKEN_REGEX.exec(line);
+  }
+  if (lastIndex < line.length) {
+    out += baseStyleFn(line.slice(lastIndex));
+  }
+  return out;
+}
+
+function renderUserItem(item, contentWidth, style, state) {
   const out = [];
-  const rawLines = String(item.text || "").split("\n");
+  const visibleText = state?.expandTools ? (item.text || "") : (item.displayText || item.text || "");
+  const rawLines = String(visibleText).split("\n");
   let firstLine = true;
   for (const rl of rawLines) {
-    const wrapped = wrapAnsiLine(style.bold(rl), Math.max(16, contentWidth - 2));
+    const styledLine = stylePastedTokens(rl, (part) => style.bold(part), style);
+    const wrapped = wrapAnsiLine(styledLine, Math.max(16, contentWidth - 2));
     for (const wl of wrapped) {
       const prefix = firstLine ? `${style.accentBold("❯")} ` : `${style.border("│")} `;
       out.push(`  ${prefix}${wl}`);
@@ -398,7 +423,7 @@ export function renderTimeline(state, cols, style) {
       flushFoldedThoughts();
       if (lines.length > 1) lines.push("");
       const userLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-        renderUserItem(item, contentWidth, style),
+        renderUserItem(item, contentWidth, style, state),
       );
       pushLines(userLines);
       lastEmittedType = "user";
@@ -584,13 +609,6 @@ export function renderComposerBlock(state, cols, style) {
       const elapsed = state.turnStartedAt ? ` · ${formatDuration(Date.now() - state.turnStartedAt)}` : "";
       statusPieces.push(`${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`);
     }
-  } else if (state.toast && Date.now() < state.toast.expiresAt) {
-    const tone = state.toast.level === "error" ? style.error : style.success;
-    statusPieces.push(tone(state.toast.text));
-  }
-
-  if (state.scrollOffset > 0 && !state.activeModalType) {
-    statusPieces.push(style.accentAlt(`↓ ${state.scrollOffset} lines below · End to jump`));
   }
 
   if (statusPieces.length > 0) {
@@ -615,48 +633,64 @@ export function renderComposerBlock(state, cols, style) {
               : "Message agent…  (/ commands · @ files · Shift+Tab mode)";
       lines.push(`${promptPrefix}${style.muted(truncateAnsi(placeholder, inputWidth, "…"))}`);
     } else {
-      lines.push(`${promptPrefix}${layout.lines[i]}`);
+      lines.push(`${promptPrefix}${stylePastedTokens(layout.lines[i], (part) => part, style)}`);
     }
   }
 
   lines.push(style.border("─".repeat(cols)));
 
-  // Compact footer hints — drop trailing items cleanly rather than clipping mid-word
-  const mouseState = state.mouseCapture ? style.success("on") : style.warn("off");
-  const detailsState = state.expandTools ? style.accent("full") : style.muted("compact");
-  const thoughtsHint =
-    thoughtMode === "expanded"
-      ? style.accent("thoughts:on")
-      : thoughtMode === "hidden"
-        ? style.muted("thoughts:off")
-        : style.muted("thoughts");
-  const footerCandidates = [
-    `${style.muted("Enter")} send`,
-    `${style.muted("^J")} newline`,
-    `${style.muted("⇧Tab")} mode`,
-    `${style.muted("^O")} ${detailsState}`,
-    `${style.muted("^T")} ${thoughtsHint}`,
-    `${style.muted("^Y")} copy`,
-    `${style.muted("^G")} mouse:${mouseState}`,
-    `${style.muted("/help")}`,
-  ];
-  const sep = style.border(" · ");
-  const sepWidth = 3;
-  const maxFooterWidth = Math.max(12, cols - 2);
-  const keptFooter = [];
-  let footerWidth = 0;
-  for (const part of footerCandidates) {
-    const w = displayWidth(part);
-    const added = keptFooter.length === 0 ? w : sepWidth + w;
-    if (footerWidth + added > maxFooterWidth) break;
-    keptFooter.push(part);
-    footerWidth += added;
+  // Render active toasts or scroll-position badge in-place inside the fixed footer
+  // line so scrolling or toasts never shift viewport height or trigger full redraws.
+  const hasActiveToast = Boolean(state.toast && Date.now() < state.toast.expiresAt);
+  let defaultFooterLine = "";
+  let footerLine;
+  if (hasActiveToast) {
+    const tone = state.toast.level === "error" ? style.error : style.success;
+    footerLine = ` ${tone(truncateAnsi(state.toast.text, Math.max(12, cols - 2), "…"))}`;
+  } else {
+    // Compact footer hints — drop trailing items cleanly rather than clipping mid-word
+    const mouseState = state.mouseCapture ? style.success("on") : style.warn("off");
+    const detailsState = state.expandTools ? style.accent("full") : style.muted("compact");
+    const thoughtsHint =
+      thoughtMode === "expanded"
+        ? style.accent("thoughts:on")
+        : thoughtMode === "hidden"
+          ? style.muted("thoughts:off")
+          : style.muted("thoughts");
+    const footerCandidates = [
+      `${style.muted("Enter")} send`,
+      `${style.muted("^J")} newline`,
+      `${style.muted("⇧Tab")} mode`,
+      `${style.muted("^O")} ${detailsState}`,
+      `${style.muted("^T")} ${thoughtsHint}`,
+      `${style.muted("^Y")} copy`,
+      `${style.muted("^G")} mouse:${mouseState}`,
+      `${style.muted("/help")}`,
+    ];
+    const sep = style.border(" · ");
+    const sepWidth = 3;
+    const maxFooterWidth = Math.max(12, cols - 2);
+    const keptFooter = [];
+    let footerWidth = 0;
+    for (const part of footerCandidates) {
+      const w = displayWidth(part);
+      const added = keptFooter.length === 0 ? w : sepWidth + w;
+      if (footerWidth + added > maxFooterWidth) break;
+      keptFooter.push(part);
+      footerWidth += added;
+    }
+    defaultFooterLine = ` ${keptFooter.join(sep)}`;
+    if (state.scrollOffset > 0 && !state.activeModalType) {
+      footerLine = ` ${style.accentAlt(`↓ ${state.scrollOffset} lines below · End / Esc to jump to bottom`)}`;
+    } else {
+      footerLine = defaultFooterLine;
+    }
   }
-  const footerLine = ` ${keptFooter.join(sep)}`;
   lines.push(footerLine);
 
   return {
     lines,
+    defaultFooterLine,
     cursorOffsetRow: composerTopOffset + layout.cursorRow,
     cursorCol: 3 + layout.cursorCol,
   };

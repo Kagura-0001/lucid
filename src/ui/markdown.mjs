@@ -1,5 +1,6 @@
 import { osc8Link } from "../term/ansi.mjs";
 import { displayWidth, padEndVisible, wrapAnsiLine } from "../term/unicode.mjs";
+import { renderLatexMath } from "./math.mjs";
 
 const KEYWORD_SETS = {
   js: new Set([
@@ -156,8 +157,29 @@ function highlightCodeLine(line, lang, style) {
   return out;
 }
 
+const HTML_BR_RE = /<br\s*\/?>/i;
+
+function findClosingInlineMathDollar(text, contentStart) {
+  const len = text.length;
+  for (let pos = contentStart; pos < len; pos += 1) {
+    if (text[pos] === "\\" && pos + 1 < len) {
+      pos += 1;
+      continue;
+    }
+    if (text[pos] === "$") {
+      // Closing $ must not be preceded by whitespace, must not be followed by a digit
+      // (protects currency like "$5 and $10"), and must not be part of "$$".
+      if (pos === contentStart) return -1;
+      if (/\s/.test(text[pos - 1])) continue;
+      if (pos + 1 < len && /[0-9$]/.test(text[pos + 1])) continue;
+      return pos;
+    }
+  }
+  return -1;
+}
+
 /**
- * Formats inline Markdown (code spans, links, bold, italic, strike) without
+ * Formats inline Markdown (code spans, math, links, bold, italic, strike) without
  * painting any opaque background colors.
  */
 export function renderInlineMarkdown(text, style) {
@@ -167,8 +189,22 @@ export function renderInlineMarkdown(text, style) {
   const len = text.length;
 
   while (i < len) {
-    // Escaped markdown punctuation
-    if (text[i] === "\\" && i + 1 < len && /[\\`*_{}[\]()#+\-.!~|]/.test(text[i + 1])) {
+    // LaTeX inline \( ... \) and display \[ ... \]
+    if (text[i] === "\\" && i + 1 < len && (text[i + 1] === "(" || text[i + 1] === "[")) {
+      const closeDelim = text[i + 1] === "(" ? "\\)" : "\\]";
+      const closeIdx = text.indexOf(closeDelim, i + 2);
+      if (closeIdx !== -1 && closeIdx > i + 2) {
+        const rendered = renderLatexMath(text.slice(i + 2, closeIdx));
+        if (rendered) {
+          out += style.accentAlt(rendered);
+        }
+        i = closeIdx + 2;
+        continue;
+      }
+    }
+
+    // Escaped markdown/math punctuation
+    if (text[i] === "\\" && i + 1 < len && /[\\`*_{}[\]()#+\-.!~|$]/.test(text[i + 1])) {
       out += text[i + 1];
       i += 2;
       continue;
@@ -185,6 +221,37 @@ export function renderInlineMarkdown(text, style) {
         out += style.inlineCode(inner);
         i = closeIdx + ticks;
         continue;
+      }
+    }
+
+    // Inline display math: $$expr$$
+    if (text[i] === "$" && text[i + 1] === "$") {
+      const closeIdx = text.indexOf("$$", i + 2);
+      if (closeIdx !== -1 && closeIdx > i + 2) {
+        const rendered = renderLatexMath(text.slice(i + 2, closeIdx));
+        if (rendered) {
+          out += style.accentAlt(rendered);
+        }
+        i = closeIdx + 2;
+        continue;
+      }
+    }
+
+    // Inline math: $expr$ (opening $ cannot be followed by whitespace or preceded by digit/backslash)
+    if (text[i] === "$" && i + 1 < len && !/\s/.test(text[i + 1]) && text[i + 1] !== "$") {
+      const closeIdx = findClosingInlineMathDollar(text, i + 1);
+      if (closeIdx !== -1) {
+        const inner = text.slice(i + 1, closeIdx);
+        // Avoid treating plain shell vars or currency like "$100" without math structure
+        const looksLikeCurrency = /^\d[\d,.\s]*$/.test(inner.trim());
+        if (!looksLikeCurrency) {
+          const rendered = renderLatexMath(inner);
+          if (rendered) {
+            out += style.accentAlt(rendered);
+          }
+          i = closeIdx + 1;
+          continue;
+        }
       }
     }
 
@@ -262,21 +329,33 @@ function renderTableBlock(rawLines, maxWidth, style) {
   );
   if (colCount === 0) return [];
 
+  const splitCellLines = (rawCell, isHeader) =>
+    String(rawCell || "")
+      .split(HTML_BR_RE)
+      .map((part) => {
+        const formatted = renderInlineMarkdown(part.trim(), style);
+        return isHeader ? style.bold(formatted) : formatted;
+      });
+
   const styledHeader = Array.from({ length: colCount }, (_, idx) =>
-    style.bold(renderInlineMarkdown(headerCells[idx] || "", style)),
+    splitCellLines(headerCells[idx] || "", true),
   );
   const styledRows = bodyRows.map((row) =>
     Array.from({ length: colCount }, (_, idx) =>
-      renderInlineMarkdown(row[idx] || "", style),
+      splitCellLines(row[idx] || "", false),
     ),
   );
 
-  // Measure natural width of each column
+  // Measure natural width of each column using the longest sub-line per cell
   const naturalWidths = new Array(colCount).fill(3);
   for (let c = 0; c < colCount; c += 1) {
-    naturalWidths[c] = Math.max(naturalWidths[c], displayWidth(styledHeader[c]));
+    for (const sub of styledHeader[c]) {
+      naturalWidths[c] = Math.max(naturalWidths[c], displayWidth(sub));
+    }
     for (const r of styledRows) {
-      naturalWidths[c] = Math.max(naturalWidths[c], displayWidth(r[c]));
+      for (const sub of r[c]) {
+        naturalWidths[c] = Math.max(naturalWidths[c], displayWidth(sub));
+      }
     }
   }
 
@@ -305,7 +384,13 @@ function renderTableBlock(rawLines, maxWidth, style) {
     style.border(`${left}${colWidths.map((w) => "─".repeat(w + 2)).join(mid)}${right}`);
 
   const renderRow = (cells) => {
-    const wrappedCols = cells.map((cell, idx) => wrapAnsiLine(cell, colWidths[idx]));
+    const wrappedCols = cells.map((subLines, idx) => {
+      const cellWrapped = [];
+      for (const subLine of subLines) {
+        cellWrapped.push(...wrapAnsiLine(subLine, colWidths[idx]));
+      }
+      return cellWrapped.length > 0 ? cellWrapped : [""];
+    });
     const rowHeight = Math.max(1, ...wrappedCols.map((w) => w.length));
     const rendered = [];
     for (let lineIdx = 0; lineIdx < rowHeight; lineIdx += 1) {
@@ -397,6 +482,50 @@ export function renderMarkdown(markdownText, maxWidth, style) {
       continue;
     }
 
+    // Display math block: $$ ... $$ or \[ ... \]
+    if (trimmed.startsWith("$$") || trimmed.startsWith("\\[")) {
+      const isBracket = trimmed.startsWith("\\[");
+      const openLen = 2;
+      const closeToken = isBracket ? "\\]" : "$$";
+      const mathLines = [];
+
+      const afterOpen = trimmed.slice(openLen);
+      const sameLineClose = afterOpen.indexOf(closeToken);
+      if (sameLineClose !== -1) {
+        const inner = afterOpen.slice(0, sameLineClose).trim();
+        if (inner) mathLines.push(inner);
+        i += 1;
+      } else {
+        if (afterOpen.trim()) mathLines.push(afterOpen.trim());
+        i += 1;
+        while (i < rawLines.length) {
+          const cur = rawLines[i];
+          const closePos = cur.indexOf(closeToken);
+          if (closePos !== -1) {
+            const beforeClose = cur.slice(0, closePos).trim();
+            if (beforeClose) mathLines.push(beforeClose);
+            i += 1;
+            break;
+          }
+          mathLines.push(cur);
+          i += 1;
+        }
+      }
+
+      const combined = mathLines.join("\n").trim();
+      if (combined) {
+        const exprRows = combined.split(/\\\\|\n/).map((part) => part.trim()).filter(Boolean);
+        const mathWidth = Math.max(12, width - 2);
+        for (const exprRow of exprRows) {
+          const rendered = style.accentAlt(renderLatexMath(exprRow));
+          for (const w of wrapAnsiLine(rendered, mathWidth)) {
+            out.push(`  ${w}`);
+          }
+        }
+      }
+      continue;
+    }
+
     // Markdown table: header + separator + rows
     if (line.includes("|") && i + 1 < rawLines.length && isTableSeparatorLine(rawLines[i + 1])) {
       const tableLines = [line, rawLines[i + 1]];
@@ -478,9 +607,11 @@ export function renderMarkdown(markdownText, maxWidth, style) {
       continue;
     }
 
-    // Regular paragraph line
-    const formatted = renderInlineMarkdown(line, style);
-    out.push(...wrapAnsiLine(formatted, width));
+    // Regular paragraph line (split explicit HTML <br> tags onto new lines)
+    for (const part of line.split(HTML_BR_RE)) {
+      const formatted = renderInlineMarkdown(part, style);
+      out.push(...wrapAnsiLine(formatted, width));
+    }
     i += 1;
   }
 
