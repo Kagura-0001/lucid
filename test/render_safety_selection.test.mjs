@@ -247,6 +247,34 @@ test("default config uses auto mode and supports --bypass / dangerouslySkipPermi
   assert.ok(launchFromConfig.args.includes("--dangerously-skip-permissions"));
 });
 
+test("bypass mode auto-answers permission requests and shows a header badge", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const { renderHeader } = await import("../src/ui/views.mjs");
+  const app = new LucidApp({ cwd: "/tmp", dangerouslySkipPermissions: true });
+  app.scheduleRender = () => {};
+  assert.equal(app.state.bypassPermissions, true);
+
+  let chosen = null;
+  app.enqueuePermissionRequest({
+    params: {
+      options: [
+        { optionId: "reject", name: "Reject", kind: "reject_once" },
+        { optionId: "allow-once", name: "Allow", kind: "allow_once" },
+      ],
+    },
+    selectOption: (optionId) => {
+      chosen = optionId;
+    },
+    cancel: () => {},
+  });
+  assert.equal(chosen, "allow-once");
+  assert.equal(app.modal, null, "no permission dialog in bypass mode");
+
+  const style = createThemeStyler("tokyo-night", "truecolor");
+  const header = renderHeader(app.state, 100, style).map(stripAnsi).join("\n");
+  assert.ok(header.includes("bypass"));
+});
+
 test("when mouseCapture is OFF, Alternate Scroll Up/Down bursts scroll timeline instead of moving composer cursor", async () => {
   const { LucidApp } = await import("../src/app.mjs");
   const app = new LucidApp({ cwd: "/tmp", noMouse: true });

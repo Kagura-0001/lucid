@@ -142,6 +142,7 @@ export class LucidApp {
     this.state = {
       cwd: this.cwd,
       agentLabel: this.launchSpec.name,
+      bypassPermissions: (this.launchSpec.args || []).includes("--dangerously-skip-permissions"),
       connected: false,
       connecting: true,
       sessionId: null,
@@ -905,6 +906,19 @@ export class LucidApp {
   }
 
   enqueuePermissionRequest(req) {
+    // Bypass mode: agy already auto-approves, but if any agent still asks, answer
+    // with its own "allow" option instead of interrupting the user.
+    if (this.state.bypassPermissions) {
+      const options = Array.isArray(req.params?.options) ? req.params.options : [];
+      const allowOption =
+        options.find((option) => option.kind === "allow_always") ||
+        options.find((option) => option.kind === "allow_once") ||
+        options.find((option) => /allow|approve|yes/i.test(`${option.optionId} ${option.name || ""}`));
+      if (allowOption) {
+        req.selectOption(allowOption.optionId);
+        return;
+      }
+    }
     this.permissionQueue.push(req);
     if (!this.modal || this.modal.type !== "permission") {
       this.openNextPermissionModal();

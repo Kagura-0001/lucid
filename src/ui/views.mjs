@@ -72,6 +72,10 @@ export function renderHeader(state, cols, style) {
     leftParts.push(formatModeLabel(state.modeId, style));
   }
 
+  if (state.bypassPermissions) {
+    leftParts.push(style.errorBold("bypass"));
+  }
+
   const rightParts = [];
   if (state.usage && state.usage.size > 0) {
     const pct = Math.min(100, Math.round((state.usage.used / state.usage.size) * 100));
