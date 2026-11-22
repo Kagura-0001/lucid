@@ -348,25 +348,66 @@ test("when mouseCapture is OFF, Alternate Scroll Up/Down bursts scroll timeline 
   assert.equal(app.state.scrollOffset, 0);
 });
 
-test("when mouseCapture is OFF, a single slow wheel arrow scrolls immediately if the composer is empty", async () => {
+test("when mouseCapture is OFF, single Up/Down recalls prompt history while trailing wheel ticks continue scrolling", async () => {
   const { LucidApp } = await import("../src/app.mjs");
   const app = new LucidApp({ cwd: "/tmp", noMouse: true });
   app.scheduleRender = () => {};
   app.scheduleScrollFlush = () => {};
   app.state.maxScrollOffset = 50;
+  app.state.composer.pushHistory("first prompt");
+  app.state.composer.pushHistory("/help");
   app.state.composer.pushHistory("previous prompt");
 
   const up = { type: "key", name: "up", ctrl: false, alt: false, shift: false };
-  app.dispatchInputBatch([up]);
-  assert.equal(app.state.scrollOffset, 1, "first single arrow must scroll, not wait for a burst");
-  assert.equal(app.state.composer.text, "", "must not load history");
+  const down = { type: "key", name: "down", ctrl: false, alt: false, shift: false };
 
-  // With a draft in the composer and no recent scrolling, a single Up is a real keypress.
-  app.lastAltScrollAt = 0;
-  app.state.composer.setText("draft line one\ndraft line two");
+  // Outside a wheel burst, a single Up/Down navigates prompt history rather than scrolling.
   app.dispatchInputBatch([up]);
-  assert.equal(app.state.scrollOffset, 1);
-  assert.equal(app.state.composer.text, "draft line one\ndraft line two");
+  assert.equal(app.state.composer.text, "previous prompt", "single Up should recall latest user prompt");
+  assert.equal(app.state.scrollOffset, 0, "single Up outside a scroll burst must not scroll timeline");
+
+  // Navigating past a /command in history must not open the slash popup and trap Up/Down.
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.composer.text, "/help");
+  assert.equal(app.popup, null, "history recall onto a /command must not open slash autocomplete");
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.composer.text, "first prompt");
+
+  // Return down through history back to the empty draft.
+  app.dispatchInputBatch([down]);
+  assert.equal(app.state.composer.text, "/help");
+  app.dispatchInputBatch([down]);
+  assert.equal(app.state.composer.text, "previous prompt");
+  app.dispatchInputBatch([down]);
+  assert.equal(app.state.composer.text, "");
+
+  // Immediately after a wheel burst, a single trailing Up continues scrolling without touching history.
+  app.dispatchInputBatch([up, up, up]);
+  assert.equal(app.state.scrollOffset, 3);
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.scrollOffset, 4);
+  assert.equal(app.state.composer.text, "");
+});
+
+test("applyHostSnapshot seeds composer prompt history so Up recalls previous session prompts", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const app = new LucidApp({ cwd: "/tmp", noMouse: true });
+  app.scheduleRender = () => {};
+
+  app.applyHostSnapshot({
+    sessionId: "sess-history-1",
+    eventLog: [
+      { type: "userPrompt", text: "first question" },
+      { type: "sessionUpdate", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "answer 1" } } } },
+      { type: "userPrompt", text: "expanded text", displayText: "second question" },
+    ],
+  });
+
+  const up = { type: "key", name: "up", ctrl: false, alt: false, shift: false };
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.composer.text, "second question");
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.composer.text, "first question");
 });
 
 test("renderer uses VT100 scroll region to send only newly revealed rows when scrolling", () => {

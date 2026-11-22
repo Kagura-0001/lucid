@@ -125,6 +125,16 @@ export function bindAcpClient(app, client) {
   });
 }
 
+function seedComposerHistoryFromItems(app) {
+  for (const item of app.state.items) {
+    if (item.type !== "user") continue;
+    const entry = (item.displayText || item.text || "").trim();
+    if (entry && entry !== "(image attachment)") {
+      app.state.composer.pushHistory(entry);
+    }
+  }
+}
+
 export function applyHostSnapshot(app, snapshot) {
   if (!snapshot) return;
   const info = snapshot.agentInfo || snapshot.initResult?.agentInfo;
@@ -169,6 +179,7 @@ export function applyHostSnapshot(app, snapshot) {
   } finally {
     app.replayingSnapshot = false;
   }
+  seedComposerHistoryFromItems(app);
 
   app.state.busy = Boolean(snapshot.busy);
   app.state.activePromptCount = snapshot.activePromptCount || (snapshot.busy ? 1 : 0);
@@ -570,6 +581,7 @@ export async function switchToSession(app, sessionId, titleLabel = "") {
   }
 
   finalizeAllStreaming(app);
+  seedComposerHistoryFromItems(app);
   app.applySessionMetadata(res);
   if (app.state.sessionTitle) {
     app.renderer.setTitle(app.state.sessionTitle);

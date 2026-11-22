@@ -89,9 +89,8 @@ export function dispatchInputBatch(app, events) {
       const runLen = j - i;
       const now = Date.now();
       const continuingAltScroll = now - app.lastAltScrollAt < 180;
-      const composerIsEmpty = app.state.composer.isEmpty();
 
-      if (runLen >= 2 || continuingAltScroll || composerIsEmpty) {
+      if (runLen >= 2 || continuingAltScroll) {
         const direction = ev.name === "up" ? 1 : -1;
         app.lastAltScrollAt = now;
         app.scrollBy(direction * runLen);
@@ -710,9 +709,11 @@ export function handleMainKey(app, key) {
       else composer.moveRight();
       break;
     case "up":
+      refreshPopup = false;
       composer.moveUpOrHistory(inputWidth);
       break;
     case "down":
+      refreshPopup = false;
       composer.moveDownOrHistory(inputWidth);
       break;
     default:
