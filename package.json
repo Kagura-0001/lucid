@@ -17,7 +17,7 @@
     "node": ">=20.0.0"
   },
   "bin": {
-    "lucid": "./bin/lucid.mjs"
+    "lucid": "bin/lucid.mjs"
   },
   "files": [
     "bin",

@@ -870,6 +870,10 @@ export class LucidApp {
   applySessionMetadata(payload) {
     if (!payload || typeof payload !== "object") return;
 
+    if (Array.isArray(payload.availableCommands)) {
+      this.state.agentCommands = payload.availableCommands;
+    }
+
     if (Array.isArray(payload.configOptions)) {
       this.state.configOptions = payload.configOptions;
     }
@@ -2725,6 +2729,7 @@ export class LucidApp {
         this.activePlanItem = null;
         this.state.usage = null;
         this.state.scrollOffset = 0;
+        this.state.sessionId = "";
         const created = await this.acp.createSession(this.cwd, this.cliOptions.addDirs || []);
         this.state.sessionId = created.sessionId;
         this.applySessionMetadata(created);

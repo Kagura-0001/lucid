@@ -360,3 +360,18 @@ test("Claude-style !command runs local shell directly without calling ACP and hi
     }
   }
 });
+
+test("agent slash commands like /goal and /swarm survive SessionHost snapshot restore and appear in slash autocomplete", () => {
+  const app = new LucidApp({ cwd: "/tmp" });
+  app.scheduleRender = () => {};
+  app.applySessionMetadata({
+    availableCommands: [
+      { name: "goal", description: "Run until the specified goal is completely finished." },
+      { name: "swarm", description: "Run a swarm of parallel agents." },
+    ],
+  });
+  app.state.composer.setText("/go");
+  app.updatePopupState();
+  assert.ok(app.popup && app.popup.kind === "slash");
+  assert.ok(app.popup.items.some((item) => item.label === "/goal"));
+});
