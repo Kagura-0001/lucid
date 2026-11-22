@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { sanitizeTerminalRow, truncateAnsi } from "./unicode.mjs";
+import { sanitizeTerminalRow, sanitizeTerminalTitle, truncateAnsi } from "./unicode.mjs";
 
 const SYNC_START = "\x1b[?2026h";
 const SYNC_END = "\x1b[?2026l";
@@ -70,6 +70,16 @@ export class TerminalRenderer {
     }
     this.mouseEnabled = target;
     this.stream.write(target ? ALT_SCROLL_DISABLE + MOUSE_ENABLE : MOUSE_DISABLE + ALT_SCROLL_ENABLE);
+  }
+
+  setTitle(title) {
+    const safe = sanitizeTerminalTitle(title);
+    if (!safe) return;
+    try {
+      this.stream.write(`\x1b]0;lucid — ${safe}\x07`);
+    } catch {
+      // Ignore terminal title write errors
+    }
   }
 
   invalidate() {

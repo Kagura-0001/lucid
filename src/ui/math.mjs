@@ -405,8 +405,10 @@ function readNextAtom(src, startIdx) {
   return { content: src[i], nextIndex: i + 1 };
 }
 
-function formatScript(rawContent, kind) {
-  const rendered = parseMathSegment(rawContent).trim();
+const MAX_MATH_DEPTH = 32;
+
+function formatScript(rawContent, kind, depth = 0) {
+  const rendered = parseMathSegment(rawContent, depth + 1).trim();
   if (!rendered) return "";
   const table = kind === "^" ? SUPERSCRIPT_MAP : SUBSCRIPT_MAP;
   const unicodeMapped = mapAllChars(rendered, table);
@@ -417,7 +419,10 @@ function formatScript(rawContent, kind) {
   return isCompound ? `${kind}(${rendered})` : `${kind}${rendered}`;
 }
 
-function parseMathSegment(src) {
+function parseMathSegment(src, depth = 0) {
+  if (depth >= MAX_MATH_DEPTH) {
+    return src;
+  }
   let out = "";
   let i = 0;
   const len = src.length;
@@ -429,7 +434,7 @@ function parseMathSegment(src) {
     if (ch === "{") {
       const group = readBalancedGroup(src, i, "{", "}");
       if (group) {
-        out += parseMathSegment(group.content);
+        out += parseMathSegment(group.content, depth + 1);
         i = group.nextIndex;
         continue;
       }
@@ -444,7 +449,7 @@ function parseMathSegment(src) {
     // Subscript / superscript
     if (ch === "_" || ch === "^") {
       const atom = readNextAtom(src, i + 1);
-      out += formatScript(atom.content, ch);
+      out += formatScript(atom.content, ch, depth);
       i = atom.nextIndex;
       continue;
     }
@@ -499,8 +504,8 @@ function parseMathSegment(src) {
       if (cmd === "frac" || cmd === "dfrac" || cmd === "tfrac" || cmd === "cfrac") {
         const numAtom = readNextAtom(src, i);
         const denAtom = readNextAtom(src, numAtom.nextIndex);
-        const num = parseMathSegment(numAtom.content).trim();
-        const den = parseMathSegment(denAtom.content).trim();
+        const num = parseMathSegment(numAtom.content, depth + 1).trim();
+        const den = parseMathSegment(denAtom.content, depth + 1).trim();
         const numStr = needsFractionParens(num) ? `(${num})` : num;
         const denStr = needsFractionParens(den) ? `(${den})` : den;
         out += `${numStr}/${denStr}`;
@@ -515,13 +520,14 @@ function parseMathSegment(src) {
         if (src[pos] === "[") {
           const opt = readBalancedGroup(src, pos, "[", "]");
           if (opt) {
-            const sup = mapAllChars(parseMathSegment(opt.content).trim(), SUPERSCRIPT_MAP);
-            indexPrefix = sup || `${parseMathSegment(opt.content).trim()}`;
+            const optRendered = parseMathSegment(opt.content, depth + 1).trim();
+            const sup = mapAllChars(optRendered, SUPERSCRIPT_MAP);
+            indexPrefix = sup || optRendered;
             pos = opt.nextIndex;
           }
         }
         const arg = readNextAtom(src, pos);
-        const inner = parseMathSegment(arg.content).trim();
+        const inner = parseMathSegment(arg.content, depth + 1).trim();
         const simple = /^[A-Za-z0-9α-ωΑ-Ω]+$/.test(inner);
         out += simple ? `${indexPrefix}√${inner}` : `${indexPrefix}√(${inner})`;
         i = arg.nextIndex;
@@ -533,7 +539,7 @@ function parseMathSegment(src) {
         // Preserve literal text inside \text{...} without mangling spaces/hyphens
         const textInner = cmd.startsWith("text") || cmd === "mbox" || cmd === "hbox"
           ? arg.content.replace(/\\([%&_#${}])/g, "$1")
-          : parseMathSegment(arg.content);
+          : parseMathSegment(arg.content, depth + 1);
         out += textInner;
         i = arg.nextIndex;
         continue;
@@ -541,22 +547,22 @@ function parseMathSegment(src) {
 
       if (cmd === "mathbb") {
         const arg = readNextAtom(src, i);
-        const inner = parseMathSegment(arg.content).trim();
-        out += [...inner].map((c) => BLACKBOARD_MAP[c] || c).join("");
+        const inner = parseMathSegment(arg.content, depth + 1).trim();
+        out += [...inner].map((c) => (Object.hasOwn(BLACKBOARD_MAP, c) ? BLACKBOARD_MAP[c] : c)).join("");
         i = arg.nextIndex;
         continue;
       }
 
       if (cmd === "mathcal" || cmd === "mathscr" || cmd === "mathfrak") {
         const arg = readNextAtom(src, i);
-        out += parseMathSegment(arg.content);
+        out += parseMathSegment(arg.content, depth + 1);
         i = arg.nextIndex;
         continue;
       }
 
-      if (COMBINING_ACCENTS[cmd]) {
+      if (Object.hasOwn(COMBINING_ACCENTS, cmd)) {
         const arg = readNextAtom(src, i);
-        const inner = parseMathSegment(arg.content).trim();
+        const inner = parseMathSegment(arg.content, depth + 1).trim();
         if (inner.length === 1 && /[A-Za-zα-ωΑ-Ω]/.test(inner)) {
           out += `${inner}${COMBINING_ACCENTS[cmd]}`;
         } else {
@@ -566,7 +572,7 @@ function parseMathSegment(src) {
         continue;
       }
 
-      if (SYMBOLS[cmd]) {
+      if (Object.hasOwn(SYMBOLS, cmd)) {
         const sym = SYMBOLS[cmd];
         // Add subtle spacing when a symbol follows an identifier without space (e.g. a\times b)
         if (out.length > 0 && /[A-Za-z0-9)\]}]$/.test(out) && /^[∝≈∼≃≅≡≤≥≠≪≫±∓×·÷→←↔⇒⇐⇔↦∈∉⊂⊆⊃⊇∪∩∧∨]$/.test(sym)) {

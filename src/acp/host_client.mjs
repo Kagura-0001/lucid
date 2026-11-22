@@ -4,22 +4,44 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { generateHostId, getBgDir, resolveSocketPath } from "./bg_registry.mjs";
+import {
+  ensureSecureBgDir,
+  generateHostId,
+  getBgDir,
+  isPidAlive,
+  resolveSocketPath,
+  verifySocketOwnership,
+} from "./bg_registry.mjs";
+import {
+  createLineSplitter,
+  parseJsonObjectLine,
+  supportsSessionList as capsSupportList,
+  supportsSessionLoad as capsSupportLoad,
+  supportsSessionResume as capsSupportResume,
+} from "./protocol.mjs";
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BIN_PATH = path.resolve(THIS_DIR, "../../bin/lucid.mjs");
 
-function waitForSocket(socketPath, timeoutMs = 15000) {
+function waitForSocket(socketPath, timeoutMs = 15000, hostPid = 0) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
 
     const attempt = () => {
+      if (hostPid > 0 && !isPidAlive(hostPid)) {
+        reject(new Error("lucid session host exited before binding socket"));
+        return;
+      }
       if (Date.now() > deadline) {
         reject(new Error(`Timed out waiting for lucid session host at ${socketPath}`));
         return;
       }
       if (!fs.existsSync(socketPath)) {
         setTimeout(attempt, 40);
+        return;
+      }
+      if (!verifySocketOwnership(socketPath)) {
+        reject(new Error(`Refusing untrusted session host socket at ${socketPath}`));
         return;
       }
       const probe = net.createConnection(socketPath);
@@ -50,7 +72,7 @@ export function spawnSessionHost({
   bypassPermissions = false,
   bgDir = getBgDir(),
 }) {
-  fs.mkdirSync(bgDir, { recursive: true });
+  ensureSecureBgDir(bgDir);
   const hostId = generateHostId();
   const socketPath = resolveSocketPath(hostId, bgDir);
   const specPath = path.join(bgDir, `${hostId}.spec.json`);
@@ -68,7 +90,7 @@ export function spawnSessionHost({
     startBackgrounded,
     bypassPermissions,
   };
-  fs.writeFileSync(specPath, JSON.stringify(spec), { encoding: "utf8", mode: 0o600 });
+  fs.writeFileSync(specPath, JSON.stringify(spec), { encoding: "utf8", mode: 0o600, flag: "wx" });
 
   const child = spawn(process.execPath, [BIN_PATH, "--internal-host", specPath], {
     detached: true,
@@ -85,15 +107,15 @@ export function spawnSessionHost({
  * Exposes the same interface as AcpClient, plus attach() and detach().
  */
 export class HostAcpClient extends EventEmitter {
-  constructor({ hostId, socketPath, launchSpec = null }) {
+  constructor({ hostId, socketPath, launchSpec = null, hostPid = 0 }) {
     super();
     this.hostId = hostId;
     this.socketPath = socketPath;
     this.launchSpec = launchSpec;
+    this.hostPid = hostPid;
     this.isHosted = true;
 
     this.socket = null;
-    this.buffer = "";
     this.pending = new Map();
     this.nextReqId = 1;
     this.agentInfo = null;
@@ -104,21 +126,11 @@ export class HostAcpClient extends EventEmitter {
   }
 
   async start(timeoutMs = 20000) {
-    this.socket = await waitForSocket(this.socketPath, timeoutMs);
+    this.socket = await waitForSocket(this.socketPath, timeoutMs, this.hostPid);
     this.socket.setEncoding("utf8");
 
-    this.socket.on("data", (chunk) => {
-      this.buffer += chunk;
-      let nlIdx = this.buffer.indexOf("\n");
-      while (nlIdx !== -1) {
-        const line = this.buffer.slice(0, nlIdx).trim();
-        this.buffer = this.buffer.slice(nlIdx + 1);
-        if (line) {
-          this.handleMessage(line);
-        }
-        nlIdx = this.buffer.indexOf("\n");
-      }
-    });
+    const onData = createLineSplitter((line) => this.handleMessage(line));
+    this.socket.on("data", onData);
 
     this.socket.on("close", () => {
       for (const [, waiter] of this.pending) {
@@ -144,12 +156,8 @@ export class HostAcpClient extends EventEmitter {
   }
 
   handleMessage(line) {
-    let msg;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      return;
-    }
+    const msg = parseJsonObjectLine(line);
+    if (!msg) return;
 
     if (msg.type === "response" && msg.id) {
       const waiter = this.pending.get(msg.id);
@@ -231,18 +239,15 @@ export class HostAcpClient extends EventEmitter {
   }
 
   supportsSessionList() {
-    const caps = this.agentCapabilities.sessionCapabilities || this.agentCapabilities.session_capabilities || {};
-    return Boolean(caps.list);
+    return capsSupportList(this.agentCapabilities);
   }
 
   supportsSessionLoad() {
-    const caps = this.agentCapabilities.sessionCapabilities || this.agentCapabilities.session_capabilities || {};
-    return Boolean(this.agentCapabilities.loadSession || this.agentCapabilities.load_session || caps.load);
+    return capsSupportLoad(this.agentCapabilities);
   }
 
   supportsSessionResume() {
-    const caps = this.agentCapabilities.sessionCapabilities || this.agentCapabilities.session_capabilities || {};
-    return Boolean(caps.resume);
+    return capsSupportResume(this.agentCapabilities);
   }
 
   listSessions(cwd) {

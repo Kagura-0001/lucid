@@ -1,22 +1,12 @@
 #!/usr/bin/env node
 import path from "node:path";
-import { findLiveBgSession, listLiveBgSessions, stopBgSession } from "../src/acp/bg_registry.mjs";
+import { findLiveBgSession, listLiveBgSessions, stopBgSession, terminatePid } from "../src/acp/bg_registry.mjs";
 import { runSessionHostFromFile } from "../src/acp/host.mjs";
 import { HostAcpClient, spawnSessionHost } from "../src/acp/host_client.mjs";
 import { LucidApp } from "../src/app.mjs";
-import { AGENT_PRESETS, loadUserConfig, parseCliArgs, resolveAgentLaunch } from "../src/config.mjs";
+import { AGENT_PRESETS, LUCID_VERSION, loadUserConfig, parseCliArgs, resolveAgentLaunch } from "../src/config.mjs";
+import { formatElapsed } from "../src/ui/format.mjs";
 import { listThemes } from "../src/ui/themes.mjs";
-
-const VERSION = "0.2.1";
-
-function formatAgeBrief(ts) {
-  if (!ts) return "";
-  const secs = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (secs < 60) return `${secs}s`;
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins}m${secs % 60}s`;
-  return `${Math.floor(mins / 60)}h${mins % 60}m`;
-}
 
 function statusIcon(status) {
   switch (status) {
@@ -38,7 +28,7 @@ function printHelp() {
     .map((t) => t.name)
     .join(", ");
 
-  process.stdout.write(`lucid ${VERSION} — transparent, flicker-free TUI for Antigravity & ACP agents
+  process.stdout.write(`lucid ${LUCID_VERSION} — transparent, flicker-free TUI for Antigravity & ACP agents
 
 Usage:
   lucid [options]
@@ -87,7 +77,7 @@ async function runBgList(opts) {
   }
   for (const s of sessions) {
     const dir = path.basename(s.cwd || "") || s.cwd || "";
-    const age = formatAgeBrief(s.startedAt);
+    const age = formatElapsed(s.startedAt);
     const title = (s.title || s.lastSummary || "Untitled").slice(0, 72);
     const attachedTag = s.attached ? " [attached]" : "";
     process.stdout.write(
@@ -143,9 +133,19 @@ async function runBgPrompt(opts) {
   });
 
   // Verify the host booted and started the ACP agent before returning.
-  const probe = new HostAcpClient({ hostId: spawned.hostId, socketPath: spawned.socketPath, launchSpec });
-  await probe.start(25000);
-  await probe.detach();
+  const probe = new HostAcpClient({
+    hostId: spawned.hostId,
+    socketPath: spawned.socketPath,
+    launchSpec,
+    hostPid: spawned.pid,
+  });
+  try {
+    await probe.start(25000);
+    await probe.detach();
+  } catch (err) {
+    terminatePid(spawned.pid);
+    throw err;
+  }
 
   process.stdout.write(`Started background session ${spawned.hostId} (${launchSpec.name} · ${cwd})\n`);
   process.stdout.write(`Resume anytime: lucid -r ${spawned.hostId}  (or lucid -r)\n`);
@@ -167,7 +167,7 @@ async function main() {
     return;
   }
   if (opts.version) {
-    process.stdout.write(`${VERSION}\n`);
+    process.stdout.write(`${LUCID_VERSION}\n`);
     return;
   }
   if (opts.bgList) {
@@ -186,9 +186,13 @@ async function main() {
   const app = new LucidApp(opts);
   activeApp = app;
 
+  let handlingFatal = false;
   const handleFatal = async (label, err) => {
+    if (handlingFatal) return;
+    handlingFatal = true;
     app.restoreTerminalSync();
-    await app.shutdown(1);
+    const shouldDetach = Boolean(app.acp?.isHosted);
+    await app.shutdown(1, { detach: shouldDetach }).catch(() => {});
     process.stderr.write(`lucid ${label}: ${err?.stack || err}\n`);
     process.exit(1);
   };

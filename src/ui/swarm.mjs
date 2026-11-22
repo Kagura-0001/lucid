@@ -1,8 +1,8 @@
 import path from "node:path";
-import { displayWidth, padEndVisible, truncateAnsi, wrapAnsiLine, wrapAnsiText } from "../term/unicode.mjs";
-import { renderMarkdown } from "./markdown.mjs";
-
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+import { displayWidth, padEndVisible, sanitizeUntrustedText, truncateAnsi, wrapAnsiText } from "../term/unicode.mjs";
+import { alignLeftRight, formatElapsed, sliceCenteredWindow, spinnerChar } from "./format.mjs";
+import { safeRenderMarkdown } from "./markdown.mjs";
+import { normalizeToolRawInput } from "./tool_format.mjs";
 
 function formatClock(ts) {
   const d = new Date(ts || Date.now());
@@ -10,28 +10,6 @@ function formatClock(ts) {
   const mm = String(d.getMinutes()).padStart(2, "0");
   const ss = String(d.getSeconds()).padStart(2, "0");
   return `${hh}:${mm}:${ss}`;
-}
-
-function formatAge(startedAt, endedAt) {
-  if (!startedAt) return "";
-  const ms = Math.max(0, (endedAt || Date.now()) - startedAt);
-  const secs = Math.floor(ms / 1000);
-  if (secs < 60) return `${secs}s`;
-  const mins = Math.floor(secs / 60);
-  return `${mins}m${secs % 60}s`;
-}
-
-function normalizeRawInput(rawInput) {
-  if (!rawInput) return null;
-  if (typeof rawInput === "object") return rawInput;
-  if (typeof rawInput === "string") {
-    try {
-      return JSON.parse(rawInput);
-    } catch {
-      return null;
-    }
-  }
-  return null;
 }
 
 function extractOutputText(update) {
@@ -45,7 +23,24 @@ function extractOutputText(update) {
   if (parts.length === 0 && update.rawOutput) {
     parts.push(typeof update.rawOutput === "string" ? update.rawOutput : JSON.stringify(update.rawOutput));
   }
-  return parts.join("\n").trim();
+  return sanitizeUntrustedText(parts.join("\n")).trim();
+}
+
+function createMemberRecord(kind, fields) {
+  const now = Date.now();
+  return {
+    kind,
+    model: "inherit",
+    workspace: "inherit",
+    state: "working",
+    brief: "",
+    output: "",
+    recentSteps: [],
+    startedAt: now,
+    updatedAt: now,
+    endedAt: null,
+    ...fields,
+  };
 }
 
 export class MultiAgentTracker {
@@ -87,6 +82,13 @@ export class MultiAgentTracker {
       this.boardMessages.length > 0 ||
       this.artifacts.size > 0
     );
+  }
+
+  hasRunningMembers() {
+    for (const member of [...this.workers.values(), ...this.subagents.values()]) {
+      if (ACTIVE_STATES.has(member.state)) return true;
+    }
+    return false;
   }
 
   getSummaryCounts() {
@@ -147,8 +149,8 @@ export class MultiAgentTracker {
   }
 
   pushBoardMessage({ from, to, body }) {
-    if (!body || !String(body).trim()) return;
-    const text = String(body).trim();
+    const text = sanitizeUntrustedText(body || "").trim();
+    if (!text) return;
     const last = this.boardMessages[this.boardMessages.length - 1];
     if (last && last.from === from && last.to === to && last.body === text) {
       return;
@@ -156,8 +158,8 @@ export class MultiAgentTracker {
     this.boardMessages.push({
       id: `msg_${this.boardMessages.length + 1}`,
       time: Date.now(),
-      from: from || "coordinator",
-      to: to || "all",
+      from: sanitizeUntrustedText(from || "coordinator"),
+      to: sanitizeUntrustedText(to || "all"),
       body: text,
     });
     if (this.boardMessages.length > 300) {
@@ -169,9 +171,9 @@ export class MultiAgentTracker {
     if (!update || typeof update !== "object") return;
     const toolCallId = update.toolCallId || "";
     const toolName = (update.name || "").toLowerCase();
-    const title = String(update.title || "");
+    const title = sanitizeUntrustedText(update.title || "");
     const titleLower = title.toLowerCase();
-    const input = normalizeRawInput(update.rawInput);
+    const input = normalizeToolRawInput(update.rawInput);
     const output = extractOutputText(update);
     const status = update.status || "";
 
@@ -268,19 +270,13 @@ export class MultiAgentTracker {
         const taskSuffix = Array.isArray(input.tasks) && input.tasks[idx] ? `\n\nSlice: ${input.tasks[idx]}` : "";
         const fullBrief = `${input.brief || ""}${taskSuffix}`.trim();
         const existing = this.workers.get(wName);
-        const worker = existing || {
+        const worker = existing || createMemberRecord("swarm", {
           id: `swarm:${wName}`,
-          kind: "swarm",
           name: wName,
           model: input.model || "inherited",
           workspace: input.workspace || "inherit",
-          state: "working",
           brief: fullBrief,
-          output: "",
-          startedAt: Date.now(),
-          updatedAt: Date.now(),
-          endedAt: null,
-        };
+        });
         worker.model = input.model || worker.model;
         worker.workspace = input.workspace || worker.workspace;
         if (fullBrief) worker.brief = fullBrief;
@@ -326,15 +322,15 @@ export class MultiAgentTracker {
 
   applySwarmOutput(hintName, output, status) {
     if (!output) return;
-    // Try parsing worker states from status tables/lines like "worker-1  waiting  model"
-    const lines = output.split(/\r?\n/);
+    const cleanOutput = sanitizeUntrustedText(output);
+    const lines = cleanOutput.split(/\r?\n/);
     for (const line of lines) {
-      const stateMatch = /\b([a-z0-9][a-z0-9_-]{0,23})\b.*\b(working|waiting|stopped|killed)\b/i.exec(line);
-      if (stateMatch) {
-        const wName = stateMatch[1];
-        const wState = stateMatch[2].toLowerCase();
-        const w = this.workers.get(wName);
-        if (w) {
+      for (const [wName, w] of this.workers) {
+        const escaped = wName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const nameMatch = new RegExp(`(?:^|[^a-z0-9_-])${escaped}(?:$|[^a-z0-9_-])`, "i").test(line);
+        const stateMatch = nameMatch && /\b(working|waiting|stopped|killed)\b/i.exec(line);
+        if (stateMatch) {
+          const wState = stateMatch[1].toLowerCase();
           w.state = wState;
           w.updatedAt = Date.now();
           if (wState === "killed" || wState === "stopped") {
@@ -346,7 +342,7 @@ export class MultiAgentTracker {
 
     if (hintName && this.workers.has(hintName)) {
       const w = this.workers.get(hintName);
-      w.output = output;
+      w.output = cleanOutput;
       w.updatedAt = Date.now();
       if (status === "failed" || status === "error") {
         w.state = "failed";
@@ -359,22 +355,16 @@ export class MultiAgentTracker {
     const key = toolCallId || `sub_${this.subagents.size + 1}`;
     let sub = this.subagents.get(key);
     if (!sub) {
-      sub = {
+      sub = createMemberRecord("subagent", {
         id: `sub:${key}`,
-        kind: "subagent",
         name: input?.Role || title || "Subagent",
         role: input?.Role || title || "Subagent",
         typeName: input?.TypeName || "subagent",
         model: input?.Model || "inherit",
         workspace: input?.Workspace || "inherit",
-        state: "working",
         brief: input?.Prompt || "",
-        output: "",
         conversationId: "",
-        startedAt: Date.now(),
-        updatedAt: Date.now(),
-        endedAt: null,
-      };
+      });
       this.subagents.set(key, sub);
       if (toolCallId) {
         this.toolCallBinding.set(toolCallId, { category: "subagent", targetKey: key });
@@ -455,7 +445,7 @@ export class MultiAgentTracker {
     if (!snapshot) return;
     this.diskBacked = true;
     if (snapshot.swarmTitle) {
-      this.swarmTitle = snapshot.swarmTitle;
+      this.swarmTitle = sanitizeUntrustedText(snapshot.swarmTitle);
     }
     if (snapshot.planSummary !== undefined) {
       this.planSummary = snapshot.planSummary;
@@ -464,34 +454,31 @@ export class MultiAgentTracker {
     // Briefs posted to the board: "@name ..." lines of kind "brief".
     const briefByWorker = new Map();
     for (const line of snapshot.board || []) {
-      const mention = /^@([a-z0-9][a-z0-9_-]*)/i.exec(String(line.text || ""));
+      const lineText = sanitizeUntrustedText(line.text || "");
+      const mention = /^@([a-z0-9][a-z0-9_-]*)/i.exec(lineText);
       if (line.kind === "brief" && mention) {
-        briefByWorker.set(mention[1], String(line.text).replace(/^@\S+\s*/, ""));
+        briefByWorker.set(mention[1], lineText.replace(/^@\S+\s*/, ""));
       }
     }
 
     for (const diskWorker of snapshot.workers || []) {
       const existing = this.workers.get(diskWorker.name);
-      const worker = existing || {
+      const worker = existing || createMemberRecord("swarm", {
         id: `swarm:${diskWorker.name}`,
-        kind: "swarm",
         name: diskWorker.name,
-        brief: "",
-        output: "",
-        recentSteps: [],
-        startedAt: Date.now(),
-        endedAt: null,
-      };
-      worker.model = diskWorker.model || worker.model || "";
-      worker.workspace = diskWorker.workspace || worker.workspace || "";
+        model: "",
+        workspace: "",
+      });
+      worker.model = sanitizeUntrustedText(diskWorker.model || worker.model || "");
+      worker.workspace = sanitizeUntrustedText(diskWorker.workspace || worker.workspace || "");
       worker.state = diskWorker.state;
-      worker.activity = diskWorker.activity;
-      worker.task = diskWorker.task;
+      worker.activity = sanitizeUntrustedText(diskWorker.activity || "");
+      worker.task = sanitizeUntrustedText(diskWorker.task || "");
       worker.conversationId = diskWorker.conversationId;
       worker.transcriptPath = diskWorker.transcriptPath;
       worker.recentSteps = Array.isArray(diskWorker.recentSteps) ? diskWorker.recentSteps : worker.recentSteps || [];
-      worker.brief = worker.brief || briefByWorker.get(diskWorker.name) || diskWorker.task || "";
-      if (diskWorker.lastText) worker.output = diskWorker.lastText;
+      worker.brief = worker.brief || briefByWorker.get(diskWorker.name) || worker.task || "";
+      if (diskWorker.lastText) worker.output = sanitizeUntrustedText(diskWorker.lastText);
       worker.updatedAt = diskWorker.updatedAt || Date.now();
       if (diskWorker.startedAt) worker.startedAt = diskWorker.startedAt;
       const isFinished = worker.state === "killed" || worker.state === "stopped";
@@ -515,29 +502,22 @@ export class MultiAgentTracker {
         }
         sub = adoptedKey ? this.subagents.get(adoptedKey) : null;
         if (adoptedKey) this.subagents.delete(adoptedKey);
-        sub = sub || {
+        sub = sub || createMemberRecord("subagent", {
           id: `sub:${key}`,
-          kind: "subagent",
-          name: diskSub.role,
-          role: diskSub.role,
-          typeName: diskSub.typeName,
-          model: "inherit",
-          workspace: "inherit",
-          brief: "",
-          output: "",
-          recentSteps: [],
-          startedAt: Date.now(),
-          endedAt: null,
-        };
+          name: sanitizeUntrustedText(diskSub.role),
+          role: sanitizeUntrustedText(diskSub.role),
+          typeName: sanitizeUntrustedText(diskSub.typeName),
+        });
         this.subagents.set(key, sub);
       }
       sub.conversationId = diskSub.conversationId;
-      sub.typeName = diskSub.typeName || sub.typeName;
+      sub.typeName = sanitizeUntrustedText(diskSub.typeName || sub.typeName);
       sub.state = diskSub.state;
-      sub.activity = diskSub.activity;
+      sub.activity = sanitizeUntrustedText(diskSub.activity || "");
       sub.transcriptPath = diskSub.transcriptPath;
       sub.recentSteps = Array.isArray(diskSub.recentSteps) ? diskSub.recentSteps : sub.recentSteps || [];
-      sub.output = diskSub.reply || diskSub.lastText || sub.output;
+      const replyOrLast = diskSub.reply || diskSub.lastText;
+      if (replyOrLast) sub.output = sanitizeUntrustedText(replyOrLast);
       sub.updatedAt = diskSub.updatedAt || Date.now();
       if (diskSub.startedAt) sub.startedAt = diskSub.startedAt;
       const isFinished = ["completed", "killed", "failed", "idle"].includes(sub.state);
@@ -551,12 +531,12 @@ export class MultiAgentTracker {
     }
     const feed = [];
     for (const line of snapshot.board || []) {
-      const text = String(line.text || "");
+      const text = sanitizeUntrustedText(line.text || "");
       const mention = /^@([a-z0-9][a-z0-9_#-]*)/i.exec(text);
       feed.push({
         id: `board_${line.seq}`,
         time: Date.parse(String(line.time || "").replace(" ", "T")) || Date.now(),
-        from: line.agent || "coordinator",
+        from: sanitizeUntrustedText(line.agent || "coordinator"),
         to: mention ? `@${mention[1]}` : "all",
         body: text,
         seq: line.seq,
@@ -566,9 +546,11 @@ export class MultiAgentTracker {
       feed.push({
         id: `msg_${message.id || message.timestamp}`,
         time: Date.parse(message.timestamp || "") || Date.now(),
-        from: roleByConversation.get(message.sender) || message.renderDetails?.messageTitle || message.sender,
+        from: sanitizeUntrustedText(
+          roleByConversation.get(message.sender) || message.renderDetails?.messageTitle || message.sender,
+        ),
         to: "coordinator",
-        body: message.content,
+        body: sanitizeUntrustedText(message.content || ""),
       });
     }
     if (feed.length > 0) {
@@ -602,7 +584,7 @@ export class MultiAgentTracker {
 }
 
 function statusBadge(state, style, spinnerFrame) {
-  const spin = SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length];
+  const spin = spinnerChar(spinnerFrame);
   switch (state) {
     case "board":
       return style.accentBold("◈");
@@ -615,6 +597,8 @@ function statusBadge(state, style, spinnerFrame) {
       return style.muted("◌");
     case "completed":
       return style.success("✓");
+    case "done":
+      return style.muted("•");
     case "failed":
     case "error":
       return style.error("✗");
@@ -671,13 +655,17 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
 
   if (members.length === 0) {
     // Only artifacts or board messages remain — keep a single quiet line.
-    const fallback = renderSwarmStrip(tracker, cols, style, spinnerFrame);
-    return fallback ? [fallback] : [];
+    const bits = [];
+    if (counts.artifactCount > 0) bits.push(style.accentAlt(`◇ ${counts.artifactCount} (/artifacts)`));
+    if (counts.boardCount > 0) bits.push(style.muted(`${counts.boardCount} board msgs`));
+    if (bits.length === 0) return [];
+    bits.push(style.muted("^B board"));
+    return [` ${truncateAnsi(bits.join(style.border(" · ")), maxWidth, "…")}`];
   }
 
   // Build top summary bar of the dock
   const icon = counts.working > 0 || counts.subagentsRunning > 0
-    ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
+    ? style.warn(spinnerChar(spinnerFrame))
     : style.accent("◈");
   const titleText = counts.swarmCount > 0
     ? (counts.swarmTitle ? `Swarm "${counts.swarmTitle}"` : "Swarm")
@@ -696,15 +684,7 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
   const rightHint = collapsed
     ? style.muted("Alt+B expand · ^B board")
     : style.muted("Alt+[/] inspect · ^B board · Alt+B fold");
-
-  const leftW = displayWidth(leftHeader);
-  const rightW = displayWidth(rightHint);
-  let headerRow;
-  if (leftW + rightW + 3 <= maxWidth) {
-    headerRow = ` ${leftHeader}${" ".repeat(maxWidth - leftW - rightW)}${rightHint}`;
-  } else {
-    headerRow = ` ${truncateAnsi(leftHeader, maxWidth, "…")}`;
-  }
+  const headerRow = ` ${alignLeftRight(leftHeader, rightHint, maxWidth, 3)}`;
 
   if (collapsed) {
     return [headerRow];
@@ -721,9 +701,9 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
     const paintName = memberColorFn(member.name, style);
     const pointer = isFocused ? style.accentBold("▸") : " ";
     const nameStr = padEndVisible(paintName(truncateAnsi(member.name, nameColWidth, "…")), nameColWidth);
-    const age = member.startedAt ? formatAge(member.startedAt, member.endedAt) : "";
+    const age = member.startedAt ? formatElapsed(member.startedAt, member.endedAt) : "";
     const ageText = age ? style.muted(age) : "";
-    const ageWidth = displayWidth(ageText);
+    const ageWidth = ageText ? displayWidth(ageText) : 0;
 
     const activityRaw = formatMemberActivityLabel(member);
     const taskRaw = member.task && member.task !== activityRaw ? member.task : "";
@@ -740,29 +720,16 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
       const actText = style.text(truncateAnsi(activityRaw, actCap, "…"));
       if (taskRaw && bodyBudget > 36) {
         const taskBudget = bodyBudget - displayWidth(actText) - 3;
-        if (taskBudget >= 8) {
-          bodyStr = `${actText}  ${style.muted(truncateAnsi(taskRaw, taskBudget, "…"))}`;
-        } else {
-          bodyStr = actText;
-        }
+        bodyStr = taskBudget >= 8 ? `${actText}  ${style.muted(truncateAnsi(taskRaw, taskBudget, "…"))}` : actText;
       } else {
         bodyStr = actText;
       }
     } else {
-      const mutedAct = taskRaw && member.state === "waiting"
-        ? `${activityRaw} · ${taskRaw}`
-        : activityRaw;
+      const mutedAct = taskRaw && member.state === "waiting" ? `${activityRaw} · ${taskRaw}` : activityRaw;
       bodyStr = style.muted(truncateAnsi(mutedAct, bodyBudget, "…"));
     }
 
-    const leftCombined = `${prefixPart}${bodyStr}`;
-    const leftCombinedW = displayWidth(leftCombined);
-    if (ageWidth > 0 && leftCombinedW + ageWidth + 2 <= maxWidth + 1) {
-      const gap = Math.max(2, maxWidth + 1 - leftCombinedW - ageWidth);
-      rows.push(`${leftCombined}${" ".repeat(gap)}${ageText}`);
-    } else {
-      rows.push(truncateAnsi(leftCombined, cols, "…"));
-    }
+    rows.push(alignLeftRight(`${prefixPart}${bodyStr}`, ageText, maxWidth + 1, 2));
   }
 
   if (hiddenCount > 0) {
@@ -772,6 +739,100 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
   return rows;
 }
 
+function renderMemberHeader(member, width, style, spinnerFrame, { live }) {
+  const out = [];
+  const badge = statusBadge(member.state, style, spinnerFrame);
+  const nameText = live ? memberColorFn(member.name, style)(member.name) : style.bold(member.name);
+  const age = live && member.startedAt ? ` · ${formatElapsed(member.startedAt, member.endedAt)}` : "";
+  out.push(truncateAnsi(`${badge} ${nameText}  ${style.muted(`[${member.kind} · ${member.state}${age}]`)}`, width, "…"));
+
+  const meta = [];
+  if (member.model) meta.push(`model${live ? " " : ": "}${member.model}`);
+  if (member.workspace) meta.push(`workspace${live ? " " : ": "}${member.workspace}`);
+  if (!live && member.startedAt) meta.push(`elapsed: ${formatElapsed(member.startedAt, member.endedAt)}`);
+  if (live && member.updatedAt) meta.push(`updated ${formatElapsed(member.updatedAt, Date.now())} ago`);
+  if (meta.length > 0) {
+    out.push(style.muted(truncateAnsi(meta.join(live ? " · " : "  ·  "), width, "…")));
+  }
+
+  if (live) {
+    out.push(style.muted("Alt+[/] switch agent · Esc back to main conversation · ^B full board"));
+  } else {
+    if (member.activity && (ACTIVE_STATES.has(member.state) || member.state === "waiting")) {
+      out.push(`${style.accent("Now:")} ${truncateAnsi(member.activity, Math.max(16, width - 6), "…")}`);
+    }
+    if (member.transcriptPath && member.updatedAt) {
+      out.push(style.muted(`last activity ${formatElapsed(member.updatedAt, Date.now())} ago`));
+    }
+    if (member.transcriptPath) {
+      out.push(style.muted(truncateAnsi(`log: ${member.transcriptPath}`, width, "…")));
+    }
+  }
+  out.push(style.border("─".repeat(Math.min(width, live ? 72 : 64))));
+  return out;
+}
+
+function renderMemberSections(member, width, style, spinnerFrame, { live }) {
+  const out = [];
+  if (member.brief) {
+    out.push(style.accent(live ? "Assignment" : "Assignment / Brief"));
+    const paintBrief = live ? style.muted : style.text;
+    for (const bl of wrapAnsiText(paintBrief(member.brief), Math.max(16, width - 2))) {
+      out.push(`  ${bl}`);
+    }
+    out.push("");
+  }
+
+  const rawSteps = Array.isArray(member.recentSteps) ? member.recentSteps : [];
+  const steps = live ? rawSteps : rawSteps.filter((s) => s.kind === "tool").slice(-10);
+
+  if (steps.length > 0) {
+    out.push(style.accent(live ? "Live Activity" : "Recent Steps"));
+    for (const step of steps) {
+      if (step.kind === "tool") {
+        const icon = statusBadge(step.status, style, spinnerFrame);
+        const label = truncateAnsi(step.activity || step.name || "tool", Math.max(16, width - 6), "…");
+        const styled = live && step.status === "running" ? style.text(label) : style.muted(label);
+        out.push(`  ${icon} ${styled}`);
+      } else if (live && step.kind === "message" && step.text) {
+        out.push("");
+        for (const ml of safeRenderMarkdown(step.text, Math.max(16, width - 2), style)) {
+          out.push(ml ? `  ${ml}` : "");
+        }
+        out.push("");
+      }
+    }
+    if (!live) out.push("");
+  }
+
+  if (!live || steps.length === 0) {
+    if (member.output) {
+      out.push(style.accent("Latest Output"));
+      for (const ol of safeRenderMarkdown(member.output, Math.max(16, width - 2), style)) {
+        out.push(ol ? `  ${ol}` : "");
+      }
+    } else {
+      out.push(style.muted(live ? "Waiting for transcript activity…" : "Waiting for output updates…"));
+    }
+  }
+  return out;
+}
+
+function formatRosterRow(entry, isSelected, width, style, spinnerFrame, includeAge) {
+  const icon = statusBadge(entry.state, style, spinnerFrame);
+  const age = includeAge && entry.startedAt ? ` ${formatElapsed(entry.startedAt, entry.endedAt)}` : "";
+  const rawName = truncateAnsi(entry.name, Math.max(8, width - displayWidth(age) - 4), "…");
+  return isSelected
+    ? style.selected(` ▸ ${rawName}${age} `)
+    : ` ${icon} ${style.text(rawName)}${age ? style.muted(age) : ""}`;
+}
+
+function sliceScrollableLines(lines, rawOffset, height) {
+  const maxDetailScroll = Math.max(0, lines.length - height);
+  const offset = Math.max(0, Math.min(rawOffset || 0, maxDetailScroll));
+  return { maxDetailScroll, slice: lines.slice(offset, offset + height) };
+}
+
 /**
  * Renders an inspected agent's live transcript (Codex-style recent steps + brief
  * + latest reply) for display inside the main viewport via Alt+[ / Alt+].
@@ -779,146 +840,15 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
 export function renderMemberTimeline(member, cols, style, spinnerFrame) {
   if (!member) return [];
   const contentWidth = Math.max(24, cols - 4);
-  const lines = [""];
-
-  const badge = statusBadge(member.state, style, spinnerFrame);
-  const paintName = memberColorFn(member.name, style);
-  const age = member.startedAt ? ` · ${formatAge(member.startedAt, member.endedAt)}` : "";
-  const banner = `${badge} ${paintName(member.name)}  ${style.muted(`[${member.kind} · ${member.state}${age}]`)}`;
-  lines.push(`  ${truncateAnsi(banner, contentWidth, "…")}`);
-
-  const metaBits = [];
-  if (member.model) metaBits.push(`model ${member.model}`);
-  if (member.workspace) metaBits.push(`workspace ${member.workspace}`);
-  if (member.updatedAt) metaBits.push(`updated ${formatAge(member.updatedAt, Date.now())} ago`);
-  if (metaBits.length > 0) {
-    lines.push(`  ${style.muted(truncateAnsi(metaBits.join(" · "), contentWidth, "…"))}`);
-  }
-  lines.push(`  ${style.muted("Alt+[/] switch agent · Esc back to main conversation · ^B full board")}`);
-  lines.push(`  ${style.border("─".repeat(Math.min(contentWidth, 72)))}`);
-  lines.push("");
-
-  if (member.brief) {
-    lines.push(`  ${style.accent("Assignment")}`);
-    for (const bl of wrapAnsiText(style.muted(member.brief), Math.max(16, contentWidth - 2))) {
-      lines.push(`    ${bl}`);
-    }
-    lines.push("");
-  }
-
-  const steps = Array.isArray(member.recentSteps) ? member.recentSteps : [];
-  if (steps.length > 0) {
-    lines.push(`  ${style.accent("Live Activity")}`);
-    for (const step of steps) {
-      if (step.kind === "tool") {
-        const icon = step.status === "running"
-          ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
-          : step.status === "failed"
-            ? style.error("✗")
-            : step.status === "waiting"
-              ? style.accentAlt("◌")
-              : style.muted("•");
-        const text = truncateAnsi(step.activity || step.name || "tool", Math.max(16, contentWidth - 4), "…");
-        lines.push(`  ${icon} ${step.status === "running" ? style.text(text) : style.muted(text)}`);
-      } else if (step.kind === "message" && step.text) {
-        lines.push("");
-        for (const ml of renderMarkdown(step.text, Math.max(16, contentWidth - 2), style)) {
-          lines.push(ml ? `  ${ml}` : "");
-        }
-        lines.push("");
-      }
-    }
-  } else if (member.output) {
-    lines.push(`  ${style.accent("Latest Output")}`);
-    for (const ml of renderMarkdown(member.output, Math.max(16, contentWidth - 2), style)) {
-      lines.push(ml ? `  ${ml}` : "");
-    }
-  } else {
-    lines.push(`  ${style.muted("Waiting for transcript activity…")}`);
-  }
-
+  const body = [
+    ...renderMemberHeader(member, contentWidth, style, spinnerFrame, { live: true }),
+    "",
+    ...renderMemberSections(member, contentWidth, style, spinnerFrame, { live: true }),
+  ];
   if (member.activity && ACTIVE_STATES.has(member.state)) {
-    const spin = style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]);
-    lines.push("");
-    lines.push(`  ${spin} ${style.text(truncateAnsi(member.activity, Math.max(16, contentWidth - 4), "…"))}`);
+    body.push("", `${style.warn(spinnerChar(spinnerFrame))} ${style.text(truncateAnsi(member.activity, Math.max(16, contentWidth - 4), "…"))}`);
   }
-
-  lines.push("");
-  return lines;
-}
-
-/**
- * Compact 1-line transparent indicator shown above composer ONLY when
- * Swarm workers, Subagents, or Artifacts are active in this session.
- * Lists members by name (active ones first) so their state is visible
- * without opening the board.
- */
-export function renderSwarmStrip(tracker, cols, style, spinnerFrame) {
-  if (!tracker || !tracker.hasActivity()) return null;
-  const counts = tracker.getSummaryCounts();
-  const maxWidth = Math.max(20, cols - 2);
-
-  const members = [...tracker.workers.values(), ...tracker.subagents.values()]
-    .filter((member) => member.state !== "killed")
-    .sort((a, b) => (STRIP_STATE_ORDER[a.state] ?? 9) - (STRIP_STATE_ORDER[b.state] ?? 9));
-
-  const prefixParts = [];
-  if (counts.swarmCount > 0) {
-    // Per-member badges already show working / waiting / done, so the prefix
-    // only names the swarm; that leaves room for member names.
-    const titlePart = counts.swarmTitle ? `Swarm "${counts.swarmTitle}"` : "Swarm";
-    const icon = counts.working > 0
-      ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
-      : style.accent("◈");
-    prefixParts.push(`${icon} ${style.bold(titlePart)}`);
-  } else if (counts.subagentsTotal > 0) {
-    prefixParts.push(style.muted(`${counts.subagentsRunning}/${counts.subagentsTotal} subagents running`));
-  }
-
-  const suffixParts = [];
-  if (counts.artifactCount > 0) {
-    suffixParts.push(style.accentAlt(`◇ ${counts.artifactCount} (/artifacts)`));
-  }
-  suffixParts.push(style.muted("^B board"));
-
-  const separator = style.border("  ·  ");
-  const separatorWidth = 5;
-  const prefix = prefixParts.join(separator);
-  const suffix = suffixParts.join(separator);
-  // Leading space + prefix + suffix + the two separators around the member list.
-  const fixedWidth = 1 + displayWidth(prefix) + displayWidth(suffix) + separatorWidth * (prefix ? 2 : 1);
-  const memberBudget = Math.max(0, maxWidth - fixedWidth);
-
-  // Names first: show as many members as fit (reserving room for "+N"), then give
-  // whatever width is left to the first active member's current action.
-  const namePieces = members.map((member) => `${statusBadge(member.state, style, spinnerFrame)} ${member.name}`);
-  let shownCount = 0;
-  let usedWidth = 0;
-  for (let i = 0; i < namePieces.length; i += 1) {
-    const pieceWidth = displayWidth(namePieces[i]) + (shownCount > 0 ? 2 : 0);
-    const remainingAfter = namePieces.length - i - 1;
-    const overflowTagWidth = remainingAfter > 0 ? 2 + String(remainingAfter).length + 1 : 0;
-    if (usedWidth + pieceWidth + overflowTagWidth > memberBudget) break;
-    usedWidth += pieceWidth;
-    shownCount += 1;
-  }
-  const hiddenCount = members.length - shownCount;
-  if (hiddenCount > 0) usedWidth += 2 + String(hiddenCount).length + 1;
-
-  const memberPieces = namePieces.slice(0, shownCount);
-  const activeIndex = members.slice(0, shownCount).findIndex((member) => ACTIVE_STATES.has(member.state) && member.activity);
-  const activityRoom = memberBudget - usedWidth - 1;
-  if (activeIndex >= 0 && activityRoom >= 8) {
-    const activity = truncateAnsi(members[activeIndex].activity, Math.min(activityRoom, 40), "…");
-    memberPieces[activeIndex] = `${memberPieces[activeIndex]} ${style.muted(activity)}`;
-  }
-  if (hiddenCount > 0) {
-    memberPieces.push(style.muted(`+${hiddenCount}`));
-  }
-
-  const parts = [prefix, memberPieces.join("  "), suffix].filter(Boolean);
-  if (parts.length === 0) return null;
-  return ` ${truncateAnsi(parts.join(separator), maxWidth, "…")}`;
+  return ["", ...body.map((l) => (l ? `  ${l}` : "")), ""];
 }
 
 /**
@@ -978,7 +908,7 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
       for (const msg of msgs) {
         const header = `${style.accentBold(msg.from)} ${style.muted("→")} ${style.accentAlt(msg.to)}  ${style.muted(formatClock(msg.time))}`;
         out.push(truncateAnsi(header, rightWidth, "…"));
-        const bodyLines = renderMarkdown(msg.body, Math.max(16, rightWidth - 2), style);
+        const bodyLines = safeRenderMarkdown(msg.body, Math.max(16, rightWidth - 2), style);
         for (const bl of bodyLines) {
           out.push(bl ? `  ${bl}` : "");
         }
@@ -988,59 +918,10 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
     }
 
     // Member detail view
-    const m = selectedEntry;
-    const out = [];
-    const badge = statusBadge(m.state, style, spinnerFrame);
-    out.push(`${badge} ${style.bold(m.name)}  ${style.muted(`[${m.kind} · ${m.state}]`)}`);
-    const metaParts = [];
-    if (m.model) metaParts.push(`model: ${m.model}`);
-    if (m.workspace) metaParts.push(`workspace: ${m.workspace}`);
-    if (m.startedAt) metaParts.push(`elapsed: ${formatAge(m.startedAt, m.endedAt)}`);
-    if (metaParts.length > 0) {
-      out.push(style.muted(metaParts.join("  ·  ")));
-    }
-    if (m.activity && (m.state === "working" || m.state === "running" || m.state === "waiting")) {
-      out.push(`${style.accent("Now:")} ${truncateAnsi(m.activity, Math.max(16, rightWidth - 6), "…")}`);
-    }
-    if (m.transcriptPath && m.updatedAt) {
-      out.push(style.muted(`last activity ${formatAge(m.updatedAt, Date.now())} ago`));
-    }
-    if (m.transcriptPath) {
-      out.push(style.muted(truncateAnsi(`log: ${m.transcriptPath}`, rightWidth, "…")));
-    }
-    out.push(style.border("─".repeat(Math.min(rightWidth, 64))));
-
-    if (m.brief) {
-      out.push(style.accent("Assignment / Brief"));
-      for (const bl of wrapAnsiText(style.text(m.brief), Math.max(16, rightWidth - 2))) {
-        out.push(`  ${bl}`);
-      }
-      out.push("");
-    }
-
-    const recentTools = (m.recentSteps || []).filter((s) => s.kind === "tool").slice(-10);
-    if (recentTools.length > 0) {
-      out.push(style.accent("Recent Steps"));
-      for (const st of recentTools) {
-        const sIcon = st.status === "running"
-          ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
-          : st.status === "failed"
-            ? style.error("✗")
-            : style.muted("•");
-        out.push(`  ${sIcon} ${style.muted(truncateAnsi(st.activity || st.name, Math.max(16, rightWidth - 6), "…"))}`);
-      }
-      out.push("");
-    }
-
-    if (m.output) {
-      out.push(style.accent("Latest Output"));
-      for (const ol of renderMarkdown(m.output, Math.max(16, rightWidth - 2), style)) {
-        out.push(ol ? `  ${ol}` : "");
-      }
-    } else {
-      out.push(style.muted("Waiting for output updates…"));
-    }
-    return out;
+    return [
+      ...renderMemberHeader(selectedEntry, rightWidth, style, spinnerFrame, { live: false }),
+      ...renderMemberSections(selectedEntry, rightWidth, style, spinnerFrame, { live: false }),
+    ];
   };
 
   const tabBar =
@@ -1064,25 +945,18 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
     leftLines.push(style.border("─".repeat(leftWidth)));
 
     const maxRosterRows = Math.max(1, contentHeight - 2);
-    const rStart = Math.max(0, Math.min(selectedIdx - Math.floor(maxRosterRows / 2), entries.length - maxRosterRows));
-    const rSlice = entries.slice(rStart, rStart + maxRosterRows);
+    const { start: rStart, slice: rSlice } = sliceCenteredWindow(entries, selectedIdx, maxRosterRows);
 
     for (let i = 0; i < rSlice.length; i += 1) {
-      const entry = rSlice[i];
-      const isSel = rStart + i === selectedIdx;
-      const icon = statusBadge(entry.state, style, spinnerFrame);
-      const age = entry.startedAt ? ` ${formatAge(entry.startedAt, entry.endedAt)}` : "";
-      const rawName = truncateAnsi(entry.name, Math.max(8, leftWidth - displayWidth(age) - 4), "…");
-      const rowText = isSel
-        ? style.selected(` ▸ ${rawName}${age} `)
-        : ` ${icon} ${style.text(rawName)}${style.muted(age)}`;
-      leftLines.push(padEndVisible(rowText, leftWidth));
+      const row = formatRosterRow(rSlice[i], rStart + i === selectedIdx, leftWidth, style, spinnerFrame, true);
+      leftLines.push(padEndVisible(row, leftWidth));
     }
 
-    const rightAll = buildRightContent(rightWidth);
-    const maxDetailScroll = Math.max(0, rightAll.length - contentHeight);
-    const scrollOffset = Math.max(0, Math.min(boardState.scrollOffset || 0, maxDetailScroll));
-    const rightSlice = rightAll.slice(scrollOffset, scrollOffset + contentHeight);
+    const { maxDetailScroll, slice: rightSlice } = sliceScrollableLines(
+      buildRightContent(rightWidth),
+      boardState.scrollOffset,
+      contentHeight,
+    );
 
     const rows = [truncateAnsi(topHeader, cols)];
     for (let y = 0; y < contentHeight; y += 1) {
@@ -1097,19 +971,19 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
   // Narrow terminal stacked layout
   const innerWidth = Math.max(20, cols - 2);
   const rosterCap = Math.min(4, entries.length);
-  const rStart = Math.max(0, Math.min(selectedIdx - 1, entries.length - rosterCap));
-  const rosterRows = entries.slice(rStart, rStart + rosterCap).map((entry, idx) => {
+  const { start: rStart, slice: narrowRoster } = sliceCenteredWindow(entries, selectedIdx, rosterCap, 1);
+  const rosterRows = narrowRoster.map((entry, idx) => {
     const isSel = rStart + idx === selectedIdx;
-    const icon = statusBadge(entry.state, style, spinnerFrame);
-    const label = truncateAnsi(entry.name, innerWidth - 6, "…");
-    return isSel ? ` ${style.selected(` ▸ ${label} `)}` : ` ${icon} ${style.text(label)}`;
+    const row = formatRosterRow(entry, isSel, innerWidth - 2, style, spinnerFrame, false);
+    return isSel ? ` ${row}` : row;
   });
 
   const detailHeight = Math.max(2, contentHeight - rosterRows.length - 1);
-  const detailAll = buildRightContent(innerWidth);
-  const maxDetailScroll = Math.max(0, detailAll.length - detailHeight);
-  const scrollOffset = Math.max(0, Math.min(boardState.scrollOffset || 0, maxDetailScroll));
-  const detailSlice = detailAll.slice(scrollOffset, scrollOffset + detailHeight);
+  const { maxDetailScroll, slice: detailSlice } = sliceScrollableLines(
+    buildRightContent(innerWidth),
+    boardState.scrollOffset,
+    detailHeight,
+  );
   while (detailSlice.length < detailHeight) detailSlice.push("");
 
   const rows = [

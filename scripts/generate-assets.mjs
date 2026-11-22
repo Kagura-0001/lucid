@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { LUCID_VERSION } from "../src/config.mjs";
 import { Composer } from "../src/ui/composer.mjs";
 import { renderDiffLines } from "../src/ui/diff.mjs";
 import { renderMarkdown } from "../src/ui/markdown.mjs";
-import { MultiAgentTracker, renderSwarmBoardView, renderSwarmStrip } from "../src/ui/swarm.mjs";
+import { MultiAgentTracker, renderSwarmBoardView, renderSwarmDock } from "../src/ui/swarm.mjs";
 import { createThemeStyler, listThemes } from "../src/ui/themes.mjs";
 import { renderComposerBlock, renderHeader, renderTimeline } from "../src/ui/views.mjs";
 
@@ -338,7 +339,7 @@ function generateHeroSvg() {
   <!-- Title & Tagline -->
   <text x="188" y="114" font-family="${SANS_FONT}" font-size="52" font-weight="800" letter-spacing="-1.2" fill="url(#wordmark-grad)">lucid</text>
   <rect x="318" y="84" width="66" height="24" rx="12" fill="#7dcfff" fill-opacity="0.12" stroke="#7dcfff" stroke-opacity="0.35" stroke-width="1" />
-  <text x="351" y="100" text-anchor="middle" font-family="${MONO_FONT}" font-size="12" font-weight="700" fill="#7dcfff">v0.2.1</text>
+  <text x="351" y="100" text-anchor="middle" font-family="${MONO_FONT}" font-size="12" font-weight="700" fill="#7dcfff">v${LUCID_VERSION}</text>
 
   <text x="188" y="150" font-family="${SANS_FONT}" font-size="18.5" font-weight="500" fill="#b7c3e3">Transparent, flicker-free terminal UI for Antigravity &amp; ACP coding agents</text>
   ${pillSvg}
@@ -847,10 +848,10 @@ function generateSwarmBoardSvg() {
     3,
   );
 
-  // The one-line status strip shown above the composer in the chat view.
-  const strip = renderSwarmStrip(tracker, cols, style, 3) || "";
+  // The compact folded dock shown below the composer in the chat view.
+  const dockRows = renderSwarmDock(tracker, cols, style, 3, { collapsed: true });
 
-  const allRows = [...headerLines, ...renderedBoard.rows, style.border("─".repeat(cols)), strip];
+  const allRows = [...headerLines, ...renderedBoard.rows, style.border("─".repeat(cols)), ...dockRows];
   const fontSize = 12.6;
   const charWidth = 7.56;
   const lineHeight = 19;

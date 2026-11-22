@@ -6,7 +6,7 @@
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a> · <a href="docs/reference.md">Reference</a> · <a href="docs/tips.md">SSH, tmux &amp; Swarm</a>
 </p>
 
-A transparent-background, zero-dependency TUI for **Google Antigravity (`agy acp`)** and other [ACP](https://agentclientprotocol.com/) coding agents. Pure Node.js (`>= 20`).
+A transparent-background, zero-dependency TUI for **Google Antigravity (`agy acp`)** and other [ACP](https://agentclientprotocol.com/) coding agents — listed in the official [ACP clients directory](https://agentclientprotocol.com/get-started/clients). Pure Node.js (`>= 20`).
 
 <p align="center">
   <img src="assets/preview-main.svg" alt="lucid preview" width="860" />

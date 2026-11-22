@@ -34,6 +34,12 @@ export class StdioJsonRpc extends EventEmitter {
     this.rl.on("close", () => {
       this.handleClose(new Error("ACP stdio stream closed"));
     });
+
+    if (stdin && typeof stdin.on === "function") {
+      stdin.on("error", (err) => {
+        this.handleClose(err);
+      });
+    }
   }
 
   onRequest(handler) {
@@ -109,6 +115,10 @@ export class StdioJsonRpc extends EventEmitter {
       msg = JSON.parse(line);
     } catch {
       this.emit("protocolWarning", `Non-JSON line on ACP stdout: ${line.slice(0, 120)}`);
+      return;
+    }
+
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
       return;
     }
 

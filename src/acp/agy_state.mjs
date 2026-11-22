@@ -30,20 +30,11 @@ export function resolveAgyDataDir(launchArgs = [], configuredDir = "") {
   return path.join(os.homedir(), ".gemini", dirName);
 }
 
-function safeStatMtime(filePath) {
+function safeStat(filePath) {
   try {
-    return fs.statSync(filePath).mtimeMs;
+    return fs.statSync(filePath);
   } catch {
-    return 0;
-  }
-}
-
-function safeStatBirth(filePath) {
-  try {
-    const stats = fs.statSync(filePath);
-    return stats.birthtimeMs || stats.ctimeMs || 0;
-  } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -172,14 +163,24 @@ function extractRecentSteps(steps) {
   return timeline.slice(-MAX_RECENT_STEPS);
 }
 
+function countTaskStatuses(items) {
+  let doneTasks = 0;
+  let blockedTasks = 0;
+  for (const item of items) {
+    const st = String(item?.status || item?.state || "").toLowerCase();
+    if (["done", "completed", "finished"].includes(st)) doneTasks += 1;
+    else if (["blocked", "failed", "error"].includes(st)) blockedTasks += 1;
+  }
+  return { totalTasks: items.length, doneTasks, blockedTasks };
+}
+
 export function summarizePlan(plan) {
   if (!plan || typeof plan !== "object") return null;
   const goalTitle = typeof plan.goal === "string" ? plan.goal : plan.goal?.title || "";
   const goalLine = typeof plan.goal === "object" ? plan.goal?.line || "" : "";
 
   const threads = [];
-  const rawThreads = Array.isArray(plan.threads) ? plan.threads : [];
-  for (const t of rawThreads) {
+  for (const t of Array.isArray(plan.threads) ? plan.threads : []) {
     if (!t || typeof t !== "object") continue;
     const name = t.title || t.name || t.label || t.id || "thread";
     const status = String(t.status || t.state || "working").toLowerCase();
@@ -187,37 +188,31 @@ export function summarizePlan(plan) {
     threads.push({ name: String(name), status, detail: String(detail) });
   }
 
-  let totalTasks = 0;
-  let doneTasks = 0;
-  let blockedTasks = 0;
+  let counts = { totalTasks: 0, doneTasks: 0, blockedTasks: 0 };
   if (Array.isArray(plan.tasks)) {
-    totalTasks = plan.tasks.length;
-    for (const task of plan.tasks) {
-      const st = String(task?.status || task?.state || "").toLowerCase();
-      if (["done", "completed", "finished"].includes(st)) doneTasks += 1;
-      else if (["blocked", "failed", "error"].includes(st)) blockedTasks += 1;
-    }
+    counts = countTaskStatuses(plan.tasks);
   } else if (plan.tasks && typeof plan.tasks === "object") {
-    const entries = Object.values(plan.tasks);
-    totalTasks = entries.length;
-    for (const entry of entries) {
-      if (entry && typeof entry === "object") {
-        const st = String(entry.status || entry.state || "").toLowerCase();
-        if (["done", "completed", "finished"].includes(st)) doneTasks += 1;
-        else if (["blocked", "failed", "error"].includes(st)) blockedTasks += 1;
-      }
-    }
+    const objEntries = Object.values(plan.tasks).filter((e) => e && typeof e === "object");
+    counts = { ...countTaskStatuses(objEntries), totalTasks: Object.keys(plan.tasks).length };
   }
-  if (totalTasks === 0 && threads.length > 0) {
-    totalTasks = threads.length;
-    for (const t of threads) {
-      if (["done", "completed", "finished"].includes(t.status)) doneTasks += 1;
-      else if (["blocked", "failed", "error"].includes(t.status)) blockedTasks += 1;
-    }
+  if (counts.totalTasks === 0 && threads.length > 0) {
+    counts = countTaskStatuses(threads);
   }
 
-  if (!goalTitle && totalTasks === 0 && threads.length === 0) return null;
-  return { goalTitle, goalLine, totalTasks, doneTasks, blockedTasks, threads };
+  if (!goalTitle && counts.totalTasks === 0 && threads.length === 0) return null;
+  return { goalTitle, goalLine, ...counts, threads };
+}
+
+function describePendingToolCall(call, lastText, lastAt, recentSteps) {
+  const isParked = /^(swarm_wait|wait|read_board)$/.test(call.name || "");
+  return {
+    activity: describeToolCall(call),
+    phase: isParked ? "waiting" : "working",
+    lastText,
+    lastAt,
+    recentSteps,
+    isParked,
+  };
 }
 
 /**
@@ -248,39 +243,28 @@ export function summarizeTranscriptTail(steps) {
     if (toolCalls.length === 0) {
       return { activity: "", phase: "idle", lastText, lastAt, recentSteps };
     }
-    const pending = toolCalls[toolCalls.length - 1];
-    const isParked = /^(swarm_wait|wait|read_board)$/.test(pending.name || "");
+    const { isParked, ...result } = describePendingToolCall(toolCalls[toolCalls.length - 1], lastText, lastAt, recentSteps);
     if (recentSteps.length > 0 && recentSteps[recentSteps.length - 1].kind === "tool") {
       recentSteps[recentSteps.length - 1].status = isParked ? "waiting" : "running";
     }
-    return {
-      activity: describeToolCall(pending),
-      phase: isParked ? "waiting" : "working",
-      lastText,
-      lastAt,
-      recentSteps,
-    };
+    return result;
   }
 
   if (last.status === "RUNNING") {
-    // A tool step is executing; name it from the planner step that requested it.
     for (let i = steps.length - 2; i >= 0; i -= 1) {
       const step = steps[i];
       if (step.type === "PLANNER_RESPONSE" && Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
-        const runningCall = step.tool_calls[step.tool_calls.length - 1];
-        const isParked = /^(swarm_wait|wait|read_board)$/.test(runningCall.name || "");
-        return {
-          activity: describeToolCall(runningCall),
-          phase: isParked ? "waiting" : "working",
+        const { isParked: _ignored, ...result } = describePendingToolCall(
+          step.tool_calls[step.tool_calls.length - 1],
           lastText,
           lastAt,
           recentSteps,
-        };
+        );
+        return result;
       }
     }
     return { activity: "running", phase: "working", lastText, lastAt, recentSteps };
   }
-  // A tool result, system message or user input arrived: the model is thinking.
   return { activity: "thinking", phase: "working", lastText, lastAt, recentSteps };
 }
 
@@ -309,7 +293,7 @@ export class AgyStateWatcher {
 
   /** Records a path's mtime; returns true when it changed since the last poll. */
   trackChange(key, filePath) {
-    const mtime = safeStatMtime(filePath);
+    const mtime = safeStat(filePath)?.mtimeMs || 0;
     const previous = this.fileMtimes.get(key);
     this.fileMtimes.set(key, mtime);
     return previous !== mtime;
@@ -317,13 +301,14 @@ export class AgyStateWatcher {
 
   readTranscriptSummary(conversationId) {
     const transcriptPath = path.join(this.systemDir(conversationId), "logs", "transcript.jsonl");
-    const mtime = safeStatMtime(transcriptPath);
+    const stats = safeStat(transcriptPath);
+    const mtime = stats?.mtimeMs || 0;
     const cached = this.transcriptCache.get(conversationId);
     if (cached && cached.mtime === mtime) {
       return { summary: cached.summary, changed: false };
     }
     const steps = mtime ? parseJsonLines(readFileTail(transcriptPath, TRANSCRIPT_TAIL_BYTES)) : [];
-    const startedAt = safeStatBirth(transcriptPath);
+    const startedAt = stats?.birthtimeMs || stats?.ctimeMs || 0;
     const summary = { ...summarizeTranscriptTail(steps), transcriptPath, updatedAt: mtime, startedAt };
     this.transcriptCache.set(conversationId, { mtime, summary });
     return { summary, changed: true };
@@ -409,9 +394,9 @@ export class AgyStateWatcher {
 
     // Swarm workers are also registered as subagents ("Swarm Worker (name)");
     // list them once, as swarm members.
-    const memberEntriesForFilter = members && members.members && typeof members.members === "object" ? members.members : {};
+    const memberEntries = members && members.members && typeof members.members === "object" ? members.members : {};
     const swarmConversationIds = new Set(
-      Object.values(memberEntriesForFilter)
+      Object.values(memberEntries)
         .map((member) => member && member.conversation_id)
         .filter(Boolean),
     );
@@ -442,34 +427,23 @@ export class AgyStateWatcher {
     });
 
     const workers = [];
-    const memberEntries = members && members.members && typeof members.members === "object" ? members.members : {};
     for (const [name, member] of Object.entries(memberEntries)) {
       if (!member || member.role === "coordinator") continue;
       if (member.conversation_id === this.sessionId) continue;
       const phase = String(member.phase || "").toUpperCase();
       const isKilled = member.killed || phase === "KILLED";
       let state;
-      let activity = "";
-      let lastText = "";
-      let updatedAt = 0;
-      let startedAt = 0;
-      let transcriptPath = "";
-      let recentSteps = [];
+      let summary = null;
       if (isKilled) {
         state = "killed";
       } else if (phase && phase !== "RUNNING") {
         state = phase.toLowerCase();
       } else if (member.conversation_id) {
-        const { summary, changed: transcriptChanged } = this.readTranscriptSummary(member.conversation_id);
-        if (transcriptChanged) changed = true;
+        const res = this.readTranscriptSummary(member.conversation_id);
+        summary = res.summary;
+        if (res.changed) changed = true;
         // A swarm worker whose turn ended is asleep on the board, i.e. waiting.
         state = summary.phase === "idle" ? "waiting" : summary.phase;
-        activity = summary.activity;
-        lastText = summary.lastText;
-        updatedAt = summary.updatedAt;
-        startedAt = summary.startedAt;
-        transcriptPath = summary.transcriptPath;
-        recentSteps = summary.recentSteps || [];
       } else {
         state = "working";
       }
@@ -481,13 +455,13 @@ export class AgyStateWatcher {
         model: member.model || member.applied_model || "",
         workspace: member.workspace_mode || "",
         state,
-        activity,
-        lastText,
+        activity: summary?.activity || "",
+        lastText: summary?.lastText || "",
         task: taskText,
-        updatedAt,
-        startedAt,
-        transcriptPath,
-        recentSteps,
+        updatedAt: summary?.updatedAt || 0,
+        startedAt: summary?.startedAt || 0,
+        transcriptPath: summary?.transcriptPath || "",
+        recentSteps: summary?.recentSteps || [],
       });
     }
 

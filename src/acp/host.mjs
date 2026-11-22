@@ -2,20 +2,19 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { AcpClient } from "./client.mjs";
-import { removeBgFiles, writeBgMeta } from "./bg_registry.mjs";
+import { ensureSecureBgDir, removeBgFiles, writeBgMeta } from "./bg_registry.mjs";
+import { autoApprovePermission } from "./permissions.mjs";
+import {
+  createLineSplitter,
+  extractChunkText,
+  findConfigOption,
+  mergeSessionMetadata,
+  parseJsonObjectLine,
+} from "./protocol.mjs";
 
 const MAX_EVENT_LOG = 6000;
 const EMPTY_DETACHED_GRACE_MS = 4000;
 const COMPLETED_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
-
-function extractChunkText(update) {
-  if (!update) return "";
-  if (typeof update.text === "string") return update.text;
-  const content = update.content;
-  if (typeof content === "string") return content;
-  if (content && typeof content.text === "string") return content.text;
-  return "";
-}
 
 function summarizeUpdateText(update) {
   if (!update || typeof update !== "object") return "";
@@ -55,7 +54,6 @@ export class SessionHost {
     this.acp = new AcpClient(this.launchSpec);
     this.server = null;
     this.activeSocket = null;
-    this.socketBuffer = "";
     this.shuttingDown = false;
 
     this.initResult = null;
@@ -171,49 +169,25 @@ export class SessionHost {
   }
 
   captureSessionMeta(payload) {
-    if (!payload || typeof payload !== "object") return;
-    if (payload.modes) {
-      this.sessionMeta.modes = payload.modes;
-      if (payload.modes.currentModeId) this.modeId = payload.modes.currentModeId;
-    }
-    if (payload.models) {
-      this.sessionMeta.models = payload.models;
-      if (payload.models.currentModelId) {
-        const found = (payload.models.availableModels || []).find((m) => m.modelId === payload.models.currentModelId);
-        this.modelLabel = found?.name || payload.models.currentModelId;
-      }
-    }
-    if (Array.isArray(payload.configOptions)) {
-      this.sessionMeta.configOptions = payload.configOptions;
-      const modelOpt = payload.configOptions.find((c) => c.category === "model" || c.id === "model");
-      if (modelOpt?.currentValue) {
-        const opt = (modelOpt.options || []).find((o) => o.value === modelOpt.currentValue);
-        this.modelLabel = opt?.name || modelOpt.currentValue;
-      }
-      const modeOpt = payload.configOptions.find((c) => c.category === "mode" || c.id === "mode");
-      if (modeOpt?.currentValue) {
-        this.modeId = modeOpt.currentValue;
-      }
-    }
-    if (Array.isArray(payload.availableCommands)) {
-      this.sessionMeta.availableCommands = payload.availableCommands;
-    }
+    const derived = mergeSessionMetadata(this.sessionMeta, payload);
+    if (derived.modeId) this.modeId = derived.modeId;
+    if (derived.modelLabel) this.modelLabel = derived.modelLabel;
   }
 
-  autoApprovePermission(req) {
-    const options = Array.isArray(req.params?.options) ? req.params.options : [];
-    const allowOption =
-      options.find((o) => o.kind === "allow_always") ||
-      options.find((o) => o.kind === "allow_once") ||
-      options.find((o) => /allow|approve|yes/i.test(`${o.optionId} ${o.name || ""}`));
-    if (!allowOption) return false;
-    req.selectOption(allowOption.optionId);
-    return true;
+  cancelAllPendingPermissions() {
+    for (const [, entry] of this.pendingPermissions) {
+      try {
+        entry.cancel();
+      } catch {
+        // Ignore
+      }
+    }
+    this.pendingPermissions.clear();
   }
 
   approveAllPendingPermissions() {
     for (const [permId, entry] of [...this.pendingPermissions]) {
-      if (this.autoApprovePermission(entry)) {
+      if (autoApprovePermission(entry)) {
         this.pendingPermissions.delete(permId);
       }
     }
@@ -243,7 +217,7 @@ export class SessionHost {
     process.once("SIGTERM", () => this.shutdown());
     process.once("SIGINT", () => this.shutdown());
 
-    fs.mkdirSync(path.dirname(this.socketPath), { recursive: true });
+    ensureSecureBgDir(path.dirname(this.socketPath));
     try {
       fs.unlinkSync(this.socketPath);
     } catch {
@@ -262,8 +236,8 @@ export class SessionHost {
           this.modeId = update.currentModeId || update.modeId || this.modeId;
         } else if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
           this.sessionMeta.availableCommands = update.availableCommands;
-        } else if (update.sessionUpdate === "config_option_update" && Array.isArray(update.configOptions)) {
-          this.captureSessionMeta({ configOptions: update.configOptions });
+        } else if (update.sessionUpdate === "config_option_update" && (Array.isArray(update.configOptions) || update.configOption)) {
+          this.captureSessionMeta(update);
         }
         const summary = summarizeUpdateText(update);
         if (summary) this.lastSummary = summary;
@@ -274,7 +248,7 @@ export class SessionHost {
     });
 
     this.acp.on("permissionRequest", (req) => {
-      if (this.bypassPermissions && this.autoApprovePermission(req)) {
+      if (this.bypassPermissions && autoApprovePermission(req)) {
         return;
       }
       const permId = `perm_${this.nextPermId++}`;
@@ -324,8 +298,7 @@ export class SessionHost {
       }
       if (this.initialModel) {
         try {
-          const hasConfigModel = Array.isArray(this.sessionMeta.configOptions) &&
-            this.sessionMeta.configOptions.some((c) => c.id === "model" || c.category === "model");
+          const hasConfigModel = Boolean(findConfigOption(this.sessionMeta.configOptions, "model"));
           const modelRes = await this.acp.setModel(this.sessionId, this.initialModel, hasConfigModel);
           this.captureSessionMeta(modelRes);
         } catch {
@@ -341,14 +314,16 @@ export class SessionHost {
       });
     } else {
       this.flushMetaNow();
+      this.scheduleIdleCheck();
     }
   }
 
   handleConnection(socket) {
-    if (this.activeSocket && !this.activeSocket.destroyed) {
+    const prevSocket = this.activeSocket;
+    if (prevSocket && !prevSocket.destroyed) {
       this.sendToClient({ type: "detached", reason: "taken over by another lucid client" });
       try {
-        this.activeSocket.end();
+        prevSocket.destroy();
       } catch {
         // Ignore
       }
@@ -360,21 +335,13 @@ export class SessionHost {
     }
 
     this.activeSocket = socket;
-    this.socketBuffer = "";
+    this.backgrounded = false;
     this.flushMetaNow();
 
+    const feed = createLineSplitter((line) => this.handleClientMessage(socket, line));
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
-      this.socketBuffer += chunk;
-      let nlIdx = this.socketBuffer.indexOf("\n");
-      while (nlIdx !== -1) {
-        const line = this.socketBuffer.slice(0, nlIdx).trim();
-        this.socketBuffer = this.socketBuffer.slice(nlIdx + 1);
-        if (line) {
-          this.handleClientMessage(socket, line);
-        }
-        nlIdx = this.socketBuffer.indexOf("\n");
-      }
+      if (this.activeSocket === socket) feed(chunk);
     });
 
     socket.on("close", () => {
@@ -404,174 +371,156 @@ export class SessionHost {
   }
 
   async handleClientMessage(socket, line) {
-    let msg;
-    try {
-      msg = JSON.parse(line);
-    } catch {
+    const msg = parseJsonObjectLine(line);
+    if (!msg) return;
+    const { id, op } = msg;
+    if (typeof op !== "string") {
+      if (id !== undefined) {
+        this.reply(socket, id, null, "Invalid host op");
+      }
       return;
     }
-    const { id, op } = msg;
 
     try {
-      if (op === "attach") {
-        this.reply(socket, id, {
-          hostId: this.hostId,
-          initResult: this.initResult,
-          agentInfo: this.acp.agentInfo,
-          agentCapabilities: this.acp.agentCapabilities,
-          authMethods: this.acp.authMethods,
-          sessionId: this.sessionId,
-          sessionMeta: this.sessionMeta,
-          sessionTitle: this.sessionTitle,
-          modelLabel: this.modelLabel,
-          modeId: this.modeId,
-          usage: this.usage,
-          busy: this.busy,
-          activePromptCount: this.activePromptCount,
-          turnStartedAt: this.turnStartedAt,
-          bypassPermissions: this.bypassPermissions,
-          eventLog: this.eventLog,
-          pendingPermissions: [...this.pendingPermissions.values()].map((p) => ({
-            permId: p.permId,
-            params: p.params,
-          })),
-        });
-        return;
-      }
-
-      if (op === "detach") {
-        this.backgrounded = true;
-        this.flushMetaNow();
-        this.reply(socket, id, { hostId: this.hostId, sessionId: this.sessionId, status: this.computeStatus() });
-        socket.end();
-        return;
-      }
-
-      if (op === "shutdown") {
-        this.reply(socket, id, { ok: true });
-        await this.shutdown();
-        return;
-      }
-
-      if (op === "setBypass") {
-        this.bypassPermissions = Boolean(msg.enabled);
-        if (this.bypassPermissions) {
-          this.approveAllPendingPermissions();
-        } else {
+      switch (op) {
+        case "attach":
+          this.reply(socket, id, {
+            hostId: this.hostId,
+            initResult: this.initResult,
+            agentInfo: this.acp.agentInfo,
+            agentCapabilities: this.acp.agentCapabilities,
+            authMethods: this.acp.authMethods,
+            sessionId: this.sessionId,
+            sessionMeta: this.sessionMeta,
+            sessionTitle: this.sessionTitle,
+            modelLabel: this.modelLabel,
+            modeId: this.modeId,
+            usage: this.usage,
+            busy: this.busy,
+            activePromptCount: this.activePromptCount,
+            turnStartedAt: this.turnStartedAt,
+            bypassPermissions: this.bypassPermissions,
+            eventLog: this.eventLog,
+            pendingPermissions: [...this.pendingPermissions.values()].map((p) => ({
+              permId: p.permId,
+              params: p.params,
+            })),
+          });
+          return;
+        case "detach":
+          this.backgrounded = true;
           this.flushMetaNow();
-        }
-        this.reply(socket, id, { ok: true });
-        return;
-      }
-
-      if (op === "permissionResponse") {
-        const entry = this.pendingPermissions.get(msg.permId);
-        if (entry) {
-          this.pendingPermissions.delete(msg.permId);
-          if (msg.cancelled) {
-            entry.cancel();
-          } else {
-            entry.selectOption(msg.optionId);
+          this.reply(socket, id, { hostId: this.hostId, sessionId: this.sessionId, status: this.computeStatus() });
+          socket.end();
+          return;
+        case "shutdown":
+          this.reply(socket, id, { ok: true });
+          await this.shutdown();
+          return;
+        case "setBypass":
+          this.bypassPermissions = Boolean(msg.enabled);
+          if (this.bypassPermissions) this.approveAllPendingPermissions();
+          else this.flushMetaNow();
+          this.reply(socket, id, { ok: true });
+          return;
+        case "permissionResponse": {
+          const entry = this.pendingPermissions.get(msg.permId);
+          if (entry) {
+            this.pendingPermissions.delete(msg.permId);
+            if (msg.cancelled) entry.cancel();
+            else entry.selectOption(msg.optionId);
+            this.flushMetaNow();
           }
+          this.reply(socket, id, { ok: true });
+          return;
+        }
+        case "listSessions":
+          this.reply(socket, id, await this.acp.listSessions(msg.cwd || this.cwd));
+          return;
+        case "createSession": {
+          this.eventLog = [];
+          this.sessionMeta = {};
+          this.cancelAllPendingPermissions();
+          this.usage = null;
+          this.sessionTitle = "";
+          this.everSentPrompt = false;
+          const created = await this.acp.createSession(msg.cwd || this.cwd, msg.additionalDirectories || []);
+          this.sessionId = created.sessionId;
+          this.captureSessionMeta(created);
           this.flushMetaNow();
+          this.reply(socket, id, created);
+          return;
         }
-        this.reply(socket, id, { ok: true });
-        return;
+        case "loadSession":
+        case "resumeSession":
+          this.reply(socket, id, await this.openExistingSession(op, msg.sessionId, msg.cwd || this.cwd));
+          return;
+        case "closeSession":
+          if (this.sessionId === msg.sessionId) this.cancelAllPendingPermissions();
+          await this.acp.closeSession(msg.sessionId);
+          if (this.sessionId === msg.sessionId) this.sessionId = "";
+          this.reply(socket, id, { ok: true });
+          return;
+        case "setMode":
+          this.applyMetaAndReply(socket, id, await this.acp.setMode(msg.sessionId, msg.modeId), msg.modeId);
+          return;
+        case "setConfigOption":
+          this.applyMetaAndReply(
+            socket,
+            id,
+            await this.acp.setConfigOption(msg.sessionId, msg.configId, msg.value),
+          );
+          return;
+        case "setModel":
+          this.applyMetaAndReply(
+            socket,
+            id,
+            await this.acp.setModel(msg.sessionId, msg.modelValue, msg.preferConfigOption),
+          );
+          return;
+        case "cancelTurn":
+          this.acp.cancelTurn(msg.sessionId);
+          this.reply(socket, id, { ok: true });
+          return;
+        case "sendPrompt":
+          // Acknowledge immediately so a client that detaches right after sending
+          // does not abort the prompt; completion is delivered via `promptDone`.
+          this.reply(socket, id, { accepted: true });
+          this.runHostedPrompt(msg.sessionId, msg.blocks, msg.meta || {});
+          return;
+        default:
+          this.reply(socket, id, null, `Unknown host op: ${op}`);
       }
-
-      if (op === "listSessions") {
-        const sessions = await this.acp.listSessions(msg.cwd || this.cwd);
-        this.reply(socket, id, sessions);
-        return;
-      }
-
-      if (op === "createSession") {
-        this.eventLog = [];
-        this.pendingPermissions.clear();
-        this.usage = null;
-        this.sessionTitle = "";
-        this.everSentPrompt = false;
-        const created = await this.acp.createSession(msg.cwd || this.cwd, msg.additionalDirectories || []);
-        this.sessionId = created.sessionId;
-        this.captureSessionMeta(created);
-        this.flushMetaNow();
-        this.reply(socket, id, created);
-        return;
-      }
-
-      if (op === "loadSession") {
-        this.eventLog = [];
-        this.pendingPermissions.clear();
-        this.sessionId = msg.sessionId;
-        const res = await this.acp.loadSession(msg.sessionId, msg.cwd || this.cwd);
-        this.captureSessionMeta(res);
-        this.flushMetaNow();
-        this.reply(socket, id, res);
-        return;
-      }
-
-      if (op === "resumeSession") {
-        this.eventLog = [];
-        this.pendingPermissions.clear();
-        this.sessionId = msg.sessionId;
-        const res = await this.acp.resumeSession(msg.sessionId, msg.cwd || this.cwd);
-        this.captureSessionMeta(res);
-        this.flushMetaNow();
-        this.reply(socket, id, res);
-        return;
-      }
-
-      if (op === "closeSession") {
-        await this.acp.closeSession(msg.sessionId);
-        if (this.sessionId === msg.sessionId) {
-          this.sessionId = "";
-        }
-        this.reply(socket, id, { ok: true });
-        return;
-      }
-
-      if (op === "setMode") {
-        const res = await this.acp.setMode(msg.sessionId, msg.modeId);
-        this.captureSessionMeta(res);
-        this.modeId = msg.modeId;
-        this.flushMetaNow();
-        this.reply(socket, id, res);
-        return;
-      }
-
-      if (op === "setConfigOption") {
-        const res = await this.acp.setConfigOption(msg.sessionId, msg.configId, msg.value);
-        this.captureSessionMeta(res);
-        this.flushMetaNow();
-        this.reply(socket, id, res);
-        return;
-      }
-
-      if (op === "setModel") {
-        const res = await this.acp.setModel(msg.sessionId, msg.modelValue, msg.preferConfigOption);
-        this.captureSessionMeta(res);
-        this.flushMetaNow();
-        this.reply(socket, id, res);
-        return;
-      }
-
-      if (op === "cancelTurn") {
-        this.acp.cancelTurn(msg.sessionId);
-        this.reply(socket, id, { ok: true });
-        return;
-      }
-
-      if (op === "sendPrompt") {
-        // Acknowledge immediately so a client that detaches right after sending
-        // does not abort the prompt; completion is delivered via `promptDone`.
-        this.reply(socket, id, { accepted: true });
-        this.runHostedPrompt(msg.sessionId, msg.blocks, msg.meta || {});
-        return;
-      }
-
-      this.reply(socket, id, null, `Unknown host op: ${op}`);
     } catch (err) {
       this.reply(socket, id, null, err?.message || String(err));
+    }
+  }
+
+  applyMetaAndReply(socket, id, res, modeOverride = "") {
+    this.captureSessionMeta(res);
+    if (modeOverride) this.modeId = modeOverride;
+    this.flushMetaNow();
+    this.reply(socket, id, res);
+  }
+
+  async openExistingSession(method, sessionId, cwd) {
+    const prevSessionId = this.sessionId;
+    const prevEventLog = this.eventLog;
+    const prevMeta = this.sessionMeta;
+    this.eventLog = [];
+    this.sessionMeta = {};
+    this.sessionId = sessionId;
+    try {
+      const res = await this.acp[method](sessionId, cwd);
+      this.cancelAllPendingPermissions();
+      this.captureSessionMeta(res);
+      this.flushMetaNow();
+      return res;
+    } catch (err) {
+      this.sessionId = prevSessionId;
+      this.eventLog = prevEventLog;
+      this.sessionMeta = prevMeta;
+      throw err;
     }
   }
 
@@ -628,7 +577,7 @@ export class SessionHost {
     }
   }
 
-  async shutdown() {
+  async shutdown(exitCode = 0) {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
 
@@ -641,14 +590,7 @@ export class SessionHost {
       this.metaDirtyTimer = null;
     }
 
-    for (const [, entry] of this.pendingPermissions) {
-      try {
-        entry.cancel();
-      } catch {
-        // Ignore
-      }
-    }
-    this.pendingPermissions.clear();
+    this.cancelAllPendingPermissions();
 
     if (this.activeSocket && !this.activeSocket.destroyed) {
       try {
@@ -675,11 +617,16 @@ export class SessionHost {
     }
 
     removeBgFiles(this.hostId, this.socketPath, this.bgDir);
-    process.exit(0);
+    process.exit(exitCode);
   }
 }
 
 export async function runSessionHostFromFile(specFilePath) {
+  try {
+    process.umask(0o077);
+  } catch {
+    // Ignore on unsupported platforms
+  }
   const raw = fs.readFileSync(specFilePath, "utf8");
   try {
     fs.unlinkSync(specFilePath);
@@ -688,5 +635,15 @@ export async function runSessionHostFromFile(specFilePath) {
   }
   const spec = JSON.parse(raw);
   const host = new SessionHost(spec);
-  await host.start();
+  process.on("uncaughtException", () => {
+    host.shutdown(1);
+  });
+  process.on("unhandledRejection", () => {
+    host.shutdown(1);
+  });
+  try {
+    await host.start();
+  } catch {
+    await host.shutdown(1);
+  }
 }

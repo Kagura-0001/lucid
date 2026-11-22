@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { AgyStateWatcher, resolveAgyDataDir, summarizeTranscriptTail } from "../src/acp/agy_state.mjs";
 import { stripAnsi } from "../src/term/unicode.mjs";
-import { MultiAgentTracker, renderSwarmBoardView, renderSwarmStrip } from "../src/ui/swarm.mjs";
+import { MultiAgentTracker, renderSwarmBoardView, renderSwarmDock } from "../src/ui/swarm.mjs";
 import { createThemeStyler } from "../src/ui/themes.mjs";
 
 const SESSION = "11111111-aaaa-bbbb-cccc-000000000001";
@@ -152,12 +152,13 @@ test("AgyStateWatcher reads live swarm + subagent state and the strip names memb
     assert.deepEqual(tracker.boardMessages.map((message) => message.from), ["coordinator", "parser", "Tmp Lister"]);
 
     const style = createThemeStyler("tokyo-night", "truecolor");
-    const strip = stripAnsi(renderSwarmStrip(tracker, 140, style, 0));
-    assert.ok(strip.includes('Swarm "parser rewrite"'), strip);
-    assert.ok(strip.includes("parser run_command cargo test"), strip);
-    assert.ok(strip.includes("verifier"), strip);
-    assert.ok(strip.includes("Tmp Lister"), strip);
-    assert.equal(strip.includes("docs"), false, "killed workers are left off the strip");
+    const dock = renderSwarmDock(tracker, 140, style, 0).map(stripAnsi).join("\n");
+    assert.ok(dock.includes('Swarm "parser rewrite"'), dock);
+    assert.ok(dock.includes("parser"), dock);
+    assert.ok(dock.includes("run_command cargo test"), dock);
+    assert.ok(dock.includes("verifier"), dock);
+    assert.ok(dock.includes("Tmp Lister"), dock);
+    assert.equal(dock.includes("docs"), false, "killed workers are left off the dock");
 
     const board = renderSwarmBoardView(tracker, { selectedIdx: 1, tab: "detail", scrollOffset: 0 }, 120, 20, style, 0);
     const boardText = board.rows.map(stripAnsi).join("\n");

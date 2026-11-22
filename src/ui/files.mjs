@@ -31,9 +31,7 @@ const IMAGE_MIME_BY_EXT = {
 };
 
 export function isImageFilePath(filePath) {
-  if (!filePath) return false;
-  const ext = path.extname(filePath).toLowerCase();
-  return Boolean(IMAGE_MIME_BY_EXT[ext]);
+  return Boolean(getImageMimeType(filePath));
 }
 
 export function getImageMimeType(filePath) {
@@ -303,6 +301,19 @@ function guessMimeType(filePath) {
   return map[ext] || "text/plain";
 }
 
+function isPathWithinDir(targetPath, baseDir) {
+  try {
+    const resolvedBase = fs.realpathSync(path.resolve(baseDir || process.cwd()));
+    const resolvedTarget = fs.existsSync(targetPath)
+      ? fs.realpathSync(targetPath)
+      : path.resolve(targetPath);
+    const basePrefix = resolvedBase.endsWith(path.sep) ? resolvedBase : `${resolvedBase}${path.sep}`;
+    return resolvedTarget === resolvedBase || resolvedTarget.startsWith(basePrefix);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Builds ACP `session/prompt` content blocks from user text plus staged images.
  */
@@ -311,6 +322,7 @@ export function buildPromptBlocks(text, cwd, options = {}) {
     supportsEmbeddedContext = true,
     supportsImage = true,
     stagedImages = [],
+    mentionSourceText = text,
   } = options;
 
   const blocks = [];
@@ -321,19 +333,19 @@ export function buildPromptBlocks(text, cwd, options = {}) {
     blocks.push({ type: "text", text });
   }
 
+  const appendImageBlock = (img, labelOverride) => {
+    if (!img || !img.data || !img.mimeType) return;
+    blocks.push({ type: "image", mimeType: img.mimeType, data: img.data });
+    attachedImages.push({
+      label: labelOverride || img.label,
+      sizeBytes: img.sizeBytes,
+      mimeType: img.mimeType,
+    });
+  };
+
   if (supportsImage && Array.isArray(stagedImages)) {
     for (const img of stagedImages) {
-      if (!img || !img.data || !img.mimeType) continue;
-      blocks.push({
-        type: "image",
-        mimeType: img.mimeType,
-        data: img.data,
-      });
-      attachedImages.push({
-        label: img.label,
-        sizeBytes: img.sizeBytes,
-        mimeType: img.mimeType,
-      });
+      appendImageBlock(img);
     }
   }
 
@@ -341,7 +353,7 @@ export function buildPromptBlocks(text, cwd, options = {}) {
   const seen = new Set();
   let match;
 
-  while ((match = mentionRegex.exec(text || "")) !== null) {
+  while ((match = mentionRegex.exec(mentionSourceText || "")) !== null) {
     const rawMention = match[1].replace(/[),.;:!?]+$/, "");
     if (!rawMention || seen.has(rawMention)) continue;
     seen.add(rawMention);
@@ -349,21 +361,12 @@ export function buildPromptBlocks(text, cwd, options = {}) {
     const normalized = normalizeDroppedPath(rawMention);
     if (!normalized) continue;
     const absPath = path.resolve(cwd, normalized);
+    if (!isPathWithinDir(absPath, cwd)) continue;
 
     if (isImageFilePath(absPath)) {
       if (!supportsImage) continue;
       try {
-        const img = loadImageAttachment(absPath, cwd);
-        blocks.push({
-          type: "image",
-          mimeType: img.mimeType,
-          data: img.data,
-        });
-        attachedImages.push({
-          label: rawMention,
-          sizeBytes: img.sizeBytes,
-          mimeType: img.mimeType,
-        });
+        appendImageBlock(loadImageAttachment(absPath, cwd), rawMention);
       } catch {
         // Ignore unreadable or oversized image mention
       }

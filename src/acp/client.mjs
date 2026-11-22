@@ -1,6 +1,12 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { LUCID_VERSION } from "../config.mjs";
 import { StdioJsonRpc } from "./jsonrpc.mjs";
+import {
+  supportsSessionList as capsSupportList,
+  supportsSessionLoad as capsSupportLoad,
+  supportsSessionResume as capsSupportResume,
+} from "./protocol.mjs";
 
 export class AcpClient extends EventEmitter {
   constructor(launchSpec) {
@@ -44,7 +50,14 @@ export class AcpClient extends EventEmitter {
     });
 
     this.child.on("exit", (code, signal) => {
-      this.emit("exit", { code, signal, stderrTail: [...this.stderrTail] });
+      const tailCopy = [...this.stderrTail];
+      this.emit("exit", { code, signal, stderrTail: tailCopy });
+      if (!this.stopping && this.rpc && !this.rpc.closed) {
+        const tailMsg = tailCopy.slice(-3).join(" | ");
+        const suffix = tailMsg ? `: ${tailMsg}` : "";
+        const err = new Error(`ACP agent exited (code=${code ?? "null"}, signal=${signal ?? "none"})${suffix}`);
+        this.rpc.handleClose(err);
+      }
     });
 
     this.rpc = new StdioJsonRpc(this.child.stdin, this.child.stdout);
@@ -77,21 +90,27 @@ export class AcpClient extends EventEmitter {
       throw err;
     });
 
-    const initResult = await Promise.race([
-      this.rpc.request(
-        "initialize",
-        {
-          protocolVersion: 1,
-          clientCapabilities: {},
-          clientInfo: {
-            name: "lucid",
-            version: "0.2.1",
+    let initResult;
+    try {
+      initResult = await Promise.race([
+        this.rpc.request(
+          "initialize",
+          {
+            protocolVersion: 1,
+            clientCapabilities: {},
+            clientInfo: {
+              name: "lucid",
+              version: LUCID_VERSION,
+            },
           },
-        },
-        15000,
-      ),
-      spawnErrorPromise,
-    ]);
+          15000,
+        ),
+        spawnErrorPromise,
+      ]);
+    } catch (err) {
+      await this.stop().catch(() => {});
+      throw err;
+    }
 
     this.agentInfo = initResult?.agentInfo || { name: this.launchSpec.name, version: "" };
     this.agentCapabilities = initResult?.agentCapabilities || {};
@@ -131,18 +150,15 @@ export class AcpClient extends EventEmitter {
   }
 
   supportsSessionList() {
-    const caps = this.agentCapabilities.sessionCapabilities || this.agentCapabilities.session_capabilities || {};
-    return Boolean(caps.list);
+    return capsSupportList(this.agentCapabilities);
   }
 
   supportsSessionLoad() {
-    const caps = this.agentCapabilities.sessionCapabilities || this.agentCapabilities.session_capabilities || {};
-    return Boolean(this.agentCapabilities.loadSession || this.agentCapabilities.load_session || caps.load);
+    return capsSupportLoad(this.agentCapabilities);
   }
 
   supportsSessionResume() {
-    const caps = this.agentCapabilities.sessionCapabilities || this.agentCapabilities.session_capabilities || {};
-    return Boolean(caps.resume);
+    return capsSupportResume(this.agentCapabilities);
   }
 
   async listSessions(cwd) {
@@ -341,6 +357,34 @@ function formatResetEta(resetTimeIso, description = "") {
   return match ? `resets in ${match[1].trim()}` : "";
 }
 
+function selectQuotaBadge(records, fallbackLine = "") {
+  let gemini5h = "";
+  let geminiWk = "";
+  let claude5h = "";
+  let claudeWk = "";
+
+  for (const { group, windowText, pct } of records) {
+    const gLower = String(group || "").toLowerCase();
+    const wLower = String(windowText || "").toLowerCase();
+    const is5h = wLower.includes("5h") || wLower.includes("five hour") || /\b5\b/.test(wLower) || wLower.includes("five");
+    const isWk = wLower.includes("week");
+    if (gLower.includes("gemini")) {
+      if (is5h) gemini5h = pct;
+      if (isWk) geminiWk = pct;
+    } else if (gLower.includes("claude") || gLower.includes("gpt")) {
+      if (is5h) claude5h = pct;
+      if (isWk) claudeWk = pct;
+    }
+  }
+
+  const parts = [];
+  if (gemini5h) parts.push(`5h ${gemini5h}`);
+  if (geminiWk) parts.push(`wk ${geminiWk}`);
+  if (parts.length === 0 && claude5h) parts.push(`5h ${claude5h}`);
+  if (parts.length === 0 && claudeWk) parts.push(`wk ${claudeWk}`);
+  return parts.join(" · ") || String(fallbackLine || "").slice(0, 40);
+}
+
 export function parseQuotaPayload(payload) {
   if (!payload || typeof payload !== "object") return null;
 
@@ -348,15 +392,11 @@ export function parseQuotaPayload(payload) {
   // { status: "SUCCESS", command: { name: "usage", data: { groups: [{ name, buckets: [...] }] } } }
   const groups = payload.command?.data?.groups;
   if (Array.isArray(groups) && groups.length > 0) {
-    let gemini5h = "";
-    let geminiWk = "";
-    let claude5h = "";
-    let claudeWk = "";
+    const records = [];
     const detailLines = [];
 
     for (const group of groups) {
       const groupName = String(group?.name || "Models");
-      const gLower = groupName.toLowerCase();
       const buckets = Array.isArray(group?.buckets) ? group.buckets : [];
       // Show 5h before weekly within each group for readability.
       const ordered = [...buckets].sort((a, b) => (a.window === "5h" ? -1 : b.window === "5h" ? 1 : 0));
@@ -369,26 +409,13 @@ export function parseQuotaPayload(payload) {
         const eta = formatResetEta(bucket.reset_time, bucket.description);
         const etaSuffix = eta ? `  (${eta})` : "";
         detailLines.push(`${groupName} · ${win.padEnd(6)} ${bar} ${pct.padStart(4)}${etaSuffix}`);
-
-        const wLower = win.toLowerCase();
-        if (gLower.includes("gemini")) {
-          if (wLower.includes("5h") || wLower.includes("five")) gemini5h = pct;
-          if (wLower.includes("week")) geminiWk = pct;
-        } else if (gLower.includes("claude") || gLower.includes("gpt")) {
-          if (wLower.includes("5h") || wLower.includes("five")) claude5h = pct;
-          if (wLower.includes("week")) claudeWk = pct;
-        }
+        records.push({ group: groupName, windowText: win, pct });
       }
     }
 
     if (detailLines.length > 0) {
-      const badgeParts = [];
-      if (gemini5h) badgeParts.push(`5h ${gemini5h}`);
-      if (geminiWk) badgeParts.push(`wk ${geminiWk}`);
-      if (badgeParts.length === 0 && claude5h) badgeParts.push(`5h ${claude5h}`);
-      if (badgeParts.length === 0 && claudeWk) badgeParts.push(`wk ${claudeWk}`);
       return {
-        badge: badgeParts.join(" · ") || detailLines[0].slice(0, 40),
+        badge: selectQuotaBadge(records, detailLines[0]),
         lines: detailLines,
       };
     }
@@ -399,39 +426,21 @@ export function parseQuotaPayload(payload) {
   if (typeof payload.response === "string" && payload.response.trim()) {
     const rawLines = payload.response.trim().split(/\r?\n/).filter(Boolean);
     const parsedRows = rawLines.map((line) => line.split("\t").map((s) => s.trim()));
-
-    let gemini5h = "";
-    let geminiWk = "";
-    let claude5h = "";
-    let claudeWk = "";
+    const records = [];
     const detailLines = [];
 
     for (const cols of parsedRows) {
       if (cols.length >= 3) {
         const [group, metric, pct] = cols;
         detailLines.push(`${group} · ${metric}: ${pct}`);
-        const gLower = group.toLowerCase();
-        const mLower = metric.toLowerCase();
-        if (gLower.includes("gemini")) {
-          if (mLower.includes("five hour") || mLower.includes("5")) gemini5h = pct;
-          if (mLower.includes("weekly")) geminiWk = pct;
-        } else if (gLower.includes("claude") || gLower.includes("gpt")) {
-          if (mLower.includes("five hour") || mLower.includes("5")) claude5h = pct;
-          if (mLower.includes("weekly")) claudeWk = pct;
-        }
+        records.push({ group, windowText: metric, pct });
       } else {
         detailLines.push(cols.join(" "));
       }
     }
 
-    const badgeParts = [];
-    if (gemini5h) badgeParts.push(`5h ${gemini5h}`);
-    if (geminiWk) badgeParts.push(`wk ${geminiWk}`);
-    if (badgeParts.length === 0 && claude5h) badgeParts.push(`5h ${claude5h}`);
-    if (badgeParts.length === 0 && claudeWk) badgeParts.push(`wk ${claudeWk}`);
-
     return {
-      badge: badgeParts.join(" · ") || detailLines[0]?.slice(0, 40) || "",
+      badge: selectQuotaBadge(records, detailLines[0]),
       lines: detailLines,
     };
   }

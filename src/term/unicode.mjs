@@ -13,8 +13,37 @@ const OSC8_PREFIX = "\x1b]8;";
 // C0 controls (incl. ESC, TAB, LF, CR), DEL and C1 controls.
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f]/;
 const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f]/g;
+const BIDI_CONTROL_RE = /[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
+const UNSAFE_TEXT_CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
 const LINE_BREAK_MARKER = " ⏎ ";
 const TAB_REPLACEMENT = "    ";
+
+/**
+ * Strips ANSI/escape sequences, bidi direction overrides, and dangerous C0/C1
+ * control characters from untrusted agent/tool text while preserving \n, \r, \t.
+ */
+export function sanitizeUntrustedText(text) {
+  if (text === undefined || text === null) return "";
+  return stripAnsi(String(text))
+    .replace(BIDI_CONTROL_RE, "")
+    .replace(UNSAFE_TEXT_CONTROL_RE, "");
+}
+
+/**
+ * Sanitizes a terminal window/tab title for OSC 0 output: removes all ANSI
+ * sequences, control characters, and bidi controls, collapses whitespace, and
+ * caps length.
+ */
+export function sanitizeTerminalTitle(text, maxLen = 80) {
+  if (!text) return "";
+  const cleaned = stripAnsi(String(text))
+    .replace(BIDI_CONTROL_RE, "")
+    .replace(CONTROL_CHAR_GLOBAL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return "";
+  return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 1)}…` : cleaned;
+}
 
 // Intl.Segmenter iteration is quadratic on long strings in Node 20
 // (30k chars ≈ 280 ms). Long non-ASCII runs are therefore segmented in
@@ -346,6 +375,29 @@ export function displayWidth(text) {
   return width;
 }
 
+function forEachAnsiToken(text, onAnsi, onGrapheme) {
+  let index = 0;
+  while (index < text.length) {
+    if (text[index] === "\x1b") {
+      const sequence = matchAnsiAt(text, index);
+      if (sequence) {
+        onAnsi(sequence);
+        index += sequence.length;
+        continue;
+      }
+    }
+    const nextEsc = text.indexOf("\x1b", index + 1);
+    const chunk = nextEsc === -1 ? text.slice(index) : text.slice(index, nextEsc);
+    index = nextEsc === -1 ? text.length : nextEsc;
+    for (const grapheme of splitGraphemes(chunk)) {
+      if (onGrapheme(grapheme) === false) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 export function truncateAnsi(text, maxWidth, ellipsis = "") {
   if (!text || maxWidth <= 0) return "";
   if (displayWidth(text) <= maxWidth) return text;
@@ -356,35 +408,22 @@ export function truncateAnsi(text, maxWidth, ellipsis = "") {
   let output = "";
   let visible = 0;
   let hasAnsi = false;
-  let index = 0;
-
-  while (index < text.length) {
-    if (text[index] === "\x1b") {
-      const sequence = matchAnsiAt(text, index);
-      if (sequence) {
-        output += sequence;
-        hasAnsi = true;
-        index += sequence.length;
-        continue;
-      }
-    }
-
-    const nextEsc = text.indexOf("\x1b", index + 1);
-    const chunk = nextEsc === -1 ? text.slice(index) : text.slice(index, nextEsc);
-    index = nextEsc === -1 ? text.length : nextEsc;
-
-    for (const grapheme of splitGraphemes(chunk)) {
+  const completed = forEachAnsiToken(
+    text,
+    (sequence) => {
+      output += sequence;
+      hasAnsi = true;
+    },
+    (grapheme) => {
       const w = graphemeWidth(grapheme);
-      if (visible + w > targetWidth) {
-        const suffix = ellipsis || "";
-        return hasAnsi ? `${output}${suffix}\x1b[0m` : `${output}${suffix}`;
-      }
+      if (visible + w > targetWidth) return false;
       output += grapheme;
       visible += w;
-    }
-  }
+    },
+  );
 
-  return hasAnsi ? `${output}\x1b[0m` : output;
+  const suffix = completed ? "" : ellipsis || "";
+  return hasAnsi ? `${output}${suffix}\x1b[0m` : `${output}${suffix}`;
 }
 
 export function padEndVisible(text, targetWidth, fillChar = " ") {
@@ -393,14 +432,6 @@ export function padEndVisible(text, targetWidth, fillChar = " ") {
     return truncateAnsi(text, targetWidth);
   }
   return text + fillChar.repeat(targetWidth - current);
-}
-
-export function padStartVisible(text, targetWidth, fillChar = " ") {
-  const current = displayWidth(text);
-  if (current >= targetWidth) {
-    return truncateAnsi(text, targetWidth);
-  }
-  return fillChar.repeat(targetWidth - current) + text;
 }
 
 const ASCII_WORD_CHAR_RE = /^[\x21-\x7e]$/;
@@ -419,28 +450,12 @@ export function wrapAnsiLine(line, maxWidth) {
   if (!line) return [""];
   if (displayWidth(line) <= widthLimit) return [line];
 
-  // Tokenize into ANSI sequences and plain graphemes
   const tokens = [];
-  let index = 0;
-  while (index < line.length) {
-    if (line[index] === "\x1b") {
-      const sequence = matchAnsiAt(line, index);
-      if (sequence) {
-        tokens.push({ ansi: sequence });
-        index += sequence.length;
-        continue;
-      }
-    }
-    const nextEsc = line.indexOf("\x1b", index + 1);
-    const chunk = nextEsc === -1 ? line.slice(index) : line.slice(index, nextEsc);
-    index = nextEsc === -1 ? line.length : nextEsc;
-    for (const grapheme of splitGraphemes(chunk)) {
-      tokens.push({
-        text: grapheme,
-        width: graphemeWidth(grapheme),
-      });
-    }
-  }
+  forEachAnsiToken(
+    line,
+    (sequence) => tokens.push({ ansi: sequence }),
+    (grapheme) => tokens.push({ text: grapheme, width: graphemeWidth(grapheme) }),
+  );
 
   const lines = [];
   let activeSgr = "";
@@ -604,27 +619,15 @@ export function highlightVisibleColumns(text, fromCol, toCol) {
   let output = "";
   let column = 0;
   let inverseActive = false;
-  let index = 0;
-
-  while (index < row.length) {
-    if (row[index] === "\x1b") {
-      const sequence = matchAnsiAt(row, index);
-      if (sequence) {
-        output += sequence;
-        index += sequence.length;
-        const isSgr = SGR_SEQUENCE_RE.test(sequence);
-        if (inverseActive && isSgr) {
-          output += INVERSE_ON;
-        }
-        continue;
+  forEachAnsiToken(
+    row,
+    (sequence) => {
+      output += sequence;
+      if (inverseActive && SGR_SEQUENCE_RE.test(sequence)) {
+        output += INVERSE_ON;
       }
-    }
-
-    const nextEsc = row.indexOf("\x1b", index + 1);
-    const chunk = nextEsc === -1 ? row.slice(index) : row.slice(index, nextEsc);
-    index = nextEsc === -1 ? row.length : nextEsc;
-
-    for (const grapheme of splitGraphemes(chunk)) {
+    },
+    (grapheme) => {
       const insideRange = column >= fromCol && column < toCol;
       if (insideRange && !inverseActive) {
         output += INVERSE_ON;
@@ -635,8 +638,8 @@ export function highlightVisibleColumns(text, fromCol, toCol) {
       }
       output += grapheme;
       column += graphemeWidth(grapheme);
-    }
-  }
+    },
+  );
 
   // Selection extends past the end of the text (whole-line or empty-line selection):
   // show one highlighted cell so the selected line stays visible.

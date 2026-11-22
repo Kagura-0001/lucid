@@ -1,4 +1,5 @@
 import path from "node:path";
+import { isToolTerminalStatus } from "./format.mjs";
 
 const METADATA_LINE_PATTERNS = [
   /^Created At:\s/i,
@@ -22,7 +23,10 @@ const READ_ONLY_COMMAND_PREFIXES = [
   { regex: /^git\s+(?:status|log|diff|show|branch|rev-parse|ls-files)\b/i, group: "check", verb: "Check" },
 ];
 
-const WRITE_OR_CHAIN_PATTERN = /(?:&&|\|\||;|`|\$\(|(?<!2)>{1,2}|\|\s*(?:tee|sh|bash|zsh|python|node|rm|mv|cp|chmod|chown|kill)\b)/;
+const WRITE_OR_CHAIN_PATTERN = /(?:&&|\|\||;|`|\$\(|(?:>(?!&1)|>>)|\|\s*(?:tee|sh|bash|zsh|python|node|rm|mv|cp|chmod|chown|kill)\b)/;
+const MUTATING_READ_FLAGS_RE = /\s-(?:delete|exec|execdir|ok|okdir|i\b|-in-place)\b/;
+const MUTATING_GIT_BRANCH_RE = /^git\s+branch\b.*\s-(?:[dDmMcC]|-(?:delete|move|copy))\b/i;
+const toolClassifyCache = new WeakMap();
 
 export function normalizeToolRawInput(rawInput) {
   if (!rawInput) return null;
@@ -114,8 +118,10 @@ function detectReadOnlyShell(commandLine, cwd) {
   const singleLine = commandLine.trim();
   if (!singleLine || singleLine.includes("\n")) return null;
   if (WRITE_OR_CHAIN_PATTERN.test(singleLine)) return null;
+  if (MUTATING_READ_FLAGS_RE.test(singleLine)) return null;
   // Strip harmless trailing 2>&1 and pipes to read-only paging/counting
   const mainSegment = singleLine.split("|")[0].trim();
+  if (MUTATING_GIT_BRANCH_RE.test(mainSegment)) return null;
   for (const spec of READ_ONLY_COMMAND_PREFIXES) {
     if (spec.regex.test(mainSegment)) {
       let target = shortenPathForDisplay(singleLine, cwd).replace(/\s*2>&1\s*$/, "").trim();
@@ -174,6 +180,18 @@ function extractFilePathFromTitle(title) {
   return stripped || title;
 }
 
+function exploreResult(base, exploreGroup, verb, summary, shortName = summary) {
+  return {
+    ...base,
+    category: "explore",
+    isExplore: !base.isFailure,
+    exploreGroup,
+    verb,
+    summary,
+    shortName,
+  };
+}
+
 export function classifyToolItem(item, cwd = "") {
   const rawName = String(item.name || "").trim();
   const nameLower = rawName.toLowerCase();
@@ -189,7 +207,7 @@ export function classifyToolItem(item, cwd = "") {
 
   const input = normalizeToolRawInput(item.rawInput);
   const exitCode = typeof item.exitCode === "number" ? item.exitCode : parseExitCode(item.outputText || "");
-  const isRunning = !["completed", "failed", "error", "cancelled"].includes(item.status);
+  const isRunning = !isToolTerminalStatus(item.status);
   const isFailure =
     item.status === "failed" ||
     item.status === "error" ||
@@ -217,27 +235,11 @@ export function classifyToolItem(item, cwd = "") {
 
   // 1. Swarm / board / message tools
   if (nameLower === "read_board" || titleLower === "run read_board" || titleLower.startsWith("read_board")) {
-    return {
-      ...base,
-      category: "explore",
-      isExplore: !isFailure,
-      exploreGroup: "check",
-      verb: "Check",
-      summary: "board",
-      shortName: "board",
-    };
+    return exploreResult(base, "check", "Check", "board");
   }
 
   if (nameLower === "swarm_wait" || titleLower === "run swarm_wait") {
-    return {
-      ...base,
-      category: "explore",
-      isExplore: !isFailure,
-      exploreGroup: "check",
-      verb: "Check",
-      summary: "wait on board",
-      shortName: "wait on board",
-    };
+    return exploreResult(base, "check", "Check", "wait on board");
   }
 
   if (nameLower === "swarm" || titleLower === "run swarm" || titleLower.startsWith("swarm ")) {
@@ -295,15 +297,7 @@ export function classifyToolItem(item, cwd = "") {
   if (nameLower === "manage_subagents") {
     const action = String(input?.Action || "list").toLowerCase();
     if (action === "list" && !isFailure) {
-      return {
-        ...base,
-        category: "explore",
-        isExplore: true,
-        exploreGroup: "check",
-        verb: "Check",
-        summary: "subagents",
-        shortName: "subagents",
-      };
+      return exploreResult(base, "check", "Check", "subagents");
     }
     return {
       ...base,
@@ -362,15 +356,7 @@ export function classifyToolItem(item, cwd = "") {
   ) {
     const rawPath = input?.Path || input?.AbsolutePath || extractFilePathFromTitle(firstTitleLine);
     const rel = shortenPathForDisplay(rawPath, cwd);
-    return {
-      ...base,
-      category: "explore",
-      isExplore: !isFailure,
-      exploreGroup: "read",
-      verb: "Read",
-      summary: rel,
-      shortName: path.basename(rel) || rel,
-    };
+    return exploreResult(base, "read", "Read", rel, path.basename(rel) || rel);
   }
 
   if (
@@ -383,15 +369,7 @@ export function classifyToolItem(item, cwd = "") {
     const isList = nameLower === "list_dir" || nameLower === "find_by_name";
     const query = input?.Query || input?.query || input?.Pattern || input?.DirectoryPath || firstTitleLine.replace(/^run\s+/i, "");
     const summary = shortenPathForDisplay(String(query), cwd);
-    return {
-      ...base,
-      category: "explore",
-      isExplore: !isFailure,
-      exploreGroup: isList ? "list" : "search",
-      verb: isList ? "List" : "Search",
-      summary,
-      shortName: summary,
-    };
+    return exploreResult(base, isList ? "list" : "search", isList ? "List" : "Search", summary);
   }
 
   // 5. Shell / command execution
@@ -413,13 +391,7 @@ export function classifyToolItem(item, cwd = "") {
       const readOnly = detectReadOnlyShell(cmdFirst, cwd);
       if (readOnly) {
         return {
-          ...base,
-          category: "explore",
-          isExplore: true,
-          exploreGroup: readOnly.exploreGroup,
-          verb: readOnly.verb,
-          summary: readOnly.summary,
-          shortName: readOnly.summary,
+          ...exploreResult(base, readOnly.exploreGroup, readOnly.verb, readOnly.summary),
           hiddenCommandLines: 0,
         };
       }
@@ -443,6 +415,20 @@ export function classifyToolItem(item, cwd = "") {
     verb: "Ran",
     summary: fallbackSummary || firstTitleLine,
   };
+}
+
+export function classifyToolItemCached(item, cwd = "") {
+  if (!item || typeof item !== "object" || !isToolTerminalStatus(item.status)) {
+    return classifyToolItem(item, cwd);
+  }
+  const key = `${cwd}|${item._rev || 0}`;
+  const cached = toolClassifyCache.get(item);
+  if (cached && cached.key === key) {
+    return cached.info;
+  }
+  const info = classifyToolItem(item, cwd);
+  toolClassifyCache.set(item, { key, info });
+  return info;
 }
 
 /**
@@ -520,7 +506,7 @@ export function summarizeArchivedWork(items, cwd = "", { includeThoughts = true 
     if (item.type !== "tool") continue;
     toolCount += 1;
     totalMs += item.durationMs || 0;
-    const info = classifyToolItem(item, cwd);
+    const info = classifyToolItemCached(item, cwd);
     if (info.category === "run") commandCount += 1;
     else if (info.exploreGroup === "read") readCount += 1;
     else if (info.exploreGroup === "list" || info.exploreGroup === "search") searchCount += 1;

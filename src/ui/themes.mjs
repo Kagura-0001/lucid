@@ -128,7 +128,7 @@ export function listThemes() {
 }
 
 export function createThemeStyler(themeName, colorDepth = "truecolor") {
-  const theme = THEMES[themeName] || THEMES.transparent;
+  const theme = Object.hasOwn(THEMES, themeName) ? THEMES[themeName] : THEMES.transparent;
   const c = theme.colors;
   const isMono = theme.name === "mono";
 
@@ -172,9 +172,5 @@ export function createThemeStyler(themeName, colorDepth = "truecolor") {
     diffHunk: (s) => paint(s, { fg: c.diffHunk, dim: true }, colorDepth),
 
     selected: (s) => paint(s, { fg: c.accent, bold: true, inverse: true }, colorDepth),
-    pill: (s, tone = "accent") => {
-      const fg = c[tone] || c.accent;
-      return paint(s, { fg, bold: true }, colorDepth);
-    },
   };
 }

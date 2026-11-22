@@ -128,22 +128,43 @@ export class Composer {
     return null;
   }
 
+  deleteGraphemeRange(start, count) {
+    if (count <= 0) return false;
+    const graphemes = this.getGraphemes();
+    graphemes.splice(start, count);
+    this.text = graphemes.join("");
+    this.cursor = start;
+    this.historyIndex = -1;
+    return true;
+  }
+
+  findWordStartBefore(graphemes, fromIdx) {
+    let idx = fromIdx;
+    while (idx > 0 && /\s/.test(graphemes[idx - 1])) idx -= 1;
+    while (idx > 0 && !/\s/.test(graphemes[idx - 1])) idx -= 1;
+    return idx;
+  }
+
+  findLineStart(graphemes, fromIdx) {
+    let idx = fromIdx;
+    while (idx > 0 && graphemes[idx - 1] !== "\n") idx -= 1;
+    return idx;
+  }
+
+  findLineEnd(graphemes, fromIdx) {
+    let idx = fromIdx;
+    while (idx < graphemes.length && graphemes[idx] !== "\n") idx += 1;
+    return idx;
+  }
+
   backspace() {
     if (this.cursor <= 0) return false;
     const graphemes = this.getGraphemes();
     const tokenHit = this.findPastedTokenBoundary(graphemes, "before");
     if (tokenHit) {
-      graphemes.splice(tokenHit.start, tokenHit.length);
-      this.text = graphemes.join("");
-      this.cursor = tokenHit.start;
-      this.historyIndex = -1;
-      return true;
+      return this.deleteGraphemeRange(tokenHit.start, tokenHit.length);
     }
-    graphemes.splice(this.cursor - 1, 1);
-    this.text = graphemes.join("");
-    this.cursor -= 1;
-    this.historyIndex = -1;
-    return true;
+    return this.deleteGraphemeRange(this.cursor - 1, 1);
   }
 
   deleteForward() {
@@ -151,52 +172,27 @@ export class Composer {
     if (this.cursor >= graphemes.length) return false;
     const tokenHit = this.findPastedTokenBoundary(graphemes, "after");
     if (tokenHit) {
-      graphemes.splice(tokenHit.start, tokenHit.length);
-      this.text = graphemes.join("");
-      this.historyIndex = -1;
-      return true;
+      return this.deleteGraphemeRange(tokenHit.start, tokenHit.length);
     }
-    graphemes.splice(this.cursor, 1);
-    this.text = graphemes.join("");
-    this.historyIndex = -1;
-    return true;
+    return this.deleteGraphemeRange(this.cursor, 1);
   }
 
   deleteWordBackward() {
     if (this.cursor <= 0) return false;
-    const graphemes = this.getGraphemes();
-    let idx = this.cursor;
-    while (idx > 0 && /\s/.test(graphemes[idx - 1])) idx -= 1;
-    while (idx > 0 && !/\s/.test(graphemes[idx - 1])) idx -= 1;
-    graphemes.splice(idx, this.cursor - idx);
-    this.text = graphemes.join("");
-    this.cursor = idx;
-    this.historyIndex = -1;
-    return true;
+    const start = this.findWordStartBefore(this.getGraphemes(), this.cursor);
+    return this.deleteGraphemeRange(start, this.cursor - start);
   }
 
   killToLineStart() {
     if (this.cursor <= 0) return false;
-    const graphemes = this.getGraphemes();
-    let idx = this.cursor;
-    while (idx > 0 && graphemes[idx - 1] !== "\n") idx -= 1;
-    if (idx === this.cursor) return false;
-    graphemes.splice(idx, this.cursor - idx);
-    this.text = graphemes.join("");
-    this.cursor = idx;
-    this.historyIndex = -1;
-    return true;
+    const start = this.findLineStart(this.getGraphemes(), this.cursor);
+    return this.deleteGraphemeRange(start, this.cursor - start);
   }
 
   killToLineEnd() {
     const graphemes = this.getGraphemes();
-    let idx = this.cursor;
-    while (idx < graphemes.length && graphemes[idx] !== "\n") idx += 1;
-    if (idx === this.cursor) return false;
-    graphemes.splice(this.cursor, idx - this.cursor);
-    this.text = graphemes.join("");
-    this.historyIndex = -1;
-    return true;
+    const end = this.findLineEnd(graphemes, this.cursor);
+    return this.deleteGraphemeRange(this.cursor, end - this.cursor);
   }
 
   moveLeft() {
@@ -209,11 +205,7 @@ export class Composer {
   }
 
   moveWordLeft() {
-    const graphemes = this.getGraphemes();
-    let idx = this.cursor;
-    while (idx > 0 && /\s/.test(graphemes[idx - 1])) idx -= 1;
-    while (idx > 0 && !/\s/.test(graphemes[idx - 1])) idx -= 1;
-    this.cursor = idx;
+    this.cursor = this.findWordStartBefore(this.getGraphemes(), this.cursor);
   }
 
   moveWordRight() {
@@ -225,17 +217,11 @@ export class Composer {
   }
 
   moveLineStart() {
-    const graphemes = this.getGraphemes();
-    let idx = this.cursor;
-    while (idx > 0 && graphemes[idx - 1] !== "\n") idx -= 1;
-    this.cursor = idx;
+    this.cursor = this.findLineStart(this.getGraphemes(), this.cursor);
   }
 
   moveLineEnd() {
-    const graphemes = this.getGraphemes();
-    let idx = this.cursor;
-    while (idx < graphemes.length && graphemes[idx] !== "\n") idx += 1;
-    this.cursor = idx;
+    this.cursor = this.findLineEnd(this.getGraphemes(), this.cursor);
   }
 
   moveUpOrHistory(contentWidth) {
@@ -350,6 +336,15 @@ export class Composer {
     let cursorCol = 0;
     let cursorPlaced = false;
 
+    const pushLine = (endIdx) => {
+      lines.push({
+        text: lineGraphemes.join(""),
+        graphemes: lineGraphemes,
+        startIdx: lineStart,
+        endIdx,
+      });
+    };
+
     for (let i = 0; i < graphemes.length; i += 1) {
       if (i === this.cursor) {
         cursorRow = lines.length;
@@ -359,12 +354,7 @@ export class Composer {
 
       const g = graphemes[i];
       if (g === "\n") {
-        lines.push({
-          text: lineGraphemes.join(""),
-          graphemes: lineGraphemes,
-          startIdx: lineStart,
-          endIdx: i,
-        });
+        pushLine(i);
         lineGraphemes = [];
         lineStart = i + 1;
         lineWidth = 0;
@@ -373,12 +363,7 @@ export class Composer {
 
       const w = graphemeWidth(g);
       if (lineWidth + w > widthLimit && lineGraphemes.length > 0) {
-        lines.push({
-          text: lineGraphemes.join(""),
-          graphemes: lineGraphemes,
-          startIdx: lineStart,
-          endIdx: i,
-        });
+        pushLine(i);
         lineGraphemes = [g];
         lineStart = i;
         lineWidth = w;
@@ -398,12 +383,7 @@ export class Composer {
       cursorCol = lineWidth;
     }
 
-    lines.push({
-      text: lineGraphemes.join(""),
-      graphemes: lineGraphemes,
-      startIdx: lineStart,
-      endIdx: graphemes.length,
-    });
+    pushLine(graphemes.length);
 
     return { lines, cursorRow, cursorCol };
   }

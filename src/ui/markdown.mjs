@@ -1,5 +1,5 @@
 import { osc8Link } from "../term/ansi.mjs";
-import { displayWidth, padEndVisible, wrapAnsiLine } from "../term/unicode.mjs";
+import { displayWidth, padEndVisible, wrapAnsiLine, wrapAnsiText } from "../term/unicode.mjs";
 import { renderLatexMath } from "./math.mjs";
 
 const KEYWORD_SETS = {
@@ -450,6 +450,16 @@ function renderTableBlock(rawLines, maxWidth, style) {
   return out;
 }
 
+function pushListItem(out, indentLen, marker, bodyText, width, style) {
+  const indent = " ".repeat(indentLen);
+  const contLen = indentLen + marker.length + 1;
+  const contIndent = " ".repeat(contLen);
+  const wrapped = wrapAnsiLine(renderInlineMarkdown(bodyText, style), Math.max(12, width - contLen));
+  wrapped.forEach((w, idx) => {
+    out.push(idx === 0 ? `${indent}${style.accent(marker)} ${w}` : `${contIndent}${w}`);
+  });
+}
+
 /**
  * Renders full Markdown document to ANSI lines wrapped to `maxWidth`.
  * Designed to stay clean and flicker-free while streaming partial tokens.
@@ -612,15 +622,7 @@ export function renderMarkdown(markdownText, maxWidth, style) {
     // Unordered list item
     const bulletMatch = /^(\s*)([-*+])\s+(.*)$/.exec(line);
     if (bulletMatch) {
-      const indentSpaces = Math.min(8, bulletMatch[1].length);
-      const indent = " ".repeat(indentSpaces);
-      const body = renderInlineMarkdown(bulletMatch[3], style);
-      const bulletPrefix = `${indent}${style.accent("•")} `;
-      const contIndent = " ".repeat(indentSpaces + 2);
-      const wrapped = wrapAnsiLine(body, Math.max(12, width - indentSpaces - 2));
-      wrapped.forEach((w, idx) => {
-        out.push(idx === 0 ? `${bulletPrefix}${w}` : `${contIndent}${w}`);
-      });
+      pushListItem(out, Math.min(8, bulletMatch[1].length), "•", bulletMatch[3], width, style);
       i += 1;
       continue;
     }
@@ -628,16 +630,7 @@ export function renderMarkdown(markdownText, maxWidth, style) {
     // Ordered list item
     const orderedMatch = /^(\s*)(\d+[.)])\s+(.*)$/.exec(line);
     if (orderedMatch) {
-      const indentSpaces = Math.min(8, orderedMatch[1].length);
-      const indent = " ".repeat(indentSpaces);
-      const num = orderedMatch[2];
-      const body = renderInlineMarkdown(orderedMatch[3], style);
-      const prefixWidth = indentSpaces + num.length + 1;
-      const contIndent = " ".repeat(prefixWidth);
-      const wrapped = wrapAnsiLine(body, Math.max(12, width - prefixWidth));
-      wrapped.forEach((w, idx) => {
-        out.push(idx === 0 ? `${indent}${style.accent(num)} ${w}` : `${contIndent}${w}`);
-      });
+      pushListItem(out, Math.min(8, orderedMatch[1].length), orderedMatch[2], orderedMatch[3], width, style);
       i += 1;
       continue;
     }
@@ -651,4 +644,12 @@ export function renderMarkdown(markdownText, maxWidth, style) {
   }
 
   return out;
+}
+
+export function safeRenderMarkdown(text, maxWidth, style) {
+  try {
+    return renderMarkdown(text || "", maxWidth, style);
+  } catch {
+    return wrapAnsiText(String(text || ""), Math.max(16, maxWidth));
+  }
 }

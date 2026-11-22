@@ -3,6 +3,25 @@ import { StringDecoder } from "node:string_decoder";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
+const CURSOR_KEY_MAP = {
+  A: "up",
+  B: "down",
+  C: "right",
+  D: "left",
+  H: "home",
+  F: "end",
+};
+
+const TILDE_KEY_MAP = {
+  1: "home",
+  3: "delete",
+  4: "end",
+  5: "pageup",
+  6: "pagedown",
+  7: "home",
+  8: "end",
+};
+
 function decodeModifierFlags(modParam) {
   const bits = Math.max(0, (modParam || 1) - 1);
   return {
@@ -69,6 +88,10 @@ export class InputParser {
     }
   }
 
+  emitKey(name, mods = {}) {
+    this.emit({ type: "key", name, ctrl: false, alt: false, shift: false, ...mods });
+  }
+
   processBuffer() {
     while (this.buffer.length > 0) {
       if (this.inPaste) {
@@ -129,7 +152,7 @@ export class InputParser {
       this.escTimer = null;
       if (this.buffer === "\x1b") {
         this.buffer = "";
-        this.emit({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+        this.emitKey("escape");
       } else if (this.buffer.startsWith("\x1b[M")) {
         // Incomplete X10 mouse report (for example, two raw high coordinate bytes
         // merged into one UTF-8 character at end of stream). Discard instead of
@@ -138,7 +161,7 @@ export class InputParser {
       } else if (this.buffer.startsWith("\x1b")) {
         // Fallback: flush raw escape then continue parsing remainder
         this.buffer = this.buffer.slice(1);
-        this.emit({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+        this.emitKey("escape");
         this.processBuffer();
       }
     }, 35);
@@ -246,48 +269,36 @@ export class InputParser {
     // SS3 sequences: \x1bO + one char
     if (second === "O") {
       if (buf.length < 3) return 0;
-      const code = buf[2];
-      const ss3Map = {
-        A: "up",
-        B: "down",
-        C: "right",
-        D: "left",
-        H: "home",
-        F: "end",
-      };
-      const name = ss3Map[code];
+      const name = CURSOR_KEY_MAP[buf[2]];
       if (name) {
-        this.emit({ type: "key", name, ctrl: false, alt: false, shift: false });
+        this.emitKey(name);
       }
       return 3;
     }
 
     // Double ESC -> escape
     if (second === "\x1b") {
-      this.emit({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+      this.emitKey("escape");
       return 1;
     }
 
     // Alt + Enter
     if (second === "\r" || second === "\n") {
-      this.emit({ type: "key", name: "enter", ctrl: false, alt: true, shift: false });
+      this.emitKey("enter", { alt: true });
       return 2;
     }
 
     // Alt + Backspace
     if (second === "\x7f" || second === "\x08") {
-      this.emit({ type: "key", name: "backspace", ctrl: false, alt: true, shift: false });
+      this.emitKey("backspace", { alt: true });
       return 2;
     }
 
     // Alt + printable ASCII
     const charCode = second.charCodeAt(0);
     if (charCode >= 32 && charCode <= 126) {
-      this.emit({
-        type: "key",
-        name: second.toLowerCase(),
+      this.emitKey(second.toLowerCase(), {
         text: second,
-        ctrl: false,
         alt: true,
         shift: second >= "A" && second <= "Z",
       });
@@ -334,30 +345,21 @@ export class InputParser {
 
       const name = keyNameFromCsiCode(baseCode);
       if (name) {
-        this.emit({ type: "key", name, ...mods });
+        this.emitKey(name, mods);
       }
       return;
     }
 
     // Shift+Tab: \x1b[Z
     if (finalByte === "Z") {
-      this.emit({ type: "key", name: "tab", ctrl: false, alt: false, shift: true });
+      this.emitKey("tab", { shift: true });
       return;
     }
 
     // Arrow / Home / End with optional modifiers: \x1b[A or \x1b[1;5C
-    const arrowMap = {
-      A: "up",
-      B: "down",
-      C: "right",
-      D: "left",
-      H: "home",
-      F: "end",
-    };
-    if (arrowMap[finalByte]) {
+    if (CURSOR_KEY_MAP[finalByte]) {
       const parts = params ? params.split(";").map((p) => Number.parseInt(p, 10)) : [];
-      const mods = decodeModifierFlags(parts[1] || 1);
-      this.emit({ type: "key", name: arrowMap[finalByte], ...mods });
+      this.emitKey(CURSOR_KEY_MAP[finalByte], decodeModifierFlags(parts[1] || 1));
       return;
     }
 
@@ -365,26 +367,15 @@ export class InputParser {
     if (finalByte === "~") {
       const parts = params.split(";").map((p) => Number.parseInt(p, 10));
       if (parts[0] === 27 && parts.length >= 3) {
-        const mods = decodeModifierFlags(parts[1] || 1);
         const name = keyNameFromCsiCode(parts[2]);
         if (name) {
-          this.emit({ type: "key", name, ...mods });
+          this.emitKey(name, decodeModifierFlags(parts[1] || 1));
         }
         return;
       }
-      const mods = decodeModifierFlags(parts[1] || 1);
-      const tildeMap = {
-        1: "home",
-        3: "delete",
-        4: "end",
-        5: "pageup",
-        6: "pagedown",
-        7: "home",
-        8: "end",
-      };
-      const name = tildeMap[parts[0]];
+      const name = TILDE_KEY_MAP[parts[0]];
       if (name) {
-        this.emit({ type: "key", name, ...mods });
+        this.emitKey(name, decodeModifierFlags(parts[1] || 1));
       }
     }
   }
@@ -394,27 +385,26 @@ export class InputParser {
     const code = ch.charCodeAt(0);
 
     if (ch === "\r") {
-      this.emit({ type: "key", name: "enter", ctrl: false, alt: false, shift: false });
+      this.emitKey("enter");
       return 1;
     }
     if (ch === "\n") {
       // Ctrl+J / LF -> newline inside composer
-      this.emit({ type: "key", name: "j", ctrl: true, alt: false, shift: false });
+      this.emitKey("j", { ctrl: true });
       return 1;
     }
     if (ch === "\t") {
-      this.emit({ type: "key", name: "tab", ctrl: false, alt: false, shift: false });
+      this.emitKey("tab");
       return 1;
     }
     if (ch === "\x7f" || ch === "\x08") {
-      this.emit({ type: "key", name: "backspace", ctrl: false, alt: false, shift: false });
+      this.emitKey("backspace");
       return 1;
     }
 
     // Ctrl+A (1) .. Ctrl+Z (26)
     if (code >= 1 && code <= 26) {
-      const letter = String.fromCharCode(code + 96);
-      this.emit({ type: "key", name: letter, ctrl: true, alt: false, shift: false });
+      this.emitKey(String.fromCharCode(code + 96), { ctrl: true });
       return 1;
     }
 

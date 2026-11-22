@@ -3,16 +3,19 @@ import { displayWidth, padEndVisible, truncateAnsi, wrapAnsiLine, wrapAnsiText }
 import { PASTED_TOKEN_REGEX } from "./composer.mjs";
 import { renderDiffLines } from "./diff.mjs";
 import { formatBytes } from "./files.mjs";
-import { renderMarkdown } from "./markdown.mjs";
+import { alignLeftRight, formatDuration, isToolTerminalStatus, sliceCenteredWindow, spinnerChar } from "./format.mjs";
+import { safeRenderMarkdown } from "./markdown.mjs";
 import { renderSwarmDock } from "./swarm.mjs";
 import {
-  classifyToolItem,
+  classifyToolItemCached,
   summarizeArchivedWork,
   summarizeExploreEntries,
 } from "./tool_format.mjs";
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+export { formatDuration };
+
 const itemRenderCache = new WeakMap();
+const archivedBlockCache = new WeakMap();
 
 export function resolveThoughtMode(state) {
   if (state?.thoughtMode === "fold" || state?.thoughtMode === "expanded" || state?.thoughtMode === "hidden") {
@@ -32,15 +35,6 @@ export function formatTokenCount(count) {
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
   if (count >= 1_000) return `${Math.round(count / 1_000)}k`;
   return String(count);
-}
-
-export function formatDuration(ms) {
-  if (!ms || ms < 0) return "";
-  const secs = ms / 1000;
-  if (secs < 60) return `${secs.toFixed(1)}s`;
-  const mins = Math.floor(secs / 60);
-  const rem = Math.floor(secs % 60);
-  return `${mins}m${rem}s`;
 }
 
 function formatModeLabel(modeId, style) {
@@ -94,17 +88,7 @@ export function renderHeader(state, cols, style) {
 
   const leftStr = leftParts.join(sep);
   const rightStr = rightParts.join(sep);
-  const leftW = displayWidth(leftStr);
-  const rightW = displayWidth(rightStr);
-
-  let topLine;
-  if (rightW > 0 && leftW + rightW + 4 <= cols) {
-    const gap = cols - leftW - rightW - 2;
-    topLine = ` ${leftStr}${" ".repeat(gap)}${rightStr} `;
-  } else {
-    topLine = ` ${truncateAnsi(leftStr, cols - 2, "…")} `;
-  }
-
+  const topLine = ` ${alignLeftRight(leftStr, rightStr, cols - 2, 2)} `;
   const ruleLine = style.border("─".repeat(cols));
   return [topLine, ruleLine];
 }
@@ -118,7 +102,7 @@ export function renderWelcome(state, cols, style) {
   const statusLine = state.connected
     ? `${style.success("●")} Connected to ${style.bold(state.agentLabel || "ACP agent")}`
     : state.connecting
-      ? `${style.warn(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length])} Connecting to ${style.bold(state.agentLabel || "ACP agent")}…`
+      ? `${style.warn(spinnerChar(state.spinnerFrame))} Connecting to ${style.bold(state.agentLabel || "ACP agent")}…`
       : `${style.error("●")} Disconnected`;
 
   lines.push(`  ${statusLine}`);
@@ -151,10 +135,16 @@ function formatOptionalDuration(durationMs, isFailure) {
   return formatDuration(durationMs);
 }
 
+function formatStatusMetaTag(parts, isFailure, style) {
+  if (!parts || parts.length === 0) return "";
+  const text = `  (${parts.join(" · ")})`;
+  return isFailure ? style.error(text) : style.muted(text);
+}
+
 function renderToolItem(item, maxWidth, style, state, precomputedInfo = null) {
   const lines = [];
-  const spinner = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length];
-  const info = precomputedInfo || classifyToolItem(item, state.cwd || "");
+  const spinner = spinnerChar(state.spinnerFrame);
+  const info = precomputedInfo || classifyToolItemCached(item, state.cwd || "");
 
   let icon;
   if (info.isFailure) {
@@ -174,9 +164,7 @@ function renderToolItem(item, maxWidth, style, state, precomputedInfo = null) {
   }
   const durStr = formatOptionalDuration(item.durationMs, info.isFailure);
   if (durStr) metaParts.push(durStr);
-  const metaTag = metaParts.length > 0
-    ? (info.isFailure ? style.error(`  (${metaParts.join(" · ")})`) : style.muted(`  (${metaParts.join(" · ")})`))
-    : "";
+  const metaTag = formatStatusMetaTag(metaParts, info.isFailure, style);
 
   const verbLabel = info.isFailure
     ? style.errorBold(info.verb)
@@ -189,8 +177,7 @@ function renderToolItem(item, maxWidth, style, state, precomputedInfo = null) {
   const reservedRight = displayWidth(moreLinesTag) + displayWidth(metaTag) + displayWidth(info.verb) + 6;
   const summaryWidth = Math.max(16, maxWidth - reservedRight);
   const summaryText = truncateAnsi(info.summary || "", summaryWidth, "…");
-  const styledSummary = info.isFailure ? style.text(summaryText) : style.text(summaryText);
-  lines.push(`  ${icon} ${verbLabel} ${styledSummary}${moreLinesTag}${metaTag}`);
+  lines.push(`  ${icon} ${verbLabel} ${style.text(summaryText)}${moreLinesTag}${metaTag}`);
 
   // Render diff blocks cleanly even in compact mode (with sensible cap)
   if (Array.isArray(item.diffs) && item.diffs.length > 0) {
@@ -258,7 +245,7 @@ function renderToolItem(item, maxWidth, style, state, precomputedInfo = null) {
 function renderExploreGroup(classifiedList, maxWidth, style, state) {
   const isRunning = classifiedList.some((entry) => entry.isRunning);
   const icon = isRunning
-    ? style.warn(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length])
+    ? style.warn(spinnerChar(state.spinnerFrame))
     : style.muted("•");
   const heading = isRunning ? style.bold("Exploring") : style.muted("Explored");
   const lines = [`  ${icon} ${heading}`];
@@ -266,7 +253,7 @@ function renderExploreGroup(classifiedList, maxWidth, style, state) {
   const rows = summarizeExploreEntries(classifiedList);
   for (const row of rows) {
     const lead = row.running
-      ? style.warn(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length])
+      ? style.warn(spinnerChar(state.spinnerFrame))
       : style.border("└");
     const verbStr = style.muted(row.verb);
     const textBudget = Math.max(14, maxWidth - 8 - displayWidth(row.verb) - 1);
@@ -323,34 +310,18 @@ function renderArchivedWorkBlock(segmentItems, maxWidth, style, state, thoughtMo
   return lines;
 }
 
-function renderThoughtItem(item, maxWidth, style, state) {
-  const thoughtMode = resolveThoughtMode(state);
-  if (thoughtMode === "hidden") return [];
-
+function renderExpandedThoughtItem(item, maxWidth, style, state) {
   const text = (item.text || "").trim();
   if (!text) return [];
-
   const isLive = Boolean(item.streaming);
   const dur = item.durationMs ? ` · ${formatDuration(item.durationMs)}` : "";
-
-  if (thoughtMode === "expanded") {
-    const lines = [];
-    const labelIcon = isLive ? style.thought(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]) : style.thought("▾");
-    const titleLabel = isLive ? `Thinking${dur}` : `Thought${dur}`;
-    lines.push(`  ${labelIcon} ${style.thought(titleLabel)}`);
-    const wrapped = wrapAnsiText(style.thought(text), Math.max(16, maxWidth - 6));
-    for (const w of wrapped) {
-      lines.push(`    ${style.border("│")} ${w}`);
-    }
-    return lines;
+  const labelIcon = isLive ? style.thought(spinnerChar(state.spinnerFrame)) : style.thought("▾");
+  const titleLabel = isLive ? `Thinking${dur}` : `Thought${dur}`;
+  const lines = [`  ${labelIcon} ${style.thought(titleLabel)}`];
+  for (const w of wrapAnsiText(style.thought(text), Math.max(16, maxWidth - 6))) {
+    lines.push(`    ${style.border("│")} ${w}`);
   }
-
-  // Folded mode (default, Claude Code style)
-  if (isLive) {
-    const spin = style.thought(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]);
-    return [`  ${spin} ${style.thought(`Thinking${dur}`)}  ${style.muted("(Ctrl+T to expand)")}`];
-  }
-  return [renderFoldedThoughtSummary(1, item.durationMs || 0, style)];
+  return lines;
 }
 
 function renderPlanItem(item, maxWidth, style) {
@@ -435,17 +406,13 @@ function renderUserItem(item, contentWidth, style, state) {
 }
 
 function renderAssistantItem(item, contentWidth, style) {
-  const out = [];
-  const mdLines = renderMarkdown(item.text || "", contentWidth, style);
-  for (const ml of mdLines) {
-    out.push(ml ? `  ${ml}` : "");
-  }
-  return out;
+  const mdLines = safeRenderMarkdown(item.text || "", contentWidth, style);
+  return mdLines.map((ml) => (ml ? `  ${ml}` : ""));
 }
 
 function renderShellItem(item, contentWidth, style, state) {
   const out = [];
-  const spinner = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length];
+  const spinner = spinnerChar(state.spinnerFrame);
   const isRunning = item.status === "running";
   const isCancelled = item.status === "cancelled";
   const isFailure = item.status === "failed" || (typeof item.exitCode === "number" && item.exitCode !== 0);
@@ -470,9 +437,7 @@ function renderShellItem(item, contentWidth, style, state) {
   if (item.durationMs >= 1000) {
     metaParts.push(formatDuration(item.durationMs));
   }
-  const metaTag = metaParts.length > 0
-    ? (isFailure ? style.error(`  (${metaParts.join(" · ")})`) : style.muted(`  (${metaParts.join(" · ")})`))
-    : "";
+  const metaTag = formatStatusMetaTag(metaParts, isFailure, style);
 
   const cmdRaw = String(item.command || "").replace(/\r?\n/g, " ").trim();
   const cmdBudget = Math.max(16, contentWidth - displayWidth(lead) - displayWidth(metaTag) - 4);
@@ -480,7 +445,9 @@ function renderShellItem(item, contentWidth, style, state) {
 
   const rawOutput = String(item.output || "").replace(/\r\n/g, "\n");
   if (rawOutput.trim()) {
-    const rawLines = rawOutput.split("\n");
+    const rawLines = rawOutput
+      .split("\n")
+      .map((l) => (l.includes("\r") ? l.slice(l.lastIndexOf("\r") + 1) : l));
     while (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") {
       rawLines.pop();
     }
@@ -505,19 +472,13 @@ function renderShellItem(item, contentWidth, style, state) {
 }
 
 function renderNoticeItem(item, contentWidth, style) {
-  const marker =
+  const [marker, paint] =
     item.level === "error"
-      ? style.errorBold("!")
+      ? [style.errorBold("!"), style.error]
       : item.level === "warn"
-        ? style.warnBold("!")
-        : style.muted("·");
-  const textStyled =
-    item.level === "error"
-      ? style.error(item.text)
-      : item.level === "warn"
-        ? style.warn(item.text)
-        : style.muted(item.text);
-  const wrapped = wrapAnsiText(textStyled, Math.max(16, contentWidth - 2));
+        ? [style.warnBold("!"), style.warn]
+        : [style.muted("·"), style.muted];
+  const wrapped = wrapAnsiText(paint(item.text), Math.max(16, contentWidth - 2));
   return wrapped.map((wl, wIdx) => (wIdx === 0 ? `  ${marker} ${wl}` : `    ${wl}`));
 }
 
@@ -531,7 +492,7 @@ function isCacheableTimelineItem(item, thoughtMode) {
     case "shell":
       return item.status !== "running";
     case "tool":
-      return ["completed", "failed", "error", "cancelled"].includes(item.status);
+      return isToolTerminalStatus(item.status);
     case "assistant":
       return !item.streaming;
     case "thought":
@@ -539,6 +500,31 @@ function isCacheableTimelineItem(item, thoughtMode) {
     default:
       return false;
   }
+}
+
+function renderCachedArchivedWorkBlock(segmentItems, cols, contentWidth, style, state, thoughtMode) {
+  if (!Array.isArray(segmentItems) || segmentItems.length === 0) return [];
+  const firstItem = segmentItems[0];
+  const baseKey = `${cols}|${style.name}|${style.depth}|${state.cwd || ""}|${thoughtMode}|${segmentItems.length}`;
+  const cached = archivedBlockCache.get(firstItem);
+  if (cached && cached.baseKey === baseKey && cached.items.length === segmentItems.length) {
+    let match = true;
+    for (let i = 0; i < segmentItems.length; i += 1) {
+      if (cached.items[i] !== segmentItems[i] || cached.revs[i] !== (segmentItems[i]._rev || 0)) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return cached.lines;
+  }
+  const lines = renderArchivedWorkBlock(segmentItems, contentWidth, style, state, thoughtMode);
+  archivedBlockCache.set(firstItem, {
+    baseKey,
+    items: segmentItems,
+    revs: segmentItems.map((it) => it._rev || 0),
+    lines,
+  });
+  return lines;
 }
 
 function renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, renderFn) {
@@ -587,6 +573,7 @@ export function renderTimeline(state, cols, style) {
       lines.push(chunk[i]);
     }
   };
+  const renderCached = (item, fn) => renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, fn);
 
   const turns = splitItemsIntoTurns(state.items);
 
@@ -594,105 +581,14 @@ export function renderTimeline(state, cols, style) {
     const turn = turns[tIdx];
     const isLatestTurn = tIdx === turns.length - 1;
     const turnHasLive = turn.some(
-      (item) =>
-        item.streaming ||
-        (item.type === "tool" && !["completed", "failed", "error", "cancelled"].includes(item.status)),
+      (item) => item.streaming || (item.type === "tool" && !isToolTerminalStatus(item.status)),
     );
     const archiveWork = !isLatestTurn && !turnHasLive && !state.expandTools;
 
-    if (archiveWork) {
-      let pendingSegment = [];
-      const flushArchivedSegment = () => {
-        if (pendingSegment.length === 0) return;
-        const block = renderArchivedWorkBlock(pendingSegment, contentWidth, style, state, thoughtMode);
-        if (block.length > 0) {
-          pushLines(block);
-          lastEmittedType = "tool";
-        }
-        pendingSegment = [];
-      };
-
-      for (const item of turn) {
-        if (item.type === "user") {
-          flushArchivedSegment();
-          if (lines.length > 1) lines.push("");
-          const userLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-            renderUserItem(item, contentWidth, style, state),
-          );
-          pushLines(userLines);
-          lastEmittedType = "user";
-          continue;
-        }
-        if (item.type === "tool") {
-          pendingSegment.push(item);
-          continue;
-        }
-        if (item.type === "thought") {
-          if (thoughtMode === "hidden") continue;
-          if (thoughtMode === "fold") {
-            if ((item.text || "").trim()) pendingSegment.push(item);
-            continue;
-          }
-          flushArchivedSegment();
-          const thoughtLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-            renderThoughtItem(item, contentWidth, style, state),
-          );
-          if (thoughtLines.length > 0) {
-            pushLines(thoughtLines);
-            lastEmittedType = "thought";
-          }
-          continue;
-        }
-        flushArchivedSegment();
-        if (item.type === "plan") {
-          const planLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-            renderPlanItem(item, contentWidth, style),
-          );
-          if (planLines.length > 0) {
-            pushLines(planLines);
-            lastEmittedType = "plan";
-          }
-          continue;
-        }
-        if (item.type === "assistant") {
-          if (lastEmittedType === "tool" || lastEmittedType === "thought" || lastEmittedType === "plan") {
-            lines.push("");
-          }
-          const assistantLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-            renderAssistantItem(item, contentWidth, style),
-          );
-          pushLines(assistantLines);
-          lines.push("");
-          lastEmittedType = "assistant";
-          continue;
-        }
-        if (item.type === "notice") {
-          const noticeLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-            renderNoticeItem(item, contentWidth, style),
-          );
-          pushLines(noticeLines);
-          lastEmittedType = "notice";
-          continue;
-        }
-        if (item.type === "shell") {
-          const shellLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-            renderShellItem(item, contentWidth, style, state),
-          );
-          pushLines(shellLines);
-          lastEmittedType = "shell";
-        }
-      }
-      flushArchivedSegment();
-      continue;
-    }
-
-    // Active / latest turn (or Ctrl+O expanded): Codex-style grouped exploration & clean tool rows.
-    // Pre-sum non-streaming folded thoughts in this turn so the summary appears cleanly
-    // where thinking began rather than dangling below every tool call.
     let turnFoldedCount = 0;
     let turnFoldedMs = 0;
     let hasLiveThought = false;
-    if (thoughtMode === "fold") {
+    if (!archiveWork && thoughtMode === "fold") {
       for (const item of turn) {
         if (item.type !== "thought") continue;
         if (item.streaming) {
@@ -704,53 +600,63 @@ export function renderTimeline(state, cols, style) {
       }
     }
     let emittedTurnFoldedThought = false;
-    let exploreBatch = [];
+    let pendingBatch = [];
 
-    const flushExploreBatch = () => {
-      if (exploreBatch.length === 0) return;
-      const block = renderExploreGroup(exploreBatch, contentWidth, style, state);
-      pushLines(block);
-      exploreBatch = [];
-      lastEmittedType = "tool";
+    const flushPending = () => {
+      if (pendingBatch.length === 0) return;
+      const block = archiveWork
+        ? renderCachedArchivedWorkBlock(pendingBatch, cols, contentWidth, style, state, thoughtMode)
+        : renderExploreGroup(pendingBatch, contentWidth, style, state);
+      if (block.length > 0) {
+        pushLines(block);
+        lastEmittedType = "tool";
+      }
+      pendingBatch = [];
     };
 
     for (const item of turn) {
-      if (item.type === "user") {
-        flushExploreBatch();
-        if (lines.length > 1) lines.push("");
-        const userLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-          renderUserItem(item, contentWidth, style, state),
-        );
-        pushLines(userLines);
-        lastEmittedType = "user";
+      if (item.type === "tool") {
+        if (archiveWork) {
+          pendingBatch.push(item);
+          continue;
+        }
+        const info = !state.expandTools ? classifyToolItemCached(item, state.cwd || "") : null;
+        if (info && info.isExplore && !info.isFailure) {
+          pendingBatch.push(info);
+          continue;
+        }
+        flushPending();
+        pushLines(renderCached(item, () => renderToolItem(item, contentWidth, style, state, info)));
+        lastEmittedType = "tool";
         continue;
       }
 
       if (item.type === "thought") {
         if (thoughtMode === "hidden") continue;
         if (thoughtMode === "fold") {
+          if (archiveWork) {
+            if ((item.text || "").trim()) pendingBatch.push(item);
+            continue;
+          }
           if (item.streaming) {
-            flushExploreBatch();
+            flushPending();
             const combinedMs = turnFoldedMs + (item.durationMs || 0);
-            const spin = style.thought(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]);
+            const spin = style.thought(spinnerChar(state.spinnerFrame));
             const dur = combinedMs > 0 ? ` · ${formatDuration(combinedMs)}` : "";
             const stepTag = turnFoldedCount > 0 ? ` · ${turnFoldedCount + 1} steps` : "";
             lines.push(`  ${spin} ${style.thought(`Thinking${dur}`)}${style.muted(`${stepTag}  (Ctrl+T to expand)`)}`);
             emittedTurnFoldedThought = true;
             lastEmittedType = "thought";
           } else if (!hasLiveThought && !emittedTurnFoldedThought && turnFoldedCount > 0) {
-            flushExploreBatch();
+            flushPending();
             lines.push(renderFoldedThoughtSummary(turnFoldedCount, turnFoldedMs, style));
             emittedTurnFoldedThought = true;
             lastEmittedType = "thought";
           }
           continue;
         }
-
-        flushExploreBatch();
-        const thoughtLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-          renderThoughtItem(item, contentWidth, style, state),
-        );
+        flushPending();
+        const thoughtLines = renderCached(item, () => renderExpandedThoughtItem(item, contentWidth, style, state));
         if (thoughtLines.length > 0) {
           pushLines(thoughtLines);
           lastEmittedType = "thought";
@@ -758,79 +664,47 @@ export function renderTimeline(state, cols, style) {
         continue;
       }
 
-      if (item.type === "tool") {
-        if (!state.expandTools) {
-          const info = classifyToolItem(item, state.cwd || "");
-          if (info.isExplore && !info.isFailure) {
-            exploreBatch.push(info);
-            continue;
+      flushPending();
+
+      switch (item.type) {
+        case "user":
+          if (lines.length > 1) lines.push("");
+          pushLines(renderCached(item, () => renderUserItem(item, contentWidth, style, state)));
+          lastEmittedType = "user";
+          break;
+        case "plan": {
+          const planLines = renderCached(item, () => renderPlanItem(item, contentWidth, style));
+          if (planLines.length > 0) {
+            pushLines(planLines);
+            lastEmittedType = "plan";
           }
-          flushExploreBatch();
-          const toolLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-            renderToolItem(item, contentWidth, style, state, info),
-          );
-          pushLines(toolLines);
-          lastEmittedType = "tool";
-          continue;
+          break;
         }
-
-        flushExploreBatch();
-        const toolLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-          renderToolItem(item, contentWidth, style, state),
-        );
-        pushLines(toolLines);
-        lastEmittedType = "tool";
-        continue;
-      }
-
-      flushExploreBatch();
-
-      if (item.type === "plan") {
-        const planLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-          renderPlanItem(item, contentWidth, style),
-        );
-        if (planLines.length > 0) {
-          pushLines(planLines);
-          lastEmittedType = "plan";
-        }
-        continue;
-      }
-
-      if (item.type === "assistant") {
-        if (lastEmittedType === "tool" || lastEmittedType === "thought" || lastEmittedType === "plan") {
+        case "assistant":
+          if (lastEmittedType === "tool" || lastEmittedType === "thought" || lastEmittedType === "plan") {
+            lines.push("");
+          }
+          pushLines(renderCached(item, () => renderAssistantItem(item, contentWidth, style)));
+          if (item.streaming) {
+            lines.push(`  ${style.accent(spinnerChar(state.spinnerFrame))}`);
+          }
           lines.push("");
-        }
-        const assistantLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-          renderAssistantItem(item, contentWidth, style),
-        );
-        pushLines(assistantLines);
-        if (item.streaming) {
-          lines.push(`  ${style.accent(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length])}`);
-        }
-        lines.push("");
-        lastEmittedType = "assistant";
-        continue;
-      }
-
-      if (item.type === "notice") {
-        const noticeLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-          renderNoticeItem(item, contentWidth, style),
-        );
-        pushLines(noticeLines);
-        lastEmittedType = "notice";
-        continue;
-      }
-
-      if (item.type === "shell") {
-        const shellLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
-          renderShellItem(item, contentWidth, style, state),
-        );
-        pushLines(shellLines);
-        lastEmittedType = "shell";
+          lastEmittedType = "assistant";
+          break;
+        case "notice":
+          pushLines(renderCached(item, () => renderNoticeItem(item, contentWidth, style)));
+          lastEmittedType = "notice";
+          break;
+        case "shell":
+          pushLines(renderCached(item, () => renderShellItem(item, contentWidth, style, state)));
+          lastEmittedType = "shell";
+          break;
+        default:
+          break;
       }
     }
 
-    flushExploreBatch();
+    flushPending();
   }
 
   return lines;
@@ -842,8 +716,7 @@ export function renderAutocompletePopup(popup, cols, style) {
   }
 
   const maxVisible = Math.min(8, popup.items.length);
-  const start = Math.max(0, Math.min(popup.selected - Math.floor(maxVisible / 2), popup.items.length - maxVisible));
-  const slice = popup.items.slice(start, start + maxVisible);
+  const { start, slice } = sliceCenteredWindow(popup.items, popup.selected, maxVisible);
   const innerWidth = Math.max(24, cols - 4);
   const lines = [];
 
@@ -898,55 +771,31 @@ export function renderComposerBlock(state, cols, style) {
   const isShellInput = !state.activeModalType && state.composer.text.startsWith("!");
 
   // Optional status strip right above the composer hairline
-  const statusPieces = [];
+  let statusBanner = "";
   if (state.activeModalType === "permission") {
-    statusPieces.push(
-      truncateAnsi(
-        `${style.warnBold("⚠ Permission approval required above")} ${style.muted("· press 1-9, ↑/↓ + Enter, or Esc to deny")}`,
-        Math.max(16, cols - 2),
-        "…",
-      ),
-    );
+    statusBanner = `${style.warnBold("⚠ Permission approval required above")} ${style.muted("· press 1-9, ↑/↓ + Enter, or Esc to deny")}`;
   } else if (state.activeModalType === "picker") {
-    statusPieces.push(
-      truncateAnsi(
-        `${style.accent("▸ Picker open")} ${style.muted("· type to filter, ↑/↓ + Enter to select, Esc to close")}`,
-        Math.max(16, cols - 2),
-        "…",
-      ),
-    );
+    statusBanner = `${style.accent("▸ Picker open")} ${style.muted("· type to filter, ↑/↓ + Enter to select, Esc to close")}`;
   } else if (isShellInput) {
-    statusPieces.push(
-      truncateAnsi(
-        `${style.warnBold("! Local shell")} ${style.muted("· runs directly in workspace (bypasses agent) · Enter run · Esc clear")}`,
-        Math.max(16, cols - 2),
-        "…",
-      ),
-    );
+    statusBanner = `${style.warnBold("! Local shell")} ${style.muted("· runs directly in workspace (bypasses agent) · Enter run · Esc clear")}`;
   } else if (state.focusedAgentName) {
-    statusPieces.push(
-      truncateAnsi(
-        `${style.accentBold(`Viewing ${state.focusedAgentName}`)} ${style.muted("· Alt+[/] switch · Esc back to main")}`,
-        Math.max(16, cols - 2),
-        "…",
-      ),
-    );
+    statusBanner = `${style.accentBold(`Viewing ${state.focusedAgentName}`)} ${style.muted("· Alt+[/] switch · Esc back to main")}`;
   } else if (state.busy) {
-    const spin = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length];
+    const spin = spinnerChar(state.spinnerFrame);
     const items = Array.isArray(state.items) ? state.items : [];
     const lastItem = items.length > 0 ? items[items.length - 1] : null;
     const isThinkingHidden = thoughtMode === "hidden" && lastItem?.type === "thought" && lastItem?.streaming;
     if (isThinkingHidden) {
       const tDur = lastItem.durationMs ? ` · ${formatDuration(lastItem.durationMs)}` : "";
-      statusPieces.push(`${style.thought(spin)} ${style.muted(`Working · thinking${tDur} · ^T show · Esc cancel`)}`);
+      statusBanner = `${style.thought(spin)} ${style.muted(`Working · thinking${tDur} · ^T show · Esc cancel`)}`;
     } else {
       const elapsed = state.turnStartedAt ? ` · ${formatDuration(Date.now() - state.turnStartedAt)}` : "";
-      statusPieces.push(`${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`);
+      statusBanner = `${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`;
     }
   }
 
-  if (statusPieces.length > 0) {
-    lines.push(` ${statusPieces.join(style.border("  ·  "))}`);
+  if (statusBanner) {
+    lines.push(` ${truncateAnsi(statusBanner, Math.max(16, cols - 2), "…")}`);
   }
 
   const ruleColor = isShellInput ? style.warn : style.border;
@@ -1028,13 +877,12 @@ export function renderComposerBlock(state, cols, style) {
   lines.push(footerLine);
 
   // Persistent multi-agent progress dock below the composer (only when Swarm / Subagents are active)
-  const dockRows = renderSwarmDock(state.multiAgent, cols, style, state.spinnerFrame, {
-    collapsed: Boolean(state.swarmDockCollapsed),
-    focusedMemberId: state.focusedAgentId || "",
-  });
-  for (const row of dockRows) {
-    lines.push(row);
-  }
+  lines.push(
+    ...renderSwarmDock(state.multiAgent, cols, style, state.spinnerFrame, {
+      collapsed: Boolean(state.swarmDockCollapsed),
+      focusedMemberId: state.focusedAgentId || "",
+    }),
+  );
 
   return {
     lines,
@@ -1067,8 +915,11 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
     }
     if (modal.detailPreview) {
       contentLines.push("");
-      for (const l of wrapAnsiText(style.muted(modal.detailPreview), innerWidth).slice(0, 6)) {
-        contentLines.push(l);
+      const wrapped = wrapAnsiText(style.muted(modal.detailPreview), innerWidth);
+      if (wrapped.length > 6) {
+        contentLines.push(...wrapped.slice(0, 5), style.warn(`… (+${wrapped.length - 5} more lines)`));
+      } else {
+        contentLines.push(...wrapped);
       }
     }
     contentLines.push("");
@@ -1096,8 +947,7 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
     if (items.length === 0) {
       contentLines.push(style.muted("No matching items."));
     } else {
-      const start = Math.max(0, Math.min(modal.selected - Math.floor(maxItems / 2), items.length - maxItems));
-      const slice = items.slice(start, start + maxItems);
+      const { start, slice } = sliceCenteredWindow(items, modal.selected, maxItems);
       for (let i = 0; i < slice.length; i += 1) {
         const entry = slice[i];
         const isSel = start + i === modal.selected;
@@ -1143,16 +993,13 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
     contentLines.push("");
     contentLines.push(style.muted("Press Esc or Enter to close"));
   } else if (modal.type === "artifact") {
-    const rendered = renderMarkdown(modal.content || "", innerWidth, style);
+    const rendered = safeRenderMarkdown(modal.content || "", innerWidth, style);
     const maxBodyRows = Math.max(4, height - 6);
     const maxScroll = Math.max(0, rendered.length - maxBodyRows);
     const offset = Math.max(0, Math.min(modal.scrollOffset || 0, maxScroll));
     modal.maxScroll = maxScroll;
     const slice = rendered.slice(offset, offset + maxBodyRows);
-    for (const l of slice) {
-      contentLines.push(l);
-    }
-    contentLines.push("");
+    contentLines.push(...slice, "");
     const pos = maxScroll > 0 ? ` (${offset + 1}-${Math.min(rendered.length, offset + maxBodyRows)}/${rendered.length})` : "";
     contentLines.push(style.muted(`↑/↓ PgUp/PgDn scroll · Ctrl+Y copy · Esc close${pos}`));
   }

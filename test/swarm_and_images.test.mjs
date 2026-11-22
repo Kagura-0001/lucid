@@ -10,7 +10,7 @@ import {
   normalizeDroppedPath,
   tryLoadDroppedImage,
 } from "../src/ui/files.mjs";
-import { MultiAgentTracker, renderSwarmBoardView, renderSwarmStrip } from "../src/ui/swarm.mjs";
+import { MultiAgentTracker, renderSwarmBoardView, renderSwarmDock } from "../src/ui/swarm.mjs";
 import { createThemeStyler, listThemes } from "../src/ui/themes.mjs";
 
 const OPAQUE_BG_REGEX = /\x1b\[(?:4[0-7]|48;|10[0-7])/;
@@ -125,10 +125,12 @@ test("MultiAgentTracker tracks Swarm, Subagents, Board messages, and Artifacts w
   for (const theme of listThemes()) {
     const style = createThemeStyler(theme.name, "truecolor");
 
-    const strip = renderSwarmStrip(tracker, 100, style, 1);
-    assert.ok(strip);
-    assert.equal(OPAQUE_BG_REGEX.test(strip), false);
-    assert.ok(displayWidth(strip) <= 100);
+    const dockRows = renderSwarmDock(tracker, 100, style, 1);
+    assert.ok(dockRows.length > 0);
+    for (const row of dockRows) {
+      assert.equal(OPAQUE_BG_REGEX.test(row), false);
+      assert.ok(displayWidth(row) <= 100);
+    }
 
     // Wide split-pane board
     const wide = renderSwarmBoardView(tracker, { selectedIdx: 1, tab: "detail", scrollOffset: 0 }, 104, 24, style, 2);

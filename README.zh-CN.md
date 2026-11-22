@@ -6,7 +6,7 @@
   <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="docs/reference.md">使用参考</a> · <a href="docs/tips.md">SSH、tmux 与 Swarm</a>
 </p>
 
-专为 **Google Antigravity（`agy acp`）** 及其他 [ACP](https://agentclientprotocol.com/) 编程 Agent 打造的透明背景、零依赖终端界面，纯 Node.js（`>= 20`）。
+专为 **Google Antigravity（`agy acp`）** 及其他 [ACP](https://agentclientprotocol.com/) 编程 Agent 打造的透明背景、零依赖终端界面，已收录进 [ACP 官方客户端列表](https://agentclientprotocol.com/get-started/clients)。纯 Node.js（`>= 20`）。
 
 <p align="center">
   <img src="assets/preview-main.svg" alt="lucid 预览" width="860" />
