@@ -1,6 +1,6 @@
 {
   "name": "lucid-acp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A transparent, flicker-free, zero-dependency terminal UI for Google Antigravity (agy acp) and any ACP coding agent",
   "type": "module",
   "license": "MIT",
@@ -22,6 +22,7 @@
   "files": [
     "bin",
     "src",
+    "docs",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"

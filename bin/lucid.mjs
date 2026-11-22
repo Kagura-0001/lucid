@@ -7,7 +7,7 @@ import { LucidApp } from "../src/app.mjs";
 import { AGENT_PRESETS, loadUserConfig, parseCliArgs, resolveAgentLaunch } from "../src/config.mjs";
 import { listThemes } from "../src/ui/themes.mjs";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 function formatAgeBrief(ts) {
   if (!ts) return "";

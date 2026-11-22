@@ -85,7 +85,7 @@ export class AcpClient extends EventEmitter {
           clientCapabilities: {},
           clientInfo: {
             name: "lucid",
-            version: "0.1.0",
+            version: "0.2.0",
           },
         },
         15000,
