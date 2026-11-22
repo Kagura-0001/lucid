@@ -12,6 +12,7 @@ import {
   handleModalInput,
   refreshPickerFilter,
   sliceViewportRows,
+  syncBoardTab,
 } from "./app/input.mjs";
 import { cancelLocalShell, runLocalShellCommand } from "./app/local_shell.mjs";
 import {
@@ -125,7 +126,7 @@ export class LucidApp {
     this.popup = null;
     this.dismissedPopupKey = null;
     this.boardOpen = false;
-    this.boardState = { selectedIdx: 0, tab: "board", scrollOffset: 0, maxDetailScroll: 0 };
+    this.boardState = { selectedIdx: 0, tab: "board", scrollOffset: 0, maxDetailScroll: 0, stickToBottom: true };
     this.activeLocalShell = null;
 
     this.selection = null;
@@ -550,11 +551,7 @@ export class LucidApp {
   // UI toggles & mode switching
   toggleSwarmBoard() {
     this.boardOpen = !this.boardOpen;
-    if (this.boardOpen) {
-      const entries = this.state.multiAgent.getRosterEntries();
-      this.boardState.selectedIdx = Math.min(this.boardState.selectedIdx, Math.max(0, entries.length - 1));
-      this.boardState.scrollOffset = 0;
-    }
+    if (this.boardOpen) syncBoardTab(this);
     this.scheduleRender();
   }
 
@@ -836,6 +833,7 @@ export class LucidApp {
         this.state.spinnerFrame,
       );
       this.boardState.maxDetailScroll = renderedBoard.maxDetailScroll;
+      this.boardState.scrollOffset = renderedBoard.scrollOffset;
       return {
         rows: [...headerLines, ...renderedBoard.rows],
         cursor: { visible: false, row: 0, col: 0 },

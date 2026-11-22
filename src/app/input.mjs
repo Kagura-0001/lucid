@@ -226,6 +226,7 @@ export function handleMouseEvent(app, event) {
   if (app.boardOpen) {
     if (wheelDir) {
       app.boardState.scrollOffset = clampScroll(app.boardState.scrollOffset, wheelDir * 3, app.boardState.maxDetailScroll);
+      app.boardState.stickToBottom = app.boardState.scrollOffset >= app.boardState.maxDetailScroll;
       app.scheduleRender(true);
     }
     return;
@@ -457,6 +458,15 @@ export function handleModalInput(app, event) {
   }
 }
 
+export function syncBoardTab(app, tabOverride = null) {
+  const entries = app.state.multiAgent.getRosterEntries();
+  app.boardState.selectedIdx = Math.min(app.boardState.selectedIdx, Math.max(0, entries.length - 1));
+  const sel = entries[app.boardState.selectedIdx];
+  app.boardState.tab = tabOverride || (sel?.kind === "board" ? "board" : "detail");
+  app.boardState.scrollOffset = 0;
+  app.boardState.stickToBottom = app.boardState.tab === "board";
+}
+
 export function handleBoardInput(app, event) {
   if (event.type !== "key") return;
   const entries = app.state.multiAgent.getRosterEntries();
@@ -466,22 +476,26 @@ export function handleBoardInput(app, event) {
     return;
   }
   if (event.name === "tab") {
-    app.boardState.tab = app.boardState.tab === "board" ? "detail" : "board";
-    app.boardState.scrollOffset = 0;
+    syncBoardTab(app, app.boardState.tab === "board" ? "detail" : "board");
     app.scheduleRender(true);
     return;
   }
   if ((event.name === "up" || event.name === "down") && entries.length > 0) {
     app.boardState.selectedIdx = wrapIndex(app.boardState.selectedIdx, event.name === "up" ? -1 : 1, entries.length);
-    const sel = entries[app.boardState.selectedIdx];
-    app.boardState.tab = sel?.kind === "board" ? "board" : "detail";
-    app.boardState.scrollOffset = 0;
+    syncBoardTab(app);
     app.scheduleRender(true);
     return;
   }
   if (event.name === "pageup" || event.name === "pagedown") {
     const delta = event.name === "pageup" ? -8 : 8;
     app.boardState.scrollOffset = clampScroll(app.boardState.scrollOffset, delta, app.boardState.maxDetailScroll);
+    app.boardState.stickToBottom = app.boardState.scrollOffset >= app.boardState.maxDetailScroll;
+    app.scheduleRender(true);
+    return;
+  }
+  if (event.name === "home" || event.name === "end") {
+    app.boardState.stickToBottom = event.name === "end";
+    app.boardState.scrollOffset = event.name === "end" ? app.boardState.maxDetailScroll : 0;
     app.scheduleRender(true);
   }
 }

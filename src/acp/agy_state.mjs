@@ -163,6 +163,42 @@ function extractRecentSteps(steps) {
   return timeline.slice(-MAX_RECENT_STEPS);
 }
 
+function extractBoardAgentProgress(board) {
+  const statusByAgent = new Map();
+  for (const line of Array.isArray(board) ? board : []) {
+    const text = String(line?.text || "").trim();
+    if (line?.kind === "brief") {
+      const targetMatch = /^@([a-z0-9][a-z0-9_-]*)/i.exec(text);
+      if (targetMatch) {
+        statusByAgent.set(targetMatch[1], "working");
+      }
+      continue;
+    }
+    const sender = String(line?.agent || "").trim();
+    if (!sender || sender === "coordinator") continue;
+    const body = text.replace(/^@\S+\s*/, "").trim();
+    if (/^\[done\]/i.test(body)) {
+      statusByAgent.set(sender, "done");
+    } else if (/^\[(?:blocked|stall)\]/i.test(body)) {
+      statusByAgent.set(sender, "blocked");
+    }
+  }
+  return statusByAgent;
+}
+
+function resolveTaskStatus(taskKey, taskValue, boardStatus, workerStateMap) {
+  if (taskValue && typeof taskValue === "object") {
+    const explicit = String(taskValue.status || taskValue.state || "").toLowerCase();
+    if (explicit) return explicit;
+  }
+  const fromBoard = boardStatus.get(taskKey);
+  if (fromBoard) return fromBoard;
+  const wState = workerStateMap.get(taskKey);
+  if (wState === "failed" || wState === "error") return "failed";
+  if (wState === "completed") return "done";
+  return "";
+}
+
 function countTaskStatuses(items) {
   let doneTasks = 0;
   let blockedTasks = 0;
@@ -174,17 +210,35 @@ function countTaskStatuses(items) {
   return { totalTasks: items.length, doneTasks, blockedTasks };
 }
 
-export function summarizePlan(plan) {
+export function summarizePlan(plan, board = [], workers = []) {
   if (!plan || typeof plan !== "object") return null;
   const goalTitle = typeof plan.goal === "string" ? plan.goal : plan.goal?.title || "";
   const goalLine = typeof plan.goal === "object" ? plan.goal?.line || "" : "";
+  const boardStatus = extractBoardAgentProgress(board);
+  const workerStateMap = new Map((workers || []).map((w) => [w.name, w.state]));
 
   const threads = [];
   for (const t of Array.isArray(plan.threads) ? plan.threads : []) {
     if (!t || typeof t !== "object") continue;
     const name = t.title || t.name || t.label || t.id || "thread";
-    const status = String(t.status || t.state || "working").toLowerCase();
-    const detail = t.detail || t.summary || t.line || t.worker || "";
+    let status = String(t.status || t.state || "").toLowerCase();
+    if (!status && Array.isArray(t.tasks) && t.tasks.length > 0) {
+      const memberStatuses = t.tasks.map((taskKey) =>
+        resolveTaskStatus(String(taskKey), plan.tasks?.[taskKey], boardStatus, workerStateMap),
+      );
+      if (memberStatuses.some((s) => s === "blocked" || s === "failed" || s === "error")) {
+        status = "failed";
+      } else if (memberStatuses.every((s) => s === "done" || s === "completed" || s === "finished")) {
+        status = "completed";
+      } else if (t.tasks.some((taskKey) => ["working", "running"].includes(workerStateMap.get(String(taskKey))))) {
+        status = "working";
+      } else {
+        status = "waiting";
+      }
+    } else if (!status) {
+      status = "working";
+    }
+    const detail = t.detail || t.summary || t.goal || t.line || t.worker || "";
     threads.push({ name: String(name), status, detail: String(detail) });
   }
 
@@ -192,8 +246,10 @@ export function summarizePlan(plan) {
   if (Array.isArray(plan.tasks)) {
     counts = countTaskStatuses(plan.tasks);
   } else if (plan.tasks && typeof plan.tasks === "object") {
-    const objEntries = Object.values(plan.tasks).filter((e) => e && typeof e === "object");
-    counts = { ...countTaskStatuses(objEntries), totalTasks: Object.keys(plan.tasks).length };
+    const resolvedEntries = Object.entries(plan.tasks).map(([key, value]) => ({
+      status: resolveTaskStatus(key, value, boardStatus, workerStateMap),
+    }));
+    counts = countTaskStatuses(resolvedEntries);
   }
   if (counts.totalTasks === 0 && threads.length > 0) {
     counts = countTaskStatuses(threads);
@@ -432,16 +488,16 @@ export class AgyStateWatcher {
       if (member.conversation_id === this.sessionId) continue;
       const phase = String(member.phase || "").toUpperCase();
       const isKilled = member.killed || phase === "KILLED";
+      const summaryRes = member.conversation_id ? this.readTranscriptSummary(member.conversation_id) : null;
+      if (summaryRes?.changed) changed = true;
+      const summary = summaryRes?.summary || null;
+
       let state;
-      let summary = null;
       if (isKilled) {
         state = "killed";
       } else if (phase && phase !== "RUNNING") {
         state = phase.toLowerCase();
-      } else if (member.conversation_id) {
-        const res = this.readTranscriptSummary(member.conversation_id);
-        summary = res.summary;
-        if (res.changed) changed = true;
+      } else if (summary) {
         // A swarm worker whose turn ended is asleep on the board, i.e. waiting.
         state = summary.phase === "idle" ? "waiting" : summary.phase;
       } else {
@@ -455,7 +511,7 @@ export class AgyStateWatcher {
         model: member.model || member.applied_model || "",
         workspace: member.workspace_mode || "",
         state,
-        activity: summary?.activity || "",
+        activity: !isKilled && (!phase || phase === "RUNNING") ? summary?.activity || "" : "",
         lastText: summary?.lastText || "",
         task: taskText,
         updatedAt: summary?.updatedAt || 0,
@@ -466,7 +522,7 @@ export class AgyStateWatcher {
     }
 
     if (!changed) return null;
-    const planSummary = summarizePlan(plan);
+    const planSummary = summarizePlan(plan, board, workers);
     this.snapshot = {
       sessionId: this.sessionId,
       subagentSignature,

@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 1,
+  "agyVersion": "1.5.14",
+  "acpFlags": [
+    "--add-dir",
+    "--agent",
+    "--app-data-dir",
+    "--app_data_dir",
+    "--cli_dir_name",
+    "--cli_log_file",
+    "--cloud_code_endpoint",
+    "--dangerously-skip-permissions",
+    "--disable-telemetry",
+    "--disable_telemetry",
+    "--gemini-dir",
+    "--gemini_dir",
+    "--help",
+    "--ide-mcp-port",
+    "--ide_mcp_port",
+    "--include-default-customizations",
+    "--is_google3_workspace",
+    "--is_google_internal",
+    "--log-file",
+    "--login",
+    "--override_user_agent_name",
+    "--process-per-session",
+    "--sandbox",
+    "--stdio",
+    "--use_stubby_auth",
+    "--worker"
+  ],
+  "cliSubcommands": [
+    "acp",
+    "agent",
+    "agents",
+    "changelog",
+    "help",
+    "install",
+    "mcp",
+    "mic-serve",
+    "models",
+    "plugin",
+    "plugins",
+    "remote-control",
+    "update"
+  ],
+  "builtinSwarmSkills": {
+    "native_swarm": {
+      "exists": true,
+      "bytes": 20850,
+      "sha256": "9193e18e748c351bfee97cabe95bd563f08dcde802670e37eb0b29c73d980032"
+    },
+    "swarm_pane": {
+      "exists": true,
+      "bytes": 2066,
+      "sha256": "64d9281a62c2568a54dffb5b446a93e580250611faeeb8fb0482f461e504e361"
+    },
+    "swarm_monitor": {
+      "exists": true,
+      "bytes": 5784,
+      "sha256": "eec457f3f332db4b7d472a29dc61a8140304a9058aabcceb624e3e8b12b2894f"
+    },
+    "swarm_narrator": {
+      "exists": true,
+      "bytes": 11626,
+      "sha256": "99b3200be99796e6377d3d8f32a283439f2d42afd3f1a418f49d1222bf5b289f"
+    }
+  },
+  "liveAcp": {
+    "ok": true,
+    "agentInfo": {
+      "name": "Antigravity ACP Server",
+      "version": "1.5.14"
+    },
+    "agentCapabilities": {
+      "loadSession": true,
+      "load_session": true,
+      "promptCapabilities": {
+        "image": true,
+        "audio": false,
+        "embeddedContext": true
+      },
+      "sessionCapabilities": {
+        "resume": {},
+        "close": {},
+        "load": {},
+        "list": {},
+        "additionalDirectories": {}
+      },
+      "session_capabilities": {
+        "resume": {},
+        "close": {},
+        "load": {},
+        "list": {},
+        "additionalDirectories": {}
+      },
+      "auth": {
+        "logout": {}
+      },
+      "_meta": {
+        "antigravity": {
+          "tier": true,
+          "systemPrompt": {
+            "append": true
+          }
+        }
+      }
+    },
+    "configOptions": [
+      {
+        "id": "model",
+        "category": "model",
+        "optionCount": 11
+      },
+      {
+        "id": "thought_level",
+        "category": "thought_level",
+        "optionCount": 4
+      },
+      {
+        "id": "mode",
+        "category": "mode",
+        "optionCount": 4
+      }
+    ],
+    "modes": [
+      "accept-edits",
+      "auto",
+      "default",
+      "plan"
+    ],
+    "modelCount": 27,
+    "availableCommands": [
+      "agy-customizations",
+      "agy-sync",
+      "antigravity-guide",
+      "boost",
+      "browser",
+      "compact",
+      "goal",
+      "grill-me",
+      "learn",
+      "plan",
+      "run-workflow",
+      "schedule",
+      "swarm",
+      "teamwork"
+    ]
+  }
+}

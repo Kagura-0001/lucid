@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { AgyStateWatcher, resolveAgyDataDir, summarizeTranscriptTail } from "../src/acp/agy_state.mjs";
+import { AgyStateWatcher, resolveAgyDataDir, summarizePlan, summarizeTranscriptTail } from "../src/acp/agy_state.mjs";
 import { stripAnsi } from "../src/term/unicode.mjs";
-import { MultiAgentTracker, renderSwarmBoardView, renderSwarmDock } from "../src/ui/swarm.mjs";
+import { MultiAgentTracker, renderMemberTimeline, renderSwarmBoardView, renderSwarmDock } from "../src/ui/swarm.mjs";
 import { createThemeStyler } from "../src/ui/themes.mjs";
 
 const SESSION = "11111111-aaaa-bbbb-cccc-000000000001";
@@ -123,6 +124,8 @@ test("AgyStateWatcher reads live swarm + subagent state and the strip names memb
     assert.equal(watcher.poll(), null, "an unchanged directory produces no new snapshot");
 
     assert.equal(snapshot.swarmTitle, "parser rewrite");
+    assert.equal(snapshot.planSummary.totalTasks, 1);
+    assert.equal(snapshot.planSummary.doneTasks, 1);
     const workerStates = Object.fromEntries(snapshot.workers.map((worker) => [worker.name, worker.state]));
     assert.deepEqual(workerStates, { parser: "working", verifier: "waiting", docs: "killed" });
     assert.equal(snapshot.workers.find((worker) => worker.name === "parser").activity, "run_command cargo test -p parser");
@@ -154,6 +157,7 @@ test("AgyStateWatcher reads live swarm + subagent state and the strip names memb
     const style = createThemeStyler("tokyo-night", "truecolor");
     const dock = renderSwarmDock(tracker, 140, style, 0).map(stripAnsi).join("\n");
     assert.ok(dock.includes('Swarm "parser rewrite"'), dock);
+    assert.ok(dock.includes("1/1 tasks"), dock);
     assert.ok(dock.includes("parser"), dock);
     assert.ok(dock.includes("run_command cargo test"), dock);
     assert.ok(dock.includes("verifier"), dock);
@@ -166,6 +170,127 @@ test("AgyStateWatcher reads live swarm + subagent state and the strip names memb
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+test("summarizePlan derives string-task and thread progress from board.jsonl posts", () => {
+  const plan = {
+    goal: { title: "Ship feature", line: "Build, test, document." },
+    tasks: { a: "Build module", b: "Run e2e suite", c: "Write docs" },
+    threads: [
+      { id: "t1", title: "Core", goal: "Build and test", tasks: ["a", "b"] },
+      { id: "t2", title: "Docs", goal: "Update reference", tasks: ["c"] },
+    ],
+  };
+  const board = [
+    { seq: 1, kind: "brief", agent: "coordinator", text: "@a build" },
+    { seq: 2, kind: "brief", agent: "coordinator", text: "@c docs" },
+    { seq: 3, agent: "a", text: "@coordinator [done] built module" },
+    { seq: 4, agent: "b", text: "@coordinator [blocked] missing fixture" },
+    { seq: 5, agent: "c", text: "@coordinator [done] draft ready" },
+    { seq: 6, kind: "brief", agent: "coordinator", text: "@c expand examples" },
+  ];
+  const workers = [
+    { name: "a", state: "waiting" },
+    { name: "b", state: "waiting" },
+    { name: "c", state: "working" },
+  ];
+  const summary = summarizePlan(plan, board, workers);
+  assert.equal(summary.totalTasks, 3);
+  assert.equal(summary.doneTasks, 1);
+  assert.equal(summary.blockedTasks, 1);
+  assert.equal(summary.threads[0].status, "failed");
+  assert.equal(summary.threads[0].detail, "Build and test");
+  assert.equal(summary.threads[1].status, "working");
+});
+
+test("non-RUNNING workers keep transcript steps/output, dock shows [done] summary, and board sticks to bottom", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "lucid-swarm-res-"));
+  try {
+    const sys = path.join(dataDir, "brain", SESSION, ".system_generated");
+    writeJson(path.join(sys, "swarm", "members.json"), {
+      title: "telemetry",
+      members: {
+        alpha: { conversation_id: WORKER_A, role: "worker", phase: "WAITING", killed: false, model: "neon" },
+      },
+    });
+    writeJson(path.join(sys, "swarm", "plan.json"), {
+      goal: { title: "Add telemetry" },
+      tasks: { alpha: "Implement exporter" },
+    });
+    const boardLines = [
+      { seq: 1, agent: "coordinator", text: "@alpha Build exporter", time: "2026-11-22 10:00:00", kind: "brief" },
+      ...Array.from({ length: 28 }, (_, i) => ({
+        seq: i + 2,
+        agent: "alpha",
+        text: `@coordinator progress step ${i + 2}`,
+        time: "2026-11-22 10:01:00",
+      })),
+      { seq: 30, agent: "alpha", text: "@coordinator [done] Built exporter + tests", time: "2026-11-22 10:05:00" },
+    ];
+    fs.writeFileSync(
+      path.join(sys, "swarm", "board.jsonl"),
+      boardLines.map((l) => JSON.stringify(l)).join("\n") + "\n",
+    );
+    writeTranscript(dataDir, WORKER_A, [
+      { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "read_file", args: { Path: "\"src/exp.mjs\"" } }] },
+      { step_index: 2, type: "GENERIC", status: "DONE" },
+      { step_index: 3, type: "PLANNER_RESPONSE", content: "Exporter implemented cleanly." },
+    ]);
+
+    const watcher = new AgyStateWatcher({ dataDir });
+    watcher.setSession(SESSION);
+    const snapshot = watcher.poll();
+    assert.ok(snapshot);
+    assert.equal(snapshot.workers[0].state, "waiting");
+    assert.equal(snapshot.workers[0].activity, "");
+    assert.ok(snapshot.workers[0].recentSteps.length >= 2);
+    assert.equal(snapshot.workers[0].lastText, "Exporter implemented cleanly.");
+
+    const tracker = new MultiAgentTracker();
+    tracker.applyAgyState(snapshot);
+    const style = createThemeStyler("transparent", "truecolor");
+
+    const dockText = renderSwarmDock(tracker, 100, style, 0).map(stripAnsi).join("\n");
+    assert.ok(dockText.includes("[done] Built exporter + tests"), dockText);
+
+    const alpha = tracker.getMemberById("swarm:alpha");
+    const memberTimeline = renderMemberTimeline(alpha, 100, style, 0).map(stripAnsi).join("\n");
+    assert.ok(memberTimeline.includes("Latest Board Post"), memberTimeline);
+    assert.ok(memberTimeline.includes("Built exporter + tests"), memberTimeline);
+    assert.ok(memberTimeline.includes("Exporter implemented cleanly."), memberTimeline);
+
+    const detailBoard = renderSwarmBoardView(tracker, { selectedIdx: 1, tab: "detail", scrollOffset: 0 }, 110, 24, style, 0);
+    const detailText = detailBoard.rows.map(stripAnsi).join("\n");
+    assert.ok(detailText.includes("Latest Board Post"), detailText);
+    assert.ok(detailText.includes("Built exporter + tests"), detailText);
+
+    const feedBoard = renderSwarmBoardView(
+      tracker,
+      { selectedIdx: 0, tab: "board", scrollOffset: 0, stickToBottom: true },
+      110,
+      16,
+      style,
+      0,
+    );
+    assert.ok(feedBoard.maxDetailScroll > 0);
+    assert.equal(feedBoard.scrollOffset, feedBoard.maxDetailScroll);
+    const feedText = feedBoard.rows.map(stripAnsi).join("\n");
+    assert.ok(feedText.includes("[done] Built exporter + tests"), feedText);
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("agy-sync probe_agy.mjs --no-live-acp --json produces structured output", () => {
+  const out = execFileSync(
+    process.execPath,
+    [".agents/skills/agy-sync/scripts/probe_agy.mjs", "--no-live-acp", "--json"],
+    { cwd: path.resolve("."), encoding: "utf8" },
+  );
+  const parsed = JSON.parse(out);
+  assert.ok(Array.isArray(parsed.current?.acpFlags));
+  assert.ok(Array.isArray(parsed.current?.cliSubcommands));
+  assert.equal(typeof parsed.diffs?.hasChanges, "boolean");
 });
 
 test("subagent state flips to killed when agy rewrites its state file", () => {

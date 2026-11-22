@@ -35,6 +35,7 @@ function createMemberRecord(kind, fields) {
     state: "working",
     brief: "",
     output: "",
+    latestPost: null,
     recentSteps: [],
     startedAt: now,
     updatedAt: now,
@@ -451,14 +452,26 @@ export class MultiAgentTracker {
       this.planSummary = snapshot.planSummary;
     }
 
-    // Briefs posted to the board: "@name ..." lines of kind "brief".
+    // Briefs posted to the board ("@name ..." of kind "brief") and latest status posts per worker.
     const briefByWorker = new Map();
+    const latestPostByWorker = new Map();
     for (const line of snapshot.board || []) {
       const lineText = sanitizeUntrustedText(line.text || "");
-      const mention = /^@([a-z0-9][a-z0-9_-]*)/i.exec(lineText);
-      if (line.kind === "brief" && mention) {
-        briefByWorker.set(mention[1], lineText.replace(/^@\S+\s*/, ""));
+      if (line.kind === "brief") {
+        const mention = /^@([a-z0-9][a-z0-9_-]*)/i.exec(lineText);
+        if (mention) briefByWorker.set(mention[1], lineText.replace(/^@\S+\s*/, ""));
+        continue;
       }
+      const sender = sanitizeUntrustedText(line.agent || "").trim();
+      if (!sender || sender === "coordinator" || !lineText.trim()) continue;
+      const bodyWithoutMention = lineText.replace(/^@\S+\s*/, "").trim();
+      const firstLine = bodyWithoutMention.split(/\r?\n/).find((l) => l.trim())?.trim() || "";
+      latestPostByWorker.set(sender, {
+        seq: line.seq,
+        text: lineText.trim(),
+        summary: firstLine,
+        isDone: /^\[done\]/i.test(bodyWithoutMention),
+      });
     }
 
     for (const diskWorker of snapshot.workers || []) {
@@ -478,6 +491,7 @@ export class MultiAgentTracker {
       worker.transcriptPath = diskWorker.transcriptPath;
       worker.recentSteps = Array.isArray(diskWorker.recentSteps) ? diskWorker.recentSteps : worker.recentSteps || [];
       worker.brief = worker.brief || briefByWorker.get(diskWorker.name) || worker.task || "";
+      worker.latestPost = latestPostByWorker.get(diskWorker.name) || worker.latestPost || null;
       if (diskWorker.lastText) worker.output = sanitizeUntrustedText(diskWorker.lastText);
       worker.updatedAt = diskWorker.updatedAt || Date.now();
       if (diskWorker.startedAt) worker.startedAt = diskWorker.startedAt;
@@ -724,6 +738,9 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
       } else {
         bodyStr = actText;
       }
+    } else if (member.latestPost?.summary) {
+      const paintPost = member.latestPost.isDone ? style.success : style.muted;
+      bodyStr = paintPost(truncateAnsi(member.latestPost.summary, bodyBudget, "…"));
     } else {
       const mutedAct = taskRaw && member.state === "waiting" ? `${activityRaw} · ${taskRaw}` : activityRaw;
       bodyStr = style.muted(truncateAnsi(mutedAct, bodyBudget, "…"));
@@ -772,8 +789,20 @@ function renderMemberHeader(member, width, style, spinnerFrame, { live }) {
   return out;
 }
 
+function pushMarkdownSection(out, heading, text, width, style) {
+  out.push(style.accent(heading));
+  for (const ml of safeRenderMarkdown(text, Math.max(16, width - 2), style)) {
+    out.push(ml ? `  ${ml}` : "");
+  }
+}
+
 function renderMemberSections(member, width, style, spinnerFrame, { live }) {
   const out = [];
+  if (!live && member.latestPost?.text) {
+    pushMarkdownSection(out, "Latest Board Post", member.latestPost.text, width, style);
+    out.push("");
+  }
+
   if (member.brief) {
     out.push(style.accent(live ? "Assignment" : "Assignment / Brief"));
     const paintBrief = live ? style.muted : style.text;
@@ -805,15 +834,22 @@ function renderMemberSections(member, width, style, spinnerFrame, { live }) {
     if (!live) out.push("");
   }
 
-  if (!live || steps.length === 0) {
-    if (member.output) {
-      out.push(style.accent("Latest Output"));
-      for (const ol of safeRenderMarkdown(member.output, Math.max(16, width - 2), style)) {
-        out.push(ol ? `  ${ol}` : "");
-      }
-    } else {
-      out.push(style.muted(live ? "Waiting for transcript activity…" : "Waiting for output updates…"));
-    }
+  const lastMessageStep = [...steps].reverse().find((s) => s.kind === "message");
+  const showLatestOutput = Boolean(
+    member.output &&
+      (!live || (member.output !== lastMessageStep?.text && member.output !== member.latestPost?.text)),
+  );
+  if (showLatestOutput) {
+    pushMarkdownSection(out, "Latest Output", member.output, width, style);
+    if (live && member.latestPost?.text) out.push("");
+  }
+
+  if (live && member.latestPost?.text) {
+    pushMarkdownSection(out, "Latest Board Post", member.latestPost.text, width, style);
+  }
+
+  if (!showLatestOutput && !member.latestPost?.text && (!live || steps.length === 0)) {
+    out.push(style.muted(live ? "Waiting for transcript activity…" : "Waiting for output updates…"));
   }
   return out;
 }
@@ -827,10 +863,10 @@ function formatRosterRow(entry, isSelected, width, style, spinnerFrame, includeA
     : ` ${icon} ${style.text(rawName)}${age ? style.muted(age) : ""}`;
 }
 
-function sliceScrollableLines(lines, rawOffset, height) {
+function sliceScrollableLines(lines, rawOffset, height, stickToBottom = false) {
   const maxDetailScroll = Math.max(0, lines.length - height);
-  const offset = Math.max(0, Math.min(rawOffset || 0, maxDetailScroll));
-  return { maxDetailScroll, slice: lines.slice(offset, offset + height) };
+  const offset = stickToBottom ? maxDetailScroll : Math.max(0, Math.min(rawOffset || 0, maxDetailScroll));
+  return { maxDetailScroll, scrollOffset: offset, slice: lines.slice(offset, offset + height) };
 }
 
 /**
@@ -869,12 +905,13 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
       `  ${style.muted("Press Ctrl+B or Esc to return to conversation.")}`,
     ];
     while (lines.length < safeHeight) lines.push("");
-    return { rows: lines.slice(0, safeHeight), maxDetailScroll: 0 };
+    return { rows: lines.slice(0, safeHeight), maxDetailScroll: 0, scrollOffset: 0 };
   }
 
   const selectedIdx = Math.max(0, Math.min(boardState.selectedIdx || 0, entries.length - 1));
   const selectedEntry = entries[selectedIdx];
   const activeTab = selectedEntry.kind === "board" ? "board" : (boardState.tab || "detail");
+  const stickToBottom = Boolean(boardState.stickToBottom && activeTab === "board");
 
   const useSplit = cols >= 84;
   const contentHeight = Math.max(4, safeHeight - 2); // reserve top bar + bottom hint
@@ -952,10 +989,11 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
       leftLines.push(padEndVisible(row, leftWidth));
     }
 
-    const { maxDetailScroll, slice: rightSlice } = sliceScrollableLines(
+    const { maxDetailScroll, scrollOffset, slice: rightSlice } = sliceScrollableLines(
       buildRightContent(rightWidth),
       boardState.scrollOffset,
       contentHeight,
+      stickToBottom,
     );
 
     const rows = [truncateAnsi(topHeader, cols)];
@@ -965,7 +1003,7 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
       rows.push(` ${lText} ${style.border("│")} ${rText}`);
     }
     rows.push(truncateAnsi(bottomHint, cols));
-    return { rows, maxDetailScroll };
+    return { rows, maxDetailScroll, scrollOffset };
   }
 
   // Narrow terminal stacked layout
@@ -979,10 +1017,11 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
   });
 
   const detailHeight = Math.max(2, contentHeight - rosterRows.length - 1);
-  const { maxDetailScroll, slice: detailSlice } = sliceScrollableLines(
+  const { maxDetailScroll, scrollOffset, slice: detailSlice } = sliceScrollableLines(
     buildRightContent(innerWidth),
     boardState.scrollOffset,
     detailHeight,
+    stickToBottom,
   );
   while (detailSlice.length < detailHeight) detailSlice.push("");
 
@@ -993,5 +1032,5 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
     ...detailSlice.map((l) => ` ${truncateAnsi(l, innerWidth)}`),
     truncateAnsi(bottomHint, cols),
   ];
-  return { rows: rows.slice(0, safeHeight), maxDetailScroll };
+  return { rows: rows.slice(0, safeHeight), maxDetailScroll, scrollOffset };
 }
