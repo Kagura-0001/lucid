@@ -24,9 +24,9 @@
 需要 **Node.js >= 20** 和任一 ACP 后端（`agy`、`gemini`、`opencode`、`goose`、`claude-code-acp`、`codex-acp` 等）。
 
 ```bash
-git clone https://github.com/Kagura-0001/lucid.git
-cd lucid
-npm link
+npm install -g lucid-acp
+# 或免安装直接试用：
+npx lucid-acp
 ```
 
 ## 快速开始
@@ -39,6 +39,8 @@ lucid bg "跑完测试并修复"      # 后台运行任务（随时用 lucid -r 
 lucid --theme tokyo-night     # 切换配色
 lucid --agent opencode        # 使用其他 ACP 后端
 ```
+
+在界面里输入 `!命令`（如 `!git status`）可直接本地执行 shell 命令，不走模型。
 
 ## 文档
 

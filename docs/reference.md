@@ -31,6 +31,7 @@ lucid bg stop <id|all>        # stop background session(s)
 | Shortcut / Command | Action |
 | :--- | :--- |
 | `Enter` | Send prompt (or steer while running) |
+| `!<command>` | Run a local shell command directly in the workspace (bypasses agent; `Esc`/`Ctrl+C` cancels) |
 | `Ctrl+J` / `Shift+Enter` / `Alt+Enter` / `\`+`Enter` | Insert newline in composer |
 | `Esc` | Close popup/modal, exit agent inspect view, cancel turn, or jump to bottom |
 | `Shift+Tab` | Cycle mode (`default` / `accept-edits` / `auto` / `plan` / session-only `bypass`) |

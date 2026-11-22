@@ -338,7 +338,7 @@ function generateHeroSvg() {
   <!-- Title & Tagline -->
   <text x="188" y="114" font-family="${SANS_FONT}" font-size="52" font-weight="800" letter-spacing="-1.2" fill="url(#wordmark-grad)">lucid</text>
   <rect x="318" y="84" width="66" height="24" rx="12" fill="#7dcfff" fill-opacity="0.12" stroke="#7dcfff" stroke-opacity="0.35" stroke-width="1" />
-  <text x="351" y="100" text-anchor="middle" font-family="${MONO_FONT}" font-size="12" font-weight="700" fill="#7dcfff">v0.2.0</text>
+  <text x="351" y="100" text-anchor="middle" font-family="${MONO_FONT}" font-size="12" font-weight="700" fill="#7dcfff">v0.2.1</text>
 
   <text x="188" y="150" font-family="${SANS_FONT}" font-size="18.5" font-weight="500" fill="#b7c3e3">Transparent, flicker-free terminal UI for Antigravity &amp; ACP coding agents</text>
   ${pillSvg}

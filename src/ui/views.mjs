@@ -443,6 +443,67 @@ function renderAssistantItem(item, contentWidth, style) {
   return out;
 }
 
+function renderShellItem(item, contentWidth, style, state) {
+  const out = [];
+  const spinner = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length];
+  const isRunning = item.status === "running";
+  const isCancelled = item.status === "cancelled";
+  const isFailure = item.status === "failed" || (typeof item.exitCode === "number" && item.exitCode !== 0);
+
+  let lead;
+  if (isRunning) {
+    lead = `${style.warn(spinner)} ${style.warnBold("!")}`;
+  } else if (isFailure) {
+    lead = `${style.error("✗")} ${style.errorBold("!")}`;
+  } else if (isCancelled) {
+    lead = `${style.muted("○")} ${style.muted("!")}`;
+  } else {
+    lead = style.warnBold("!");
+  }
+
+  const metaParts = [];
+  if (isFailure) {
+    metaParts.push(typeof item.exitCode === "number" && item.exitCode !== 0 ? `exit ${item.exitCode}` : "failed");
+  } else if (isCancelled) {
+    metaParts.push("cancelled");
+  }
+  if (item.durationMs >= 1000) {
+    metaParts.push(formatDuration(item.durationMs));
+  }
+  const metaTag = metaParts.length > 0
+    ? (isFailure ? style.error(`  (${metaParts.join(" · ")})`) : style.muted(`  (${metaParts.join(" · ")})`))
+    : "";
+
+  const cmdRaw = String(item.command || "").replace(/\r?\n/g, " ").trim();
+  const cmdBudget = Math.max(16, contentWidth - displayWidth(lead) - displayWidth(metaTag) - 4);
+  out.push(`  ${lead} ${style.bold(truncateAnsi(cmdRaw, cmdBudget, "…"))}${metaTag}`);
+
+  const rawOutput = String(item.output || "").replace(/\r\n/g, "\n");
+  if (rawOutput.trim()) {
+    const rawLines = rawOutput.split("\n");
+    while (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") {
+      rawLines.pop();
+    }
+    const maxOut = state.expandTools ? 120 : 16;
+    const slice = rawLines.slice(0, maxOut);
+    const bodyWidth = Math.max(16, contentWidth - 6);
+    for (const line of slice) {
+      const colored = isFailure ? style.error(line.replace(/\t/g, "    ")) : style.muted(line.replace(/\t/g, "    "));
+      const wrapped = wrapAnsiLine(colored, bodyWidth);
+      for (const wl of wrapped) {
+        out.push(`    ${style.border("│")} ${wl}`);
+      }
+    }
+    if (rawLines.length > maxOut) {
+      out.push(`    ${style.border("│")} ${style.muted(`… +${rawLines.length - maxOut} more lines (^O expand)`)}`);
+    }
+  } else if (!isRunning && !isCancelled && !isFailure) {
+    out.push(`    ${style.border("└")} ${style.muted("(no output)")}`);
+  }
+  out.push("");
+  return out;
+}
+
 function renderNoticeItem(item, contentWidth, style) {
   const marker =
     item.level === "error"
@@ -467,6 +528,8 @@ function isCacheableTimelineItem(item, thoughtMode) {
     case "notice":
     case "plan":
       return true;
+    case "shell":
+      return item.status !== "running";
     case "tool":
       return ["completed", "failed", "error", "cancelled"].includes(item.status);
     case "assistant":
@@ -609,6 +672,14 @@ export function renderTimeline(state, cols, style) {
           );
           pushLines(noticeLines);
           lastEmittedType = "notice";
+          continue;
+        }
+        if (item.type === "shell") {
+          const shellLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+            renderShellItem(item, contentWidth, style, state),
+          );
+          pushLines(shellLines);
+          lastEmittedType = "shell";
         }
       }
       flushArchivedSegment();
@@ -747,6 +818,15 @@ export function renderTimeline(state, cols, style) {
         );
         pushLines(noticeLines);
         lastEmittedType = "notice";
+        continue;
+      }
+
+      if (item.type === "shell") {
+        const shellLines = renderCachedTimelineItem(item, cols, contentWidth, style, state, thoughtMode, () =>
+          renderShellItem(item, contentWidth, style, state),
+        );
+        pushLines(shellLines);
+        lastEmittedType = "shell";
       }
     }
 
@@ -815,6 +895,8 @@ export function renderComposerBlock(state, cols, style) {
 
   const thoughtMode = resolveThoughtMode(state);
 
+  const isShellInput = !state.activeModalType && state.composer.text.startsWith("!");
+
   // Optional status strip right above the composer hairline
   const statusPieces = [];
   if (state.activeModalType === "permission") {
@@ -829,6 +911,14 @@ export function renderComposerBlock(state, cols, style) {
     statusPieces.push(
       truncateAnsi(
         `${style.accent("▸ Picker open")} ${style.muted("· type to filter, ↑/↓ + Enter to select, Esc to close")}`,
+        Math.max(16, cols - 2),
+        "…",
+      ),
+    );
+  } else if (isShellInput) {
+    statusPieces.push(
+      truncateAnsi(
+        `${style.warnBold("! Local shell")} ${style.muted("· runs directly in workspace (bypasses agent) · Enter run · Esc clear")}`,
         Math.max(16, cols - 2),
         "…",
       ),
@@ -859,13 +949,16 @@ export function renderComposerBlock(state, cols, style) {
     lines.push(` ${statusPieces.join(style.border("  ·  "))}`);
   }
 
-  lines.push(style.border("─".repeat(cols)));
+  const ruleColor = isShellInput ? style.warn : style.border;
+  lines.push(ruleColor("─".repeat(cols)));
 
   const composerTopOffset = lines.length;
   const isEmpty = state.composer.isEmpty();
 
   for (let i = 0; i < layout.lines.length; i += 1) {
-    const promptPrefix = i === 0 ? ` ${style.accentBold("❯")} ` : ` ${style.border("│")} `;
+    const promptPrefix = i === 0
+      ? ` ${isShellInput ? style.warnBold("!") : style.accentBold("❯")} `
+      : ` ${ruleColor("│")} `;
     if (isEmpty && i === 0) {
       const placeholder =
         state.activeModalType === "permission"
@@ -876,14 +969,14 @@ export function renderComposerBlock(state, cols, style) {
               ? `Viewing ${state.focusedAgentName} · Esc back to main, or message coordinator…`
               : state.busy
                 ? "Type to steer the running turn…"
-                : "Message agent…  (/ commands · @ files · Shift+Tab mode)";
+                : "Message agent…  (/ commands · ! shell · @ files · Shift+Tab mode)";
       lines.push(`${promptPrefix}${style.muted(truncateAnsi(placeholder, inputWidth, "…"))}`);
     } else {
       lines.push(`${promptPrefix}${stylePastedTokens(layout.lines[i], (part) => part, style)}`);
     }
   }
 
-  lines.push(style.border("─".repeat(cols)));
+  lines.push(ruleColor("─".repeat(cols)));
 
   // Render active toasts or scroll-position badge in-place inside the fixed footer
   // line so scrolling or toasts never shift viewport height or trigger full redraws.
@@ -1025,6 +1118,7 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
   } else if (modal.type === "help") {
     const rows = [
       ["Enter", "Send prompt (or steer while running)"],
+      ["!<command>", "Run a local shell command directly (bypasses agent)"],
       ["Ctrl+J / Shift+Enter", "Insert newline in composer"],
       ["Esc", "Cancel running turn / close popup or modal"],
       ["Shift+Tab", "Cycle execution mode (default / accept-edits / auto / plan / bypass)"],

@@ -298,3 +298,65 @@ test("Swarm dock renders below composer with plan progress, inspect switching, a
   app.handleMainKey({ type: "key", name: "b", ctrl: false, alt: true, shift: false });
   assert.equal(app.state.swarmDockCollapsed, false);
 });
+
+test("Claude-style !command runs local shell directly without calling ACP and highlights composer in shell mode", async () => {
+  const style = createThemeStyler("tokyo-night", "truecolor");
+  const composer = new Composer();
+  composer.setText("!echo hello-lucid");
+
+  const compBlock = renderComposerBlock(
+    {
+      cwd: "/tmp",
+      busy: false,
+      spinnerFrame: 0,
+      scrollOffset: 0,
+      mouseCapture: true,
+      expandTools: false,
+      thoughtMode: "fold",
+      composer,
+    },
+    100,
+    style,
+  );
+  const compPlain = compBlock.lines.map(stripAnsi).join("\n");
+  assert.ok(compPlain.includes("! Local shell"), compPlain);
+  assert.ok(compPlain.includes(" ! !echo hello-lucid"), compPlain);
+
+  const app = new LucidApp({ cwd: "/tmp" });
+  app.scheduleRender = () => {};
+  let sentToAgent = false;
+  app.sendUserPrompt = () => {
+    sentToAgent = true;
+  };
+
+  app.state.composer.setText("!printf 'line1\\nline2\\n'");
+  app.submitComposer();
+  assert.equal(sentToAgent, false, "!command must bypass ACP agent");
+
+  // Wait for local shell process to exit
+  const deadline = Date.now() + 3000;
+  while (app.activeLocalShell && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(app.activeLocalShell, null);
+  const shellItem = app.state.items.find((it) => it.type === "shell");
+  assert.ok(shellItem);
+  assert.equal(shellItem.status, "completed");
+  assert.equal(shellItem.exitCode, 0);
+  assert.ok(shellItem.output.includes("line1"));
+
+  for (const theme of listThemes()) {
+    const themeStyle = createThemeStyler(theme.name, "truecolor");
+    const lines = renderTimeline(
+      { cwd: "/tmp", items: app.state.items, thoughtMode: "fold", expandTools: false, spinnerFrame: 0 },
+      96,
+      themeStyle,
+    );
+    const plain = lines.map(stripAnsi).join("\n");
+    assert.ok(plain.includes("line1"));
+    for (const line of lines) {
+      assert.equal(OPAQUE_BG_REGEX.test(line), false, `Opaque bg in shell item (${theme.name})`);
+      assert.ok(displayWidth(line) <= 96, `Shell item overflow (${theme.name}): ${stripAnsi(line)}`);
+    }
+  }
+});

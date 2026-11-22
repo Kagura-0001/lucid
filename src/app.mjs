@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { AgyStateWatcher, resolveAgyDataDir } from "./acp/agy_state.mjs";
 import { findLiveBgSession, listLiveBgSessions } from "./acp/bg_registry.mjs";
@@ -198,6 +199,7 @@ export class LucidApp {
     this.dismissedPopupKey = null;
     this.boardOpen = false;
     this.boardState = { selectedIdx: 0, tab: "board", scrollOffset: 0, maxDetailScroll: 0 };
+    this.activeLocalShell = null;
 
     // Mouse selection over the timeline (see ui/selection.mjs) and the layout of the
     // last rendered frame, used to map screen rows to timeline lines and patch
@@ -1862,6 +1864,10 @@ export class LucidApp {
         this.scheduleRender(true);
         return;
       }
+      if (this.activeLocalShell) {
+        this.cancelLocalShell();
+        return;
+      }
       if (this.state.busy && this.state.sessionId) {
         this.acp.cancelTurn(this.state.sessionId);
         this.showToast("Cancellation requested…");
@@ -1971,6 +1977,15 @@ export class LucidApp {
         this.state.scrollOffset = 0;
         this.showToast("Returned to main conversation");
         this.scheduleRender(true);
+        return;
+      }
+      if (this.state.composer.text.startsWith("!")) {
+        this.state.composer.clear();
+        this.scheduleRender(true);
+        return;
+      }
+      if (this.activeLocalShell) {
+        this.cancelLocalShell();
         return;
       }
       if (this.state.busy && this.state.sessionId) {
@@ -2266,6 +2281,17 @@ export class LucidApp {
     this.popup = null;
     this.state.scrollOffset = 0;
 
+    if (fullRaw.startsWith("!")) {
+      const shellCmd = fullRaw.slice(1).trim();
+      if (!shellCmd) {
+        this.pushNotice("info", "Usage: !<shell command>  (runs directly in your workspace without calling the agent)");
+        this.scheduleRender(true);
+        return;
+      }
+      this.runLocalShellCommand(shellCmd);
+      return;
+    }
+
     if (fullRaw.startsWith("/") && !fullRaw.includes("\n")) {
       const spaceIdx = fullRaw.indexOf(" ");
       const cmdName = (spaceIdx === -1 ? fullRaw.slice(1) : fullRaw.slice(1, spaceIdx)).toLowerCase();
@@ -2325,6 +2351,108 @@ export class LucidApp {
       this.boardState.scrollOffset = Math.min(this.boardState.maxDetailScroll || 0, this.boardState.scrollOffset + 8);
       this.scheduleRender(true);
     }
+  }
+
+  runLocalShellCommand(command) {
+    if (this.activeLocalShell) {
+      this.showToast("A local shell command is already running (press Esc or Ctrl+C to stop it)", "error");
+      this.scheduleRender(true);
+      return;
+    }
+    const item = {
+      type: "shell",
+      command,
+      cwd: this.cwd,
+      status: "running",
+      output: "",
+      exitCode: null,
+      startedAt: Date.now(),
+      durationMs: 0,
+      _rev: 0,
+    };
+    this.state.items.push(item);
+    this.state.scrollOffset = 0;
+
+    const shellBin = process.env.SHELL || "/bin/bash";
+    const child = spawn(shellBin, ["-lc", command], {
+      cwd: this.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+
+    const MAX_SHELL_OUTPUT = 256 * 1024;
+    let truncated = false;
+    const appendOutput = (chunk) => {
+      if (truncated) return;
+      const text = chunk.toString("utf8");
+      if (!text) return;
+      if (item.output.length + text.length > MAX_SHELL_OUTPUT) {
+        item.output += text.slice(0, Math.max(0, MAX_SHELL_OUTPUT - item.output.length));
+        item.output += "\n… (output truncated at 256 KB)";
+        truncated = true;
+      } else {
+        item.output += text;
+      }
+      item._rev += 1;
+      this.scheduleRender();
+    };
+
+    child.stdout?.on("data", appendOutput);
+    child.stderr?.on("data", appendOutput);
+
+    const record = { child, item, cancelled: false };
+    this.activeLocalShell = record;
+
+    child.on("error", (err) => {
+      if (this.activeLocalShell === record) {
+        this.activeLocalShell = null;
+      }
+      item.status = "failed";
+      item.exitCode = 1;
+      item.durationMs = Date.now() - item.startedAt;
+      item.output = item.output ? `${item.output}\n${err.message}` : err.message;
+      item._rev += 1;
+      this.scheduleRender(true);
+    });
+
+    child.on("close", (code) => {
+      if (this.activeLocalShell === record) {
+        this.activeLocalShell = null;
+      }
+      item.durationMs = Date.now() - item.startedAt;
+      if (record.cancelled) {
+        item.status = "cancelled";
+      } else {
+        item.exitCode = typeof code === "number" ? code : 1;
+        item.status = item.exitCode === 0 ? "completed" : "failed";
+      }
+      item._rev += 1;
+      this.scheduleRender(true);
+    });
+
+    this.scheduleRender(true);
+  }
+
+  cancelLocalShell() {
+    const active = this.activeLocalShell;
+    if (!active) return;
+    active.cancelled = true;
+    try {
+      if (process.platform !== "win32" && active.child.pid) {
+        process.kill(-active.child.pid, "SIGTERM");
+      } else {
+        active.child.kill("SIGTERM");
+      }
+    } catch {
+      try {
+        active.child.kill("SIGKILL");
+      } catch {
+        // Ignore
+      }
+    }
+    this.showToast("Cancelled local shell command");
+    this.scheduleRender(true);
   }
 
   toggleSwarmBoard() {
@@ -3078,6 +3206,9 @@ export class LucidApp {
     if (this.spinnerTimer) {
       clearInterval(this.spinnerTimer);
       this.spinnerTimer = null;
+    }
+    if (this.activeLocalShell) {
+      this.cancelLocalShell();
     }
     if (this.agyStateTimer) {
       clearInterval(this.agyStateTimer);

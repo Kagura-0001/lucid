@@ -24,9 +24,9 @@ A transparent-background, zero-dependency TUI for **Google Antigravity (`agy acp
 Requires **Node.js >= 20** and an ACP agent (`agy`, `gemini`, `opencode`, `goose`, `claude-code-acp`, `codex-acp`, etc.).
 
 ```bash
-git clone https://github.com/Kagura-0001/lucid.git
-cd lucid
-npm link
+npm install -g lucid-acp
+# or try without installing:
+npx lucid-acp
 ```
 
 ## Quick Start
@@ -39,6 +39,8 @@ lucid bg "run tests and fix"  # run detached in the background
 lucid --theme tokyo-night     # pick a palette
 lucid --agent opencode        # use another ACP backend
 ```
+
+Inside lucid, prefix any prompt with `!` (e.g. `!git status`) to run a local shell command directly without calling the agent.
 
 ## Docs
 
