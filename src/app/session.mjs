@@ -1,7 +1,8 @@
 import { findLiveBgSession, listLiveBgSessions, terminatePid } from "../acp/bg_registry.mjs";
-import { AcpClient, fetchAgyQuota } from "../acp/client.mjs";
+import { AcpClient, fetchAgyQuota, hotSwapAcpClient } from "../acp/client.mjs";
 import { HostAcpClient, spawnSessionHost } from "../acp/host_client.mjs";
-import { extractChunkText, matchByIdOrPrefix } from "../acp/protocol.mjs";
+import { extractChunkText, findConfigOption, matchByIdOrPrefix } from "../acp/protocol.mjs";
+import { saveUserConfig, supportsNativeBypassFlag, withDangerouslySkipPermissions } from "../config.mjs";
 import { sanitizeUntrustedText } from "../term/unicode.mjs";
 import { formatRelativeTime, isToolTerminalStatus } from "../ui/format.mjs";
 import { extractCleanOutputPreview, parseExitCode } from "../ui/tool_format.mjs";
@@ -91,7 +92,7 @@ export function resetConversationState(
 
 export function bindAcpClient(app, client) {
   client.on("sessionUpdate", (params) => {
-    if (client !== app.acp) return;
+    if (client !== app.acp || app.suppressReplayEvents) return;
     handleSessionUpdate(app, params);
   });
 
@@ -135,6 +136,159 @@ function seedComposerHistoryFromItems(app) {
   }
 }
 
+export async function syncSessionBypass(app, enabled, { modeId = "" } = {}) {
+  const target = Boolean(enabled);
+  app.state.sessionBypass = target;
+  app.pendingNativeBypass = null;
+  const hasRunningMembers = Boolean(app.state.multiAgent?.hasRunningMembers?.());
+
+  if (!app.acp) {
+    return { ok: true, nativeBypass: false, restarted: false, deferred: false };
+  }
+
+  if (app.acp.isHosted) {
+    const res = await app.acp.setBypassPermissions(target, { modeId, hasRunningMembers });
+    if (res?.sessionMeta) {
+      app.applySessionMetadata(res.sessionMeta);
+    }
+    if (res?.modeId) {
+      app.state.modeId = res.modeId;
+    }
+    if (typeof res?.nativeBypass === "boolean") {
+      app.state.nativeBypassActive = res.nativeBypass;
+    }
+    if (res?.deferred) {
+      app.pendingNativeBypass = { enabled: target, modeId };
+    }
+    return res || { ok: false, nativeBypass: app.state.nativeBypassActive, restarted: false, deferred: false };
+  }
+
+  const canHotSwapDirect =
+    supportsNativeBypassFlag(app.launchSpec) &&
+    !app.state.launchBypass &&
+    Boolean(app.state.sessionId) &&
+    typeof app.acp.stop === "function" &&
+    (typeof app.acp.resumeSession === "function" || typeof app.acp.loadSession === "function");
+
+  if (!canHotSwapDirect) {
+    if (typeof app.acp.setBypassPermissions === "function") {
+      app.acp.setBypassPermissions(target);
+    }
+    return { ok: true, nativeBypass: false, restarted: false, deferred: false };
+  }
+
+  if (target === Boolean(app.state.nativeBypassActive)) {
+    return { ok: true, nativeBypass: app.state.nativeBypassActive, restarted: false, deferred: false };
+  }
+
+  if (app.state.busy || hasRunningMembers) {
+    app.pendingNativeBypass = { enabled: target, modeId };
+    return { ok: true, nativeBypass: app.state.nativeBypassActive, restarted: false, deferred: true };
+  }
+
+  const nextLaunchSpec = withDangerouslySkipPermissions(app.launchSpec, target);
+  const restoreMode = modeId || (target ? resolveModeId(app, "auto") || "auto" : app.state.modeId);
+  const sessionMeta = {
+    availableCommands: app.state.agentCommands,
+    configOptions: app.state.configOptions,
+    modes: { availableModes: app.state.modes, currentModeId: app.state.modeId },
+    models: { availableModels: app.state.models },
+  };
+  try {
+    const { updates } = await hotSwapAcpClient({
+      currentClient: app.acp,
+      nextLaunchSpec,
+      sessionId: app.state.sessionId,
+      cwd: app.cwd,
+      modeId: restoreMode,
+      sessionMeta,
+      onBindNext: (nextAcp) => {
+        app.acp = nextAcp;
+        bindAcpClient(app, nextAcp);
+      },
+      onReplaySuppressed: (flag) => {
+        app.suppressReplayEvents = flag;
+      },
+    });
+    for (const meta of updates) {
+      if (meta) app.applySessionMetadata(meta);
+    }
+    app.launchSpec = nextLaunchSpec;
+    app.state.nativeBypassActive = target;
+    return { ok: true, nativeBypass: target, restarted: true, deferred: false };
+  } catch (err) {
+    return { ok: false, nativeBypass: app.state.nativeBypassActive, restarted: false, deferred: false, error: err?.message };
+  }
+}
+
+export function maybeFlushPendingNativeBypass(app) {
+  if (
+    !app.pendingNativeBypass ||
+    app.exiting ||
+    app.nativeBypassFlushing ||
+    app.state.busy ||
+    app.state.multiAgent?.hasRunningMembers?.()
+  ) {
+    return;
+  }
+  const pending = app.pendingNativeBypass;
+  app.pendingNativeBypass = null;
+  app.nativeBypassFlushing = true;
+  syncSessionBypass(app, pending.enabled, { modeId: pending.modeId })
+    .then((res) => {
+      if (app.exiting || !res?.restarted) return;
+      app.showToast(
+        pending.enabled
+          ? "Bypass backend upgraded — Swarm sub-workers now auto-approved"
+          : "Bypass backend restored — standard permissions active",
+      );
+      app.scheduleRender();
+    })
+    .catch(() => {})
+    .finally(() => {
+      app.nativeBypassFlushing = false;
+    });
+}
+
+export async function switchSessionMode(app, targetId, bypassModeId) {
+  try {
+    if (targetId === bypassModeId) {
+      app.state.sessionBypass = true;
+      app.approvePendingPermissions();
+      const autoModeId = resolveModeId(app, "auto");
+      const res = await syncSessionBypass(app, true, { modeId: autoModeId || "auto" });
+      if (!res?.restarted && autoModeId && autoModeId !== app.state.modeId && app.state.sessionId) {
+        const modeRes = await app.acp.setMode(app.state.sessionId, autoModeId);
+        app.applySessionMetadata(modeRes);
+        app.state.modeId = autoModeId;
+      }
+      if (res?.restarted) {
+        app.showToast("Mode → Bypass (backend upgraded with --dangerously-skip-permissions; sub-workers included)", "error");
+      } else if (res?.deferred) {
+        app.showToast("Mode → Bypass (ACP auto-approved; will upgrade backend for sub-workers when idle)", "error");
+      } else {
+        app.showToast("Mode → Bypass (every tool permission auto-approved this session)", "error");
+      }
+    } else {
+      const wasBypass = Boolean(app.state.sessionBypass || app.state.nativeBypassActive || app.pendingNativeBypass);
+      const res = wasBypass ? await syncSessionBypass(app, false, { modeId: targetId }) : null;
+      if (!wasBypass || !res?.restarted) {
+        const modeRes = await app.acp.setMode(app.state.sessionId, targetId);
+        app.applySessionMetadata(modeRes);
+        app.state.modeId = targetId;
+      }
+      app.userConfig.mode = targetId;
+      saveUserConfig(app.userConfig);
+      const target = app.state.modes.find((mode) => mode.id === targetId);
+      const suffix = res?.deferred ? " (backend downgrade queued until idle)" : "";
+      app.showToast(`Mode → ${target?.name || targetId}${suffix}`);
+    }
+  } catch (err) {
+    app.showToast(`Mode switch failed: ${err.message}`, "error");
+  }
+  app.scheduleRender();
+}
+
 export function applyHostSnapshot(app, snapshot) {
   if (!snapshot) return;
   const info = snapshot.agentInfo || snapshot.initResult?.agentInfo;
@@ -153,6 +307,7 @@ export function applyHostSnapshot(app, snapshot) {
   if (snapshot.modeId) app.state.modeId = snapshot.modeId;
   if (!app.state.launchBypass) {
     app.state.sessionBypass = Boolean(snapshot.bypassPermissions);
+    app.state.nativeBypassActive = Boolean(snapshot.nativeBypassActive);
   }
 
   app.replayingSnapshot = true;

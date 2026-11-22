@@ -23,9 +23,11 @@ import {
   drainCancelledPermissions,
   finalizeAllStreaming,
   handleSessionUpdate,
+  maybeFlushPendingNativeBypass,
   openInitialSession,
   resolveModeId,
   summarizeRawInput,
+  switchSessionMode,
 } from "./app/session.mjs";
 import {
   getConfigLoadError,
@@ -82,6 +84,7 @@ export class LucidApp {
       // sessionBypass: user switched to the Bypass mode inside this session.
       launchBypass: (this.launchSpec.args || []).includes("--dangerously-skip-permissions"),
       sessionBypass: false,
+      nativeBypassActive: (this.launchSpec.args || []).includes("--dangerously-skip-permissions"),
       get bypassPermissions() {
         return this.launchBypass || this.sessionBypass;
       },
@@ -135,6 +138,8 @@ export class LucidApp {
     this.scrollScheduler = createPacedScheduler(24, () => flushScroll(this));
     this.lastAltScrollAt = 0;
     this.pendingChunkEvents = null;
+    this.pendingNativeBypass = null;
+    this.nativeBypassFlushing = false;
 
     this.agyStateWatcher = isAgyCommand(this.launchSpec.command)
       ? new AgyStateWatcher({
@@ -200,6 +205,7 @@ export class LucidApp {
     }
     if (snapshot) {
       this.state.multiAgent.applyAgyState(snapshot);
+      maybeFlushPendingNativeBypass(this);
       this.scheduleRender();
     }
   }
@@ -628,31 +634,7 @@ export class LucidApp {
   }
 
   async switchMode(targetId) {
-    try {
-      if (targetId === BYPASS_MODE_ID) {
-        const autoModeId = resolveModeId(this, "auto");
-        if (autoModeId && autoModeId !== this.state.modeId && this.state.sessionId) {
-          const res = await this.acp.setMode(this.state.sessionId, autoModeId);
-          this.applySessionMetadata(res);
-          this.state.modeId = autoModeId;
-        }
-        this.setSessionBypass(true);
-        this.approvePendingPermissions();
-        this.showToast("Mode → Bypass (every tool permission auto-approved this session)", "error");
-      } else {
-        const res = await this.acp.setMode(this.state.sessionId, targetId);
-        this.applySessionMetadata(res);
-        this.state.modeId = targetId;
-        this.setSessionBypass(false);
-        this.userConfig.mode = targetId;
-        saveUserConfig(this.userConfig);
-        const target = this.state.modes.find((mode) => mode.id === targetId);
-        this.showToast(`Mode → ${target?.name || targetId}`);
-      }
-    } catch (err) {
-      this.showToast(`Mode switch failed: ${err.message}`, "error");
-    }
-    this.scheduleRender();
+    return switchSessionMode(this, targetId, BYPASS_MODE_ID);
   }
 
   async cycleMode() {
@@ -683,8 +665,8 @@ export class LucidApp {
     this.persistConfig(
       { mouseCapture: this.state.mouseCapture },
       this.state.mouseCapture
-        ? "Mouse capture ON (wheel scrolls history)"
-        : "Mouse capture OFF (native drag-select enabled)",
+        ? "Mouse capture ON (wheel scrolls · drag selects · ↑/↓ prompt history)"
+        : "Mouse capture OFF (native drag-select · PgUp/PgDn or Alt+↑/↓ to scroll)",
     );
   }
 
@@ -733,6 +715,7 @@ export class LucidApp {
     if (this.state.activePromptCount === 0) {
       this.state.busy = false;
       finalizeAllStreaming(this);
+      maybeFlushPendingNativeBypass(this);
     }
     this.scheduleRender();
   }

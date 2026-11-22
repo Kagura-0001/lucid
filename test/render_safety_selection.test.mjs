@@ -59,6 +59,18 @@ test("renderer never writes raw newlines and erases each changed row before draw
   const renderer = new TerminalRenderer(sink);
   renderer.enter({ mouseCapture: false });
   assert.ok(sink.output.includes("\x1b[?7l"), "autowrap is disabled in the alt screen");
+  assert.ok(sink.output.includes("\x1b[?1007l"), "alternate scroll is disabled so wheel never emits fake arrow keys");
+  assert.equal(sink.output.includes("\x1b[?1007h"), false, "alternate scroll must never be enabled");
+
+  sink.output = "";
+  renderer.setMouseCapture(true);
+  assert.ok(sink.output.includes("\x1b[?1007l"));
+  assert.equal(sink.output.includes("\x1b[?1007h"), false);
+
+  sink.output = "";
+  renderer.setMouseCapture(false);
+  assert.ok(sink.output.includes("\x1b[?1007l"));
+  assert.equal(sink.output.includes("\x1b[?1007h"), false);
 
   sink.output = "";
   renderer.render([`  ✓ ${HEREDOC_COMMAND}`, "second row"], null);
@@ -387,6 +399,26 @@ test("when mouseCapture is OFF, single Up/Down recalls prompt history while trai
   app.dispatchInputBatch([up]);
   assert.equal(app.state.scrollOffset, 4);
   assert.equal(app.state.composer.text, "");
+});
+
+test("even when mouseCapture is ON, Alternate Scroll Up/Down bursts scroll timeline without recalling history", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const app = new LucidApp({ cwd: "/tmp" });
+  app.scheduleRender = () => {};
+  app.scheduleScrollFlush = () => {};
+  app.state.mouseCapture = true;
+  app.state.maxScrollOffset = 50;
+  app.state.scrollOffset = 0;
+  app.state.composer.pushHistory("previous prompt");
+
+  const up = { type: "key", name: "up", ctrl: false, alt: false, shift: false };
+  app.dispatchInputBatch([up, up, up]);
+  assert.equal(app.state.scrollOffset, 3, "outer terminal/tmux arrow burst must scroll even when mouseCapture is ON");
+  assert.equal(app.state.composer.text, "", "wheel burst must not load prompt history into composer");
+
+  app.lastAltScrollAt = 0;
+  app.dispatchInputBatch([up]);
+  assert.equal(app.state.composer.text, "previous prompt", "single Up keypress recalls prompt history");
 });
 
 test("applyHostSnapshot seeds composer prompt history so Up recalls previous session prompts", async () => {

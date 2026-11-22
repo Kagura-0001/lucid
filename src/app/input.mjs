@@ -74,14 +74,16 @@ function isPlainVerticalArrow(ev) {
 }
 
 /**
- * Translates Alternate Scroll (?1007h) arrow bursts into timeline scrolling when
- * mouse capture is OFF.
+ * Catches Alternate Scroll arrow bursts (2+ same-direction Up/Down arrows in one
+ * chunk, or trailing ticks within 180 ms) from terminals or multiplexers such as
+ * tmux with `mouse off` that still translate wheel notches into arrow keys even
+ * when ?1007l or ?1000h is active. Single Up/Down presses still recall prompt history.
  */
 export function dispatchInputBatch(app, events) {
   let i = 0;
   while (i < events.length) {
     const ev = events[i];
-    if (!app.state.mouseCapture && !app.modal && !app.boardOpen && !app.popup && isPlainVerticalArrow(ev)) {
+    if (!app.modal && !app.boardOpen && !app.popup && isPlainVerticalArrow(ev)) {
       let j = i + 1;
       while (j < events.length && isPlainVerticalArrow(events[j]) && events[j].name === ev.name) {
         j += 1;

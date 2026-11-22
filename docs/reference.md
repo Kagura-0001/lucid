@@ -34,14 +34,14 @@ lucid bg stop <id|all>        # stop background session(s)
 | `!<command>` | Run a local shell command directly in the workspace (bypasses agent; `Esc`/`Ctrl+C` cancels) |
 | `Ctrl+J` / `Shift+Enter` / `Alt+Enter` / `\`+`Enter` | Insert newline in composer |
 | `Esc` | Close popup/modal, exit agent inspect view, cancel turn, or jump to bottom |
-| `Shift+Tab` | Cycle mode (`default` / `accept-edits` / `auto` / `plan` / session-only `bypass`) |
+| `Shift+Tab` | Cycle mode (`default` / `accept-edits` / `auto` / `plan` / session-only `bypass`, which also hot-restarts `agy acp` with `--dangerously-skip-permissions` via `session/resume` so Swarm sub-workers auto-approve too) |
 | `Ctrl+O` / `/expand` | Expand or collapse tool details and archived turns |
 | `Ctrl+T` / `/thoughts [fold\|show\|hide]` | Fold, expand, or hide thinking blocks |
 | `Alt+[` / `Alt+]` (or `Shift+←/→` when empty) | Cycle main conversation and individual Swarm workers / subagents live |
 | `Alt+B` / `/dock` | Fold or expand the bottom multi-agent progress dock |
 | `Ctrl+B` / `/board` | Toggle the full-screen Swarm & Subagent split-pane board |
 | `Ctrl+Y` / `/copy` | Copy latest assistant reply via OSC 52 |
-| `Ctrl+G` / `/mouse` | Toggle mouse capture (OFF = native terminal drag-select; wheel still scrolls) |
+| `Ctrl+G` / `/mouse` | Toggle mouse capture (ON = wheel scrolls & drag-copy; OFF = native drag-select, PgUp/PgDn or Alt+↑/↓ to scroll) |
 | `Ctrl+V` / `/image <path>` / `/unattach` | Attach clipboard or local image (`@img.png` and drag-drop also work) |
 | `Ctrl+P` / `Ctrl+N` | Previous / next prompt history |
 | `Ctrl+L` | Force full screen repaint |

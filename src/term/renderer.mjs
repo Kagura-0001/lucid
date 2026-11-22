@@ -13,10 +13,8 @@ const MOUSE_ENABLE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 // Disable tracking modes (1000/1002/1003) before encoding modes (1006/1015) so
 // an interrupted write can never leave tracking active in legacy X10 mode.
 const MOUSE_DISABLE = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l";
-// Alternate Scroll Mode: when mouse tracking is OFF in the alt screen, let the
-// terminal keep native drag-select while still translating wheel notches into
-// Up/Down bursts that lucid converts back into timeline scrolling.
-const ALT_SCROLL_ENABLE = "\x1b[?1007h";
+// Alternate Scroll Mode (?1007h) translates mouse wheel ticks into fake Up/Down
+// arrow keypresses, which collide with composer prompt history. Keep it disabled.
 const ALT_SCROLL_DISABLE = "\x1b[?1007l";
 // With autowrap off, a row whose width we underestimate (ambiguous-width
 // glyphs, unusual emoji) is clipped at the right edge instead of spilling into
@@ -53,12 +51,15 @@ export class TerminalRenderer {
     this.prevRows = [];
     this.mouseEnabled = Boolean(mouseCapture);
 
-    let seq = ALT_SCREEN_ENTER + AUTOWRAP_DISABLE + PASTE_ENABLE + KITTY_KEYS_PUSH + CURSOR_HIDE + "\x1b[2J\x1b[H";
-    if (this.mouseEnabled) {
-      seq += ALT_SCROLL_DISABLE + MOUSE_ENABLE;
-    } else {
-      seq += MOUSE_DISABLE + ALT_SCROLL_ENABLE;
-    }
+    let seq =
+      ALT_SCREEN_ENTER +
+      AUTOWRAP_DISABLE +
+      PASTE_ENABLE +
+      KITTY_KEYS_PUSH +
+      CURSOR_HIDE +
+      "\x1b[2J\x1b[H" +
+      ALT_SCROLL_DISABLE;
+    seq += this.mouseEnabled ? MOUSE_ENABLE : MOUSE_DISABLE;
     this.stream.write(seq);
   }
 
@@ -69,7 +70,7 @@ export class TerminalRenderer {
       return;
     }
     this.mouseEnabled = target;
-    this.stream.write(target ? ALT_SCROLL_DISABLE + MOUSE_ENABLE : MOUSE_DISABLE + ALT_SCROLL_ENABLE);
+    this.stream.write(target ? ALT_SCROLL_DISABLE + MOUSE_ENABLE : MOUSE_DISABLE + ALT_SCROLL_DISABLE);
   }
 
   setTitle(title) {

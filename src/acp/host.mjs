@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { AcpClient } from "./client.mjs";
+import { AcpClient, hotSwapAcpClient } from "./client.mjs";
 import { ensureSecureBgDir, removeBgFiles, writeBgMeta } from "./bg_registry.mjs";
 import { autoApprovePermission } from "./permissions.mjs";
 import {
@@ -11,6 +11,7 @@ import {
   mergeSessionMetadata,
   parseJsonObjectLine,
 } from "./protocol.mjs";
+import { supportsNativeBypassFlag, withDangerouslySkipPermissions } from "../config.mjs";
 
 const MAX_EVENT_LOG = 6000;
 const EMPTY_DETACHED_GRACE_MS = 4000;
@@ -41,15 +42,18 @@ export class SessionHost {
     this.bgDir = spec.bgDir;
     this.socketPath = spec.socketPath;
     this.cwd = spec.cwd;
+    this.baseLaunchSpec = spec.launchSpec;
     this.launchSpec = spec.launchSpec;
     this.addDirs = Array.isArray(spec.addDirs) ? spec.addDirs : [];
     this.initialPrompt = spec.initialPrompt || "";
     this.initialMode = spec.initialMode || "";
     this.initialModel = spec.initialModel || "";
     this.startBackgrounded = Boolean(spec.startBackgrounded);
-    this.bypassPermissions = Boolean(
-      spec.bypassPermissions || (this.launchSpec?.args || []).includes("--dangerously-skip-permissions"),
-    );
+    this.launchBypass = (this.launchSpec?.args || []).includes("--dangerously-skip-permissions");
+    this.bypassPermissions = Boolean(spec.bypassPermissions || this.launchBypass);
+    this.nativeBypassActive = this.launchBypass;
+    this.suppressReplayEvents = false;
+    this.bypassSwapPromise = null;
 
     this.acp = new AcpClient(this.launchSpec);
     this.server = null;
@@ -106,6 +110,7 @@ export class SessionHost {
           modelLabel: this.modelLabel,
           modeId: this.modeId,
           bypassPermissions: this.bypassPermissions,
+          nativeBypassActive: this.nativeBypassActive,
           status: this.computeStatus(),
           attached: Boolean(this.activeSocket),
           backgrounded: this.backgrounded,
@@ -224,46 +229,7 @@ export class SessionHost {
       // Ignore
     }
 
-    this.acp.on("sessionUpdate", (params) => {
-      this.updatedAt = Date.now();
-      const update = params?.update;
-      if (update) {
-        if (update.sessionUpdate === "session_info_update" && typeof update.title === "string" && update.title.trim()) {
-          this.sessionTitle = update.title.trim();
-        } else if (update.sessionUpdate === "usage_update" && typeof update.used === "number") {
-          this.usage = { used: update.used, size: update.size };
-        } else if (update.sessionUpdate === "current_mode_update") {
-          this.modeId = update.currentModeId || update.modeId || this.modeId;
-        } else if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
-          this.sessionMeta.availableCommands = update.availableCommands;
-        } else if (update.sessionUpdate === "config_option_update" && (Array.isArray(update.configOptions) || update.configOption)) {
-          this.captureSessionMeta(update);
-        }
-        const summary = summarizeUpdateText(update);
-        if (summary) this.lastSummary = summary;
-      }
-      this.pushEvent({ type: "sessionUpdate", params });
-      this.sendToClient({ type: "sessionUpdate", params });
-      this.scheduleMetaFlush();
-    });
-
-    this.acp.on("permissionRequest", (req) => {
-      if (this.bypassPermissions && autoApprovePermission(req)) {
-        return;
-      }
-      const permId = `perm_${this.nextPermId++}`;
-      this.pendingPermissions.set(permId, { permId, ...req });
-      this.updatedAt = Date.now();
-      this.flushMetaNow();
-      this.sendToClient({ type: "permissionRequest", permId, params: req.params });
-    });
-
-    this.acp.on("disconnect", () => {
-      if (this.shuttingDown) return;
-      this.busy = false;
-      this.sendToClient({ type: "disconnect" });
-      this.shutdown();
-    });
+    this.bindAcpEvents(this.acp);
 
     this.flushMetaNow();
     this.initResult = await this.acp.start();
@@ -316,6 +282,136 @@ export class SessionHost {
       this.flushMetaNow();
       this.scheduleIdleCheck();
     }
+  }
+
+  bindAcpEvents(acpClient) {
+    acpClient.on("sessionUpdate", (params) => {
+      if (acpClient !== this.acp || this.suppressReplayEvents) return;
+      this.updatedAt = Date.now();
+      const update = params?.update;
+      if (update) {
+        if (update.sessionUpdate === "session_info_update" && typeof update.title === "string" && update.title.trim()) {
+          this.sessionTitle = update.title.trim();
+        } else if (update.sessionUpdate === "usage_update" && typeof update.used === "number") {
+          this.usage = { used: update.used, size: update.size };
+        } else if (update.sessionUpdate === "current_mode_update") {
+          this.modeId = update.currentModeId || update.modeId || this.modeId;
+        } else if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
+          this.sessionMeta.availableCommands = update.availableCommands;
+        } else if (update.sessionUpdate === "config_option_update" && (Array.isArray(update.configOptions) || update.configOption)) {
+          this.captureSessionMeta(update);
+        }
+        const summary = summarizeUpdateText(update);
+        if (summary) this.lastSummary = summary;
+      }
+      this.pushEvent({ type: "sessionUpdate", params });
+      this.sendToClient({ type: "sessionUpdate", params });
+      this.scheduleMetaFlush();
+    });
+
+    acpClient.on("permissionRequest", (req) => {
+      if (acpClient !== this.acp) return;
+      if (this.bypassPermissions && autoApprovePermission(req)) {
+        return;
+      }
+      const permId = `perm_${this.nextPermId++}`;
+      this.pendingPermissions.set(permId, { permId, ...req });
+      this.updatedAt = Date.now();
+      this.flushMetaNow();
+      this.sendToClient({ type: "permissionRequest", permId, params: req.params });
+    });
+
+    acpClient.on("disconnect", () => {
+      if (acpClient !== this.acp || this.shuttingDown) return;
+      this.busy = false;
+      this.sendToClient({ type: "disconnect" });
+      this.shutdown();
+    });
+  }
+
+  async syncNativeBypass(enabled, { modeId = "", hasRunningMembers = false } = {}) {
+    const target = Boolean(enabled);
+    this.bypassPermissions = target;
+    if (target) {
+      this.approveAllPendingPermissions();
+    }
+
+    const canSwapBackend =
+      supportsNativeBypassFlag(this.baseLaunchSpec) &&
+      !this.launchBypass &&
+      Boolean(this.sessionId) &&
+      Boolean(this.acp?.supportsSessionResume?.() || this.acp?.supportsSessionLoad?.());
+
+    if (!canSwapBackend) {
+      this.flushMetaNow();
+      return { ok: true, nativeBypass: this.nativeBypassActive, restarted: false, deferred: false };
+    }
+
+    const execute = async () => {
+      if (target === this.nativeBypassActive) {
+        this.flushMetaNow();
+        return { ok: true, nativeBypass: this.nativeBypassActive, restarted: false, deferred: false };
+      }
+      if (this.busy || this.activePromptCount > 0 || hasRunningMembers) {
+        this.flushMetaNow();
+        return { ok: true, nativeBypass: this.nativeBypassActive, restarted: false, deferred: true };
+      }
+
+      const nextSpec = withDangerouslySkipPermissions(this.baseLaunchSpec, target);
+      const restoreMode = modeId || (target ? "auto" : this.modeId);
+      try {
+        const { updates } = await hotSwapAcpClient({
+          currentClient: this.acp,
+          nextLaunchSpec: nextSpec,
+          sessionId: this.sessionId,
+          cwd: this.cwd,
+          modeId: restoreMode,
+          sessionMeta: this.sessionMeta,
+          onBindNext: (nextAcp) => {
+            this.acp = nextAcp;
+            this.bindAcpEvents(nextAcp);
+          },
+          onReplaySuppressed: (flag) => {
+            this.suppressReplayEvents = flag;
+          },
+        });
+        for (const meta of updates) {
+          if (meta) this.captureSessionMeta(meta);
+        }
+        this.launchSpec = nextSpec;
+        this.nativeBypassActive = target;
+        this.flushMetaNow();
+        return {
+          ok: true,
+          nativeBypass: this.nativeBypassActive,
+          restarted: true,
+          deferred: false,
+          sessionMeta: this.sessionMeta,
+          modeId: this.modeId,
+          modelLabel: this.modelLabel,
+        };
+      } catch (err) {
+        this.flushMetaNow();
+        return {
+          ok: true,
+          nativeBypass: this.nativeBypassActive,
+          restarted: false,
+          deferred: false,
+          error: err?.message || String(err),
+        };
+      }
+    };
+
+    if (this.bypassSwapPromise) {
+      await this.bypassSwapPromise.catch(() => {});
+    }
+    const tracked = execute().finally(() => {
+      if (this.bypassSwapPromise === tracked) {
+        this.bypassSwapPromise = null;
+      }
+    });
+    this.bypassSwapPromise = tracked;
+    return tracked;
   }
 
   handleConnection(socket) {
@@ -400,6 +496,7 @@ export class SessionHost {
             activePromptCount: this.activePromptCount,
             turnStartedAt: this.turnStartedAt,
             bypassPermissions: this.bypassPermissions,
+            nativeBypassActive: this.nativeBypassActive,
             eventLog: this.eventLog,
             pendingPermissions: [...this.pendingPermissions.values()].map((p) => ({
               permId: p.permId,
@@ -417,12 +514,14 @@ export class SessionHost {
           this.reply(socket, id, { ok: true });
           await this.shutdown();
           return;
-        case "setBypass":
-          this.bypassPermissions = Boolean(msg.enabled);
-          if (this.bypassPermissions) this.approveAllPendingPermissions();
-          else this.flushMetaNow();
-          this.reply(socket, id, { ok: true });
+        case "setBypass": {
+          const res = await this.syncNativeBypass(Boolean(msg.enabled), {
+            modeId: msg.modeId || "",
+            hasRunningMembers: Boolean(msg.hasRunningMembers),
+          });
+          this.reply(socket, id, res);
           return;
+        }
         case "permissionResponse": {
           const entry = this.pendingPermissions.get(msg.permId);
           if (entry) {

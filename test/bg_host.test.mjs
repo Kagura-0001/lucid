@@ -6,7 +6,7 @@ import test from "node:test";
 import { findLiveBgSession, listLiveBgSessions, stopBgSession } from "../src/acp/bg_registry.mjs";
 import { HostAcpClient, spawnSessionHost } from "../src/acp/host_client.mjs";
 import { LucidApp } from "../src/app.mjs";
-import { parseCliArgs } from "../src/config.mjs";
+import { parseCliArgs, withDangerouslySkipPermissions } from "../src/config.mjs";
 
 const MOCK_BG_AGENT = `
 const readline = require("node:readline");
@@ -179,6 +179,217 @@ test("SessionHost survives detach mid-turn, queues permissions, replays full sta
     assert.equal(listLiveBgSessions({ allCwd: true, includeAttached: true, bgDir }).length, 0);
     hostMeta = null;
   } finally {
+    if (hostMeta) {
+      await stopBgSession(hostMeta);
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("withDangerouslySkipPermissions toggles flag without duplicating or mutating source spec", () => {
+  const base = { name: "Antigravity", command: "agy", args: ["acp", "--stdio"], supportsDangerouslySkipPermissions: true };
+  const upgraded = withDangerouslySkipPermissions(base, true);
+  assert.deepEqual(base.args, ["acp", "--stdio"]);
+  assert.deepEqual(upgraded.args, ["acp", "--stdio", "--dangerously-skip-permissions"]);
+
+  const upgradedTwice = withDangerouslySkipPermissions(upgraded, true);
+  assert.deepEqual(upgradedTwice.args, ["acp", "--stdio", "--dangerously-skip-permissions"]);
+
+  const downgraded = withDangerouslySkipPermissions(upgraded, false);
+  assert.deepEqual(downgraded.args, ["acp", "--stdio"]);
+});
+
+test("SessionHost hot-upgrades and downgrades backend with --dangerously-skip-permissions on Bypass switch and defers while workers run", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "lucid-bypass-swap-"));
+  const bgDir = path.join(tmpDir, "bg");
+  const logPath = path.join(tmpDir, "rpc.jsonl");
+  const mockPath = path.join(tmpDir, "swap_agent.cjs");
+
+  const MOCK_SWAP_AGENT = `
+const fs = require("node:fs");
+const readline = require("node:readline");
+const logPath = process.argv[2];
+const argvFlags = process.argv.slice(3);
+const record = (entry) => fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, argvFlags, ...entry }) + "\\n");
+record({ event: "spawn" });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+let mode = "auto";
+let model = "gemini-4";
+let thought = "high";
+
+const makeConfigOptions = () => [
+  { id: "model", category: "model", currentValue: model, options: [{ value: "gemini-4", name: "Gemini 4" }] },
+  { id: "thought_level", category: "thought_level", currentValue: thought, options: [{ value: "high", name: "High" }] },
+];
+
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  record({ event: "rpc", method: msg.method, params: msg.params });
+  if (msg.method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: 1,
+        agentInfo: { name: "Mock Swap Agy", version: "1.5.14" },
+        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, load: {}, list: {}, close: {} } },
+      },
+    });
+    return;
+  }
+  if (msg.method === "session/new") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId: "bg-sess-swap",
+        modes: { currentModeId: mode, availableModes: [{ id: "default", name: "Default" }, { id: "auto", name: "Auto" }] },
+        configOptions: makeConfigOptions(),
+      },
+    });
+    return;
+  }
+  if (msg.method === "session/resume") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId: msg.params.sessionId,
+        modes: { currentModeId: mode, availableModes: [{ id: "default", name: "Default" }, { id: "auto", name: "Auto" }] },
+        configOptions: makeConfigOptions(),
+      },
+    });
+    return;
+  }
+  if (msg.method === "session/set_mode") {
+    mode = msg.params.modeId;
+    send({ jsonrpc: "2.0", id: msg.id, result: { modes: { currentModeId: mode } } });
+    return;
+  }
+  if (msg.method === "session/set_config_option") {
+    if (msg.params.configId === "mode") mode = msg.params.value;
+    if (msg.params.configId === "model") model = msg.params.value;
+    if (msg.params.configId === "thought_level") thought = msg.params.value;
+    send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: makeConfigOptions() } });
+    return;
+  }
+  if (msg.method === "session/prompt") {
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: msg.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Initial reply." } } },
+    });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    return;
+  }
+  if (msg.id) send({ jsonrpc: "2.0", id: msg.id, result: {} });
+});
+`;
+  fs.writeFileSync(mockPath, MOCK_SWAP_AGENT, "utf8");
+
+  const launchSpec = {
+    name: "Mock Swap Agy",
+    command: process.execPath,
+    args: [mockPath, logPath],
+    supportsQuotaCli: false,
+    supportsDangerouslySkipPermissions: true,
+  };
+
+  let client = null;
+  let hostMeta = null;
+  try {
+    const spawned = spawnSessionHost({ cwd: tmpDir, launchSpec, bgDir });
+    client = new HostAcpClient({ hostId: spawned.hostId, socketPath: spawned.socketPath, launchSpec, hostPid: spawned.pid });
+
+    let disconnects = 0;
+    client.on("disconnect", () => {
+      disconnects += 1;
+    });
+
+    await client.start(10000);
+    const created = await client.createSession(tmpDir, []);
+    assert.equal(created.sessionId, "bg-sess-swap");
+
+    const donePromise = new Promise((resolve) => client.once("promptDone", resolve));
+    await client.sendPrompt("bg-sess-swap", [{ type: "text", text: "Hello" }], { text: "Hello" });
+    await donePromise;
+
+    // 1. While Swarm workers are running, bypass swap defers without killing running backend.
+    const deferredRes = await client.setBypassPermissions(true, { modeId: "auto", hasRunningMembers: true });
+    assert.equal(deferredRes.deferred, true);
+    assert.equal(deferredRes.restarted, false);
+    assert.equal(deferredRes.nativeBypass, false);
+
+    // 2. When idle, setBypassPermissions(true) hot-restarts backend with --dangerously-skip-permissions via session/resume.
+    const upgradeRes = await client.setBypassPermissions(true, { modeId: "auto", hasRunningMembers: false });
+    assert.equal(upgradeRes.restarted, true);
+    assert.equal(upgradeRes.nativeBypass, true);
+    assert.equal(upgradeRes.deferred, false);
+    assert.equal(disconnects, 0, "hot-swap must not fire spurious disconnect");
+
+    // 3. Switching back out of Bypass removes --dangerously-skip-permissions cleanly.
+    const downgradeRes = await client.setBypassPermissions(false, { modeId: "default", hasRunningMembers: false });
+    assert.equal(downgradeRes.restarted, true);
+    assert.equal(downgradeRes.nativeBypass, false);
+    assert.equal(disconnects, 0);
+
+    const events = fs
+      .readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const spawns = events.filter((e) => e.event === "spawn");
+    assert.equal(spawns.length, 3, "should have initial spawn + bypass upgrade + bypass downgrade");
+    assert.equal(spawns[0].argvFlags.includes("--dangerously-skip-permissions"), false);
+    assert.equal(spawns[1].argvFlags.includes("--dangerously-skip-permissions"), true);
+    assert.equal(spawns[2].argvFlags.includes("--dangerously-skip-permissions"), false);
+
+    const resumedBySecond = events.filter((e) => e.pid === spawns[1].pid && e.method === "session/resume");
+    assert.equal(resumedBySecond.length, 1);
+    assert.equal(resumedBySecond[0].params.sessionId, "bg-sess-swap");
+    const restoredThoughtBySecond = events.filter(
+      (e) => e.pid === spawns[1].pid && e.method === "session/set_config_option" && e.params?.configId === "thought_level",
+    );
+    assert.equal(restoredThoughtBySecond[0]?.params?.value, "high");
+
+    // 4. Deferred switch in LucidApp flushes automatically once Swarm workers finish.
+    const app = new LucidApp({ cwd: tmpDir, direct: true });
+    app.scheduleRender = () => {};
+    app.acp = client;
+    app.bindAcpClient(client);
+    app.state.connected = true;
+    app.state.sessionId = "bg-sess-swap";
+    app.state.modes = [{ id: "default", name: "Default" }, { id: "auto", name: "Auto" }];
+    app.state.modeId = "auto";
+    app.state.multiAgent.applyAgyState({
+      workers: [{ name: "ckpt-publisher", state: "working", startedAt: Date.now() }],
+    });
+    await app.switchMode("bypass");
+    assert.equal(app.state.sessionBypass, true);
+    assert.equal(app.state.nativeBypassActive, false);
+    assert.ok(app.pendingNativeBypass, "queued while ckpt-publisher is working");
+
+    app.state.multiAgent.applyAgyState({
+      workers: [{ name: "ckpt-publisher", state: "waiting", startedAt: Date.now() }],
+    });
+    app.state.busy = false;
+    const { maybeFlushPendingNativeBypass } = await import("../src/app/session.mjs");
+    maybeFlushPendingNativeBypass(app);
+    for (let i = 0; i < 40 && !app.state.nativeBypassActive; i += 1) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.equal(app.state.nativeBypassActive, true, "flushed native bypass once workers paused");
+
+    await client.stop();
+    client = null;
+    await new Promise((r) => setTimeout(r, 150));
+  } finally {
+    if (client) {
+      await client.stop().catch(() => {});
+    }
     if (hostMeta) {
       await stopBgSession(hostMeta);
     }

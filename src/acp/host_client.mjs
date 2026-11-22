@@ -291,8 +291,16 @@ export class HostAcpClient extends EventEmitter {
     return this.request("setModel", { sessionId, modelValue, preferConfigOption }, 10000);
   }
 
-  setBypassPermissions(enabled) {
-    this.request("setBypass", { enabled: Boolean(enabled) }, 5000).catch(() => {});
+  setBypassPermissions(enabled, opts = {}) {
+    return this.request(
+      "setBypass",
+      {
+        enabled: Boolean(enabled),
+        modeId: opts.modeId || "",
+        hasRunningMembers: Boolean(opts.hasRunningMembers),
+      },
+      25000,
+    ).catch(() => ({ ok: false, restarted: false, deferred: false }));
   }
 
   async detach() {

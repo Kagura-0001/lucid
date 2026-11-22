@@ -27,10 +27,11 @@ set -g default-terminal "tmux-256color"
 set -as terminal-features ",xterm*:RGB"
 set -g set-clipboard on
 set -g allow-passthrough on
+set -g mouse on
 ```
 
-- **Mouse capture ON (default):** wheel scrolls the conversation; drag-select copies on release via OSC 52 (anchored to content so streaming output doesn't shift your selection). Hold `Shift` (iTerm2: `Option`) for native terminal selection.
-- **Mouse capture OFF (`Ctrl+G` / `--no-mouse`):** native terminal drag-select with zero latency; wheel still scrolls via alternate-scroll mode.
+- **Mouse capture ON (default):** wheel scrolls the conversation; drag-select copies on release via OSC 52 (anchored to content so streaming output doesn't shift your selection). Hold `Shift` (iTerm2: `Option`) for native terminal selection. Inside `tmux`, enable `set -g mouse on` so wheel events reach lucid instead of arriving as `↑`/`↓` arrow keys.
+- **Mouse capture OFF (`Ctrl+G` / `--no-mouse`):** native terminal drag-select with zero latency; Alternate Scroll (`?1007l`) stays disabled so wheel scrolling never hijacks `↑`/`↓` prompt history. Use `PgUp`/`PgDn` or `Alt+↑`/`Alt+↓` to scroll, or toggle `Ctrl+G` back ON for wheel scrolling.
 - **Terminal notes:** VS Code, Windows Terminal, kitty, and WezTerm support OSC 52 out of the box; iTerm2 needs *"Applications in terminal may access clipboard"*. In VS Code's integrated terminal, setting `terminal.integrated.mouseWheelScrollSensitivity` to `2`–`3` makes trackpad scrolling snappier.
 
 ## Tool Timeline & Long Pastes

@@ -17,6 +17,28 @@ export function isAgyCommand(command) {
   return /(^|\/)agy$/i.test(String(command || "").trim());
 }
 
+export function supportsNativeBypassFlag(launchSpec) {
+  if (!launchSpec || typeof launchSpec !== "object") return false;
+  if (typeof launchSpec.supportsDangerouslySkipPermissions === "boolean") {
+    return launchSpec.supportsDangerouslySkipPermissions;
+  }
+  return isAgyCommand(launchSpec.command);
+}
+
+export function withDangerouslySkipPermissions(launchSpec, enabled) {
+  if (!launchSpec || typeof launchSpec !== "object") return launchSpec;
+  const filteredArgs = Array.isArray(launchSpec.args)
+    ? launchSpec.args.filter((arg) => arg !== "--dangerously-skip-permissions")
+    : [];
+  if (enabled) {
+    filteredArgs.push("--dangerously-skip-permissions");
+  }
+  return {
+    ...launchSpec,
+    args: filteredArgs,
+  };
+}
+
 const AGY_PRESET = {
   name: "Antigravity",
   command: "agy",
@@ -203,6 +225,7 @@ export function resolveAgentLaunch(options, userConfig) {
       command: parts[0],
       args: parts.slice(1),
       supportsQuotaCli: isAgyCommand(parts[0]),
+      supportsDangerouslySkipPermissions: isAgyCommand(parts[0]),
     };
   }
 
@@ -214,6 +237,7 @@ export function resolveAgentLaunch(options, userConfig) {
       command: customPreset.command,
       args: Array.isArray(customPreset.args) ? [...customPreset.args] : [],
       supportsQuotaCli: Boolean(customPreset.supportsQuotaCli),
+      supportsDangerouslySkipPermissions: Boolean(customPreset.supportsDangerouslySkipPermissions),
     };
   }
 
@@ -243,6 +267,7 @@ export function resolveAgentLaunch(options, userConfig) {
     args,
     loginArgs: builtinPreset.loginArgs || null,
     supportsQuotaCli: builtinPreset.supportsQuotaCli,
+    supportsDangerouslySkipPermissions: isAgy,
   };
 }
 

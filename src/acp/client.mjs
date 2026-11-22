@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { LUCID_VERSION } from "../config.mjs";
 import { StdioJsonRpc } from "./jsonrpc.mjs";
 import {
+  findConfigOption,
   supportsSessionList as capsSupportList,
   supportsSessionLoad as capsSupportLoad,
   supportsSessionResume as capsSupportResume,
@@ -271,6 +272,89 @@ export class AcpClient extends EventEmitter {
       }
     }
   }
+}
+
+/**
+ * Starts a replacement AcpClient with `nextLaunchSpec`, swaps it in cleanly,
+ * stops the previous process, resumes or reloads the same session, and restores
+ * mode, model, and thinking effort without emitting spurious disconnects.
+ */
+export async function hotSwapAcpClient({
+  currentClient,
+  nextLaunchSpec,
+  sessionId,
+  cwd,
+  modeId = "",
+  sessionMeta = {},
+  onBindNext,
+  onReplaySuppressed = () => {},
+}) {
+  const nextAcp = new AcpClient(nextLaunchSpec);
+  try {
+    await nextAcp.start();
+  } catch (err) {
+    await nextAcp.stop().catch(() => {});
+    throw err;
+  }
+
+  onBindNext(nextAcp);
+  // Stop without session/close so the on-disk session stays intact for resume.
+  await currentClient.stop(null).catch(() => {});
+
+  const modelOpt = findConfigOption(sessionMeta.configOptions, "model");
+  const restoreModel = modelOpt?.currentValue || sessionMeta.models?.currentModelId || "";
+  const preferConfigModel = Boolean(modelOpt);
+  const effortOpt =
+    findConfigOption(sessionMeta.configOptions, "thought_level") ||
+    findConfigOption(sessionMeta.configOptions, "effort");
+  const restoreEffort = effortOpt?.currentValue || "";
+
+  let res = null;
+  let restored = false;
+  if (nextAcp.supportsSessionResume()) {
+    try {
+      res = await nextAcp.resumeSession(sessionId, cwd);
+      restored = true;
+    } catch {
+      res = null;
+    }
+  }
+  if (!restored && nextAcp.supportsSessionLoad()) {
+    onReplaySuppressed(true);
+    try {
+      res = await nextAcp.loadSession(sessionId, cwd);
+      restored = true;
+    } finally {
+      onReplaySuppressed(false);
+    }
+  }
+  if (!restored) {
+    throw new Error("Replacement ACP backend does not support resuming or loading the active session");
+  }
+
+  const updates = [res];
+  if (modeId) {
+    try {
+      updates.push(await nextAcp.setMode(sessionId, modeId));
+    } catch {
+      // Best-effort mode restore
+    }
+  }
+  if (restoreModel) {
+    try {
+      updates.push(await nextAcp.setModel(sessionId, restoreModel, preferConfigModel));
+    } catch {
+      // Best-effort model restore
+    }
+  }
+  if (effortOpt?.id && restoreEffort) {
+    try {
+      updates.push(await nextAcp.setConfigOption(sessionId, effortOpt.id, restoreEffort));
+    } catch {
+      // Best-effort thought_level restore
+    }
+  }
+  return { nextAcp, updates };
 }
 
 /**
