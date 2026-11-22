@@ -19,6 +19,7 @@ import path from "node:path";
 const TRANSCRIPT_TAIL_BYTES = 192 * 1024;
 const MAX_BOARD_LINES = 300;
 const MAX_MESSAGES = 200;
+const MAX_RECENT_STEPS = 48;
 
 export function resolveAgyDataDir(launchArgs = [], configuredDir = "") {
   if (configuredDir) return configuredDir;
@@ -135,6 +136,90 @@ function describeToolCall(toolCall) {
   return toolCall.name;
 }
 
+function extractRecentSteps(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) return [];
+  const timeline = [];
+  for (const step of steps) {
+    if (!step || typeof step !== "object") continue;
+    const at = Date.parse(step.created_at || "") || 0;
+    if (step.type === "PLANNER_RESPONSE") {
+      if (typeof step.content === "string" && step.content.trim()) {
+        timeline.push({
+          kind: "message",
+          text: step.content.trim(),
+          time: at,
+        });
+      }
+      const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+      for (const call of toolCalls) {
+        if (!call || !call.name) continue;
+        timeline.push({
+          kind: "tool",
+          name: call.name,
+          activity: describeToolCall(call),
+          status: "done",
+          time: at,
+        });
+      }
+    } else if (step.status === "RUNNING" && timeline.length > 0) {
+      const prev = timeline[timeline.length - 1];
+      if (prev.kind === "tool") prev.status = "running";
+    } else if ((step.status === "ERROR" || step.status === "FAILED") && timeline.length > 0) {
+      const prev = timeline[timeline.length - 1];
+      if (prev.kind === "tool") prev.status = "failed";
+    }
+  }
+  return timeline.slice(-MAX_RECENT_STEPS);
+}
+
+export function summarizePlan(plan) {
+  if (!plan || typeof plan !== "object") return null;
+  const goalTitle = typeof plan.goal === "string" ? plan.goal : plan.goal?.title || "";
+  const goalLine = typeof plan.goal === "object" ? plan.goal?.line || "" : "";
+
+  const threads = [];
+  const rawThreads = Array.isArray(plan.threads) ? plan.threads : [];
+  for (const t of rawThreads) {
+    if (!t || typeof t !== "object") continue;
+    const name = t.title || t.name || t.label || t.id || "thread";
+    const status = String(t.status || t.state || "working").toLowerCase();
+    const detail = t.detail || t.summary || t.line || t.worker || "";
+    threads.push({ name: String(name), status, detail: String(detail) });
+  }
+
+  let totalTasks = 0;
+  let doneTasks = 0;
+  let blockedTasks = 0;
+  if (Array.isArray(plan.tasks)) {
+    totalTasks = plan.tasks.length;
+    for (const task of plan.tasks) {
+      const st = String(task?.status || task?.state || "").toLowerCase();
+      if (["done", "completed", "finished"].includes(st)) doneTasks += 1;
+      else if (["blocked", "failed", "error"].includes(st)) blockedTasks += 1;
+    }
+  } else if (plan.tasks && typeof plan.tasks === "object") {
+    const entries = Object.values(plan.tasks);
+    totalTasks = entries.length;
+    for (const entry of entries) {
+      if (entry && typeof entry === "object") {
+        const st = String(entry.status || entry.state || "").toLowerCase();
+        if (["done", "completed", "finished"].includes(st)) doneTasks += 1;
+        else if (["blocked", "failed", "error"].includes(st)) blockedTasks += 1;
+      }
+    }
+  }
+  if (totalTasks === 0 && threads.length > 0) {
+    totalTasks = threads.length;
+    for (const t of threads) {
+      if (["done", "completed", "finished"].includes(t.status)) doneTasks += 1;
+      else if (["blocked", "failed", "error"].includes(t.status)) blockedTasks += 1;
+    }
+  }
+
+  if (!goalTitle && totalTasks === 0 && threads.length === 0) return null;
+  return { goalTitle, goalLine, totalTasks, doneTasks, blockedTasks, threads };
+}
+
 /**
  * Derives what a member is doing from the tail of its transcript.
  *   working: mid-turn (thinking, or a tool call is pending)
@@ -143,8 +228,9 @@ function describeToolCall(toolCall) {
  */
 export function summarizeTranscriptTail(steps) {
   if (!Array.isArray(steps) || steps.length === 0) {
-    return { activity: "", phase: "working", lastText: "", lastAt: 0 };
+    return { activity: "", phase: "working", lastText: "", lastAt: 0, recentSteps: [] };
   }
+  const recentSteps = extractRecentSteps(steps);
   const last = steps[steps.length - 1];
   const lastAt = Date.parse(last.created_at || "") || 0;
 
@@ -160,15 +246,19 @@ export function summarizeTranscriptTail(steps) {
   if (last.type === "PLANNER_RESPONSE") {
     const toolCalls = Array.isArray(last.tool_calls) ? last.tool_calls : [];
     if (toolCalls.length === 0) {
-      return { activity: "", phase: "idle", lastText, lastAt };
+      return { activity: "", phase: "idle", lastText, lastAt, recentSteps };
     }
     const pending = toolCalls[toolCalls.length - 1];
     const isParked = /^(swarm_wait|wait|read_board)$/.test(pending.name || "");
+    if (recentSteps.length > 0 && recentSteps[recentSteps.length - 1].kind === "tool") {
+      recentSteps[recentSteps.length - 1].status = isParked ? "waiting" : "running";
+    }
     return {
       activity: describeToolCall(pending),
       phase: isParked ? "waiting" : "working",
       lastText,
       lastAt,
+      recentSteps,
     };
   }
 
@@ -184,13 +274,14 @@ export function summarizeTranscriptTail(steps) {
           phase: isParked ? "waiting" : "working",
           lastText,
           lastAt,
+          recentSteps,
         };
       }
     }
-    return { activity: "running", phase: "working", lastText, lastAt };
+    return { activity: "running", phase: "working", lastText, lastAt, recentSteps };
   }
   // A tool result, system message or user input arrived: the model is thinking.
-  return { activity: "thinking", phase: "working", lastText, lastAt };
+  return { activity: "thinking", phase: "working", lastText, lastAt, recentSteps };
 }
 
 export class AgyStateWatcher {
@@ -346,6 +437,7 @@ export class AgyStateWatcher {
         updatedAt: summary.updatedAt,
         startedAt: summary.startedAt,
         transcriptPath: summary.transcriptPath,
+        recentSteps: summary.recentSteps || [],
       };
     });
 
@@ -362,6 +454,7 @@ export class AgyStateWatcher {
       let updatedAt = 0;
       let startedAt = 0;
       let transcriptPath = "";
+      let recentSteps = [];
       if (isKilled) {
         state = "killed";
       } else if (phase && phase !== "RUNNING") {
@@ -376,9 +469,12 @@ export class AgyStateWatcher {
         updatedAt = summary.updatedAt;
         startedAt = summary.startedAt;
         transcriptPath = summary.transcriptPath;
+        recentSteps = summary.recentSteps || [];
       } else {
         state = "working";
       }
+      const rawTask = plan?.tasks?.[name];
+      const taskText = typeof rawTask === "string" ? rawTask : rawTask?.title || rawTask?.text || "";
       workers.push({
         name,
         conversationId: member.conversation_id || "",
@@ -387,19 +483,22 @@ export class AgyStateWatcher {
         state,
         activity,
         lastText,
-        task: plan?.tasks?.[name] || "",
+        task: taskText,
         updatedAt,
         startedAt,
         transcriptPath,
+        recentSteps,
       });
     }
 
     if (!changed) return null;
+    const planSummary = summarizePlan(plan);
     this.snapshot = {
       sessionId: this.sessionId,
       subagentSignature,
       swarmTitle: members?.title || plan?.goal?.title || "",
       goal: plan?.goal || null,
+      planSummary,
       workers,
       subagents,
       board,

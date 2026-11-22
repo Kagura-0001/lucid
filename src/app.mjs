@@ -24,8 +24,9 @@ import {
   isSelectionEmpty,
   patchSelectionInFrame,
 } from "./ui/selection.mjs";
-import { MultiAgentTracker, renderSwarmBoardView } from "./ui/swarm.mjs";
+import { MultiAgentTracker, renderMemberTimeline, renderSwarmBoardView } from "./ui/swarm.mjs";
 import { createThemeStyler, listThemes } from "./ui/themes.mjs";
+import { extractCleanOutputPreview, parseExitCode } from "./ui/tool_format.mjs";
 import {
   applyOverlayModal,
   renderAutocompletePopup,
@@ -47,6 +48,7 @@ const LOCAL_COMMANDS = [
   { name: "bg", description: "Move session to background (/bg [prompt]) — resume via /resume", local: true },
   { name: "new", description: "Start a fresh conversation session", local: true },
   { name: "board", description: "Open Swarm & Subagent multi-pane board (Ctrl+B)", local: true },
+  { name: "dock", description: "Fold or expand the bottom multi-agent progress dock (Alt+B)", local: true },
   { name: "artifacts", description: "Browse & read session Markdown artifacts", local: true },
   { name: "image", description: "Attach an image file (/image <path>)", local: true },
   { name: "unattach", description: "Clear staged image attachments", local: true },
@@ -182,6 +184,9 @@ export class LucidApp {
       composer: new Composer(),
       stagedImages: [],
       multiAgent: new MultiAgentTracker(),
+      swarmDockCollapsed: false,
+      focusedAgentId: null,
+      focusedAgentName: "",
       toast: null,
     };
 
@@ -1083,7 +1088,9 @@ export class LucidApp {
         diffs: [],
         outputText: "",
         outputPreview: "",
+        rawInput: update.rawInput ?? null,
         rawInputSummary: "",
+        exitCode: null,
         _rev: 0,
       };
       this.toolMap.set(id, item);
@@ -1102,6 +1109,7 @@ export class LucidApp {
       }
     }
     if (update.rawInput) {
+      item.rawInput = update.rawInput;
       item.rawInputSummary = summarizeRawInput(update.rawInput);
     }
 
@@ -1134,13 +1142,11 @@ export class LucidApp {
               : "";
         if (text) {
           item.outputText = item.outputText ? `${item.outputText}\n${text}` : text;
-          const firstNonEmpty = text
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .find(Boolean);
-          if (firstNonEmpty) {
-            item.outputPreview = firstNonEmpty;
+          const parsedCode = parseExitCode(item.outputText);
+          if (parsedCode !== null) {
+            item.exitCode = parsedCode;
           }
+          item.outputPreview = extractCleanOutputPreview(item.outputText);
         }
       }
     }
@@ -1149,7 +1155,11 @@ export class LucidApp {
       const rawStr = typeof update.rawOutput === "string" ? update.rawOutput : JSON.stringify(update.rawOutput);
       if (rawStr) {
         item.outputText = rawStr.slice(0, 4000);
-        item.outputPreview = rawStr.split(/\r?\n/)[0].slice(0, 120);
+        const parsedCode = parseExitCode(item.outputText);
+        if (parsedCode !== null) {
+          item.exitCode = parsedCode;
+        }
+        item.outputPreview = extractCleanOutputPreview(item.outputText) || rawStr.split(/\r?\n/)[0].slice(0, 120);
       }
     }
   }
@@ -1908,6 +1918,28 @@ export class LucidApp {
       return;
     }
 
+    if (key.alt && key.name === "b") {
+      this.toggleSwarmDock();
+      return;
+    }
+
+    if (key.alt && key.name === "[") {
+      this.cycleFocusedAgent(-1);
+      return;
+    }
+
+    if (key.alt && key.name === "]") {
+      this.cycleFocusedAgent(1);
+      return;
+    }
+
+    if (key.shift && !key.ctrl && !key.alt && this.state.composer.isEmpty() && (key.name === "left" || key.name === "right")) {
+      if (this.state.multiAgent.getInspectableMembers().length > 0) {
+        this.cycleFocusedAgent(key.name === "right" ? 1 : -1);
+        return;
+      }
+    }
+
     if (key.ctrl && key.name === "v") {
       this.attachFromClipboard();
       return;
@@ -1925,11 +1957,19 @@ export class LucidApp {
       return;
     }
 
-    // Escape: close popup -> cancel busy turn -> jump to bottom
+    // Escape: close popup -> leave agent inspect view -> cancel busy turn -> jump to bottom
     if (key.name === "escape") {
       if (this.popup) {
         this.dismissedPopupKey = this.popup.triggerKey;
         this.popup = null;
+        this.scheduleRender(true);
+        return;
+      }
+      if (this.state.focusedAgentId) {
+        this.state.focusedAgentId = null;
+        this.state.focusedAgentName = "";
+        this.state.scrollOffset = 0;
+        this.showToast("Returned to main conversation");
         this.scheduleRender(true);
         return;
       }
@@ -2297,6 +2337,41 @@ export class LucidApp {
     this.scheduleRender();
   }
 
+  toggleSwarmDock() {
+    this.state.swarmDockCollapsed = !this.state.swarmDockCollapsed;
+    this.showToast(this.state.swarmDockCollapsed ? "Agent dock folded" : "Agent dock expanded");
+    this.scheduleRender(true);
+  }
+
+  cycleFocusedAgent(delta = 1) {
+    const members = this.state.multiAgent.getInspectableMembers();
+    if (members.length === 0) {
+      if (this.state.focusedAgentId) {
+        this.state.focusedAgentId = null;
+        this.state.focusedAgentName = "";
+        this.state.scrollOffset = 0;
+        this.scheduleRender(true);
+      } else {
+        this.showToast("No active Swarm workers or Subagents to inspect");
+      }
+      return;
+    }
+    // Cycle order: null (main conversation) -> member[0] -> ... -> member[n-1] -> null
+    const slots = [null, ...members];
+    const currentIdx = this.state.focusedAgentId
+      ? slots.findIndex((m) => m && m.id === this.state.focusedAgentId)
+      : 0;
+    const baseIdx = currentIdx >= 0 ? currentIdx : 0;
+    const nextIdx = (baseIdx + delta + slots.length) % slots.length;
+    const nextMember = slots[nextIdx];
+    this.state.focusedAgentId = nextMember ? nextMember.id : null;
+    this.state.focusedAgentName = nextMember ? nextMember.name : "";
+    this.state.scrollOffset = 0;
+    this.selection = null;
+    this.showToast(nextMember ? `Inspecting ${nextMember.name}` : "Main conversation");
+    this.scheduleRender(true);
+  }
+
   attachFromClipboard() {
     const img = tryReadClipboardImage();
     if (img) {
@@ -2327,6 +2402,11 @@ export class LucidApp {
 
     if (cmdName === "board" || cmdName === "agents") {
       this.toggleSwarmBoard();
+      return;
+    }
+
+    if (cmdName === "dock") {
+      this.toggleSwarmDock();
       return;
     }
 
@@ -2510,6 +2590,8 @@ export class LucidApp {
         this.state.items = [];
         this.toolMap.clear();
         this.state.multiAgent.reset();
+        this.state.focusedAgentId = null;
+        this.state.focusedAgentName = "";
         this.state.stagedImages = [];
         this.boardOpen = false;
         this.activePlanItem = null;
@@ -2872,6 +2954,16 @@ export class LucidApp {
       };
     }
 
+    const focusedMember = this.state.focusedAgentId
+      ? this.state.multiAgent.getMemberById(this.state.focusedAgentId)
+      : null;
+    if (this.state.focusedAgentId && !focusedMember) {
+      this.state.focusedAgentId = null;
+      this.state.focusedAgentName = "";
+    } else if (focusedMember) {
+      this.state.focusedAgentName = focusedMember.name;
+    }
+
     const composerState = this.modal
       ? { ...this.state, activeModalType: this.modal.type }
       : this.state;
@@ -2881,7 +2973,9 @@ export class LucidApp {
     const reservedBottom = composerBlock.lines.length + popupLines.length;
     const viewportHeight = Math.max(3, rows - headerLines.length - reservedBottom);
 
-    const timelineLines = renderTimeline(this.state, cols, this.style);
+    const timelineLines = focusedMember
+      ? renderMemberTimeline(focusedMember, cols, this.style, this.state.spinnerFrame)
+      : renderTimeline(this.state, cols, this.style);
     const maxScroll = Math.max(0, timelineLines.length - viewportHeight);
     this.state.maxScrollOffset = maxScroll;
     if (this.state.scrollOffset > maxScroll) {

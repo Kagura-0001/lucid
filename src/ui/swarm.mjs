@@ -55,11 +55,29 @@ export class MultiAgentTracker {
 
   reset() {
     this.swarmTitle = "";
-    this.workers = new Map(); // name -> { id, kind: "swarm", name, model, workspace, state, brief, output, startedAt, updatedAt, endedAt }
-    this.subagents = new Map(); // toolCallId -> { id, kind: "subagent", name, role, typeName, model, workspace, state, brief, output, conversationId, startedAt, updatedAt, endedAt }
+    this.planSummary = null;
+    this.workers = new Map(); // name -> { id, kind: "swarm", name, model, workspace, state, brief, output, recentSteps, startedAt, updatedAt, endedAt }
+    this.subagents = new Map(); // toolCallId -> { id, kind: "subagent", name, role, typeName, model, workspace, state, brief, output, recentSteps, conversationId, startedAt, updatedAt, endedAt }
     this.boardMessages = []; // { id, time, from, to, body }
     this.artifacts = new Map(); // path -> { path, title, summary, updatedAt }
     this.toolCallBinding = new Map(); // toolCallId -> { category, targetKey }
+  }
+
+  getInspectableMembers() {
+    return [...this.workers.values(), ...this.subagents.values()]
+      .filter((member) => member.state !== "killed")
+      .sort((a, b) => (STRIP_STATE_ORDER[a.state] ?? 9) - (STRIP_STATE_ORDER[b.state] ?? 9));
+  }
+
+  getMemberById(memberId) {
+    if (!memberId) return null;
+    for (const [, w] of this.workers) {
+      if (w.id === memberId) return w;
+    }
+    for (const [, s] of this.subagents) {
+      if (s.id === memberId) return s;
+    }
+    return null;
   }
 
   hasActivity() {
@@ -439,6 +457,9 @@ export class MultiAgentTracker {
     if (snapshot.swarmTitle) {
       this.swarmTitle = snapshot.swarmTitle;
     }
+    if (snapshot.planSummary !== undefined) {
+      this.planSummary = snapshot.planSummary;
+    }
 
     // Briefs posted to the board: "@name ..." lines of kind "brief".
     const briefByWorker = new Map();
@@ -457,6 +478,7 @@ export class MultiAgentTracker {
         name: diskWorker.name,
         brief: "",
         output: "",
+        recentSteps: [],
         startedAt: Date.now(),
         endedAt: null,
       };
@@ -467,6 +489,7 @@ export class MultiAgentTracker {
       worker.task = diskWorker.task;
       worker.conversationId = diskWorker.conversationId;
       worker.transcriptPath = diskWorker.transcriptPath;
+      worker.recentSteps = Array.isArray(diskWorker.recentSteps) ? diskWorker.recentSteps : worker.recentSteps || [];
       worker.brief = worker.brief || briefByWorker.get(diskWorker.name) || diskWorker.task || "";
       if (diskWorker.lastText) worker.output = diskWorker.lastText;
       worker.updatedAt = diskWorker.updatedAt || Date.now();
@@ -502,6 +525,7 @@ export class MultiAgentTracker {
           workspace: "inherit",
           brief: "",
           output: "",
+          recentSteps: [],
           startedAt: Date.now(),
           endedAt: null,
         };
@@ -512,6 +536,7 @@ export class MultiAgentTracker {
       sub.state = diskSub.state;
       sub.activity = diskSub.activity;
       sub.transcriptPath = diskSub.transcriptPath;
+      sub.recentSteps = Array.isArray(diskSub.recentSteps) ? diskSub.recentSteps : sub.recentSteps || [];
       sub.output = diskSub.reply || diskSub.lastText || sub.output;
       sub.updatedAt = diskSub.updatedAt || Date.now();
       if (diskSub.startedAt) sub.startedAt = diskSub.startedAt;
@@ -603,6 +628,224 @@ function statusBadge(state, style, spinnerFrame) {
 
 const ACTIVE_STATES = new Set(["working", "running"]);
 const STRIP_STATE_ORDER = { working: 0, running: 0, waiting: 1, idle: 2, completed: 3, failed: 4, stopped: 5, killed: 6 };
+
+function memberColorFn(name, style) {
+  const palette = [style.accent, style.accentAlt, style.success, style.warn, style.thought];
+  let hash = 0;
+  const text = String(name || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return palette[hash % palette.length];
+}
+
+function formatPlanProgressTag(planSummary) {
+  if (!planSummary || planSummary.totalTasks <= 0) return "";
+  const base = `${planSummary.doneTasks}/${planSummary.totalTasks} tasks`;
+  return planSummary.blockedTasks > 0 ? `${base} (${planSummary.blockedTasks} blocked)` : base;
+}
+
+function formatMemberActivityLabel(member) {
+  if (member.activity) return member.activity;
+  if (member.state === "waiting") return "waiting on board";
+  if (member.state === "completed") return "done";
+  if (member.state === "idle") return "idle";
+  if (member.state === "failed" || member.state === "error") return "failed";
+  if (member.state === "working" || member.state === "running") return "working";
+  return member.state || "";
+}
+
+/**
+ * Multi-line transparent dock rendered below the composer when Swarm workers
+ * or Subagents are active. Mirrors Claude Code's persistent teammate progress
+ * bar while keeping zero opaque backgrounds.
+ */
+export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}) {
+  if (!tracker || !tracker.hasActivity()) return [];
+  const members = tracker.getInspectableMembers();
+  const counts = tracker.getSummaryCounts();
+  const maxWidth = Math.max(20, cols - 2);
+  const collapsed = Boolean(options.collapsed);
+  const focusedMemberId = options.focusedMemberId || "";
+  const maxVisibleMembers = Math.max(1, options.maxVisibleMembers || 5);
+
+  if (members.length === 0) {
+    // Only artifacts or board messages remain — keep a single quiet line.
+    const fallback = renderSwarmStrip(tracker, cols, style, spinnerFrame);
+    return fallback ? [fallback] : [];
+  }
+
+  // Build top summary bar of the dock
+  const icon = counts.working > 0 || counts.subagentsRunning > 0
+    ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
+    : style.accent("◈");
+  const titleText = counts.swarmCount > 0
+    ? (counts.swarmTitle ? `Swarm "${counts.swarmTitle}"` : "Swarm")
+    : "Agents";
+
+  const statusBits = [];
+  const planTag = formatPlanProgressTag(tracker.planSummary);
+  if (planTag) statusBits.push(planTag);
+  const activeCount = counts.working + counts.subagentsRunning;
+  if (activeCount > 0) statusBits.push(`${activeCount} running`);
+  else if (counts.waiting > 0) statusBits.push(`${counts.waiting} waiting`);
+  else statusBits.push(`${members.length} done`);
+  if (counts.artifactCount > 0) statusBits.push(`◇ ${counts.artifactCount}`);
+
+  const leftHeader = `${icon} ${style.bold(titleText)}${statusBits.length > 0 ? style.muted(` · ${statusBits.join(" · ")}`) : ""}`;
+  const rightHint = collapsed
+    ? style.muted("Alt+B expand · ^B board")
+    : style.muted("Alt+[/] inspect · ^B board · Alt+B fold");
+
+  const leftW = displayWidth(leftHeader);
+  const rightW = displayWidth(rightHint);
+  let headerRow;
+  if (leftW + rightW + 3 <= maxWidth) {
+    headerRow = ` ${leftHeader}${" ".repeat(maxWidth - leftW - rightW)}${rightHint}`;
+  } else {
+    headerRow = ` ${truncateAnsi(leftHeader, maxWidth, "…")}`;
+  }
+
+  if (collapsed) {
+    return [headerRow];
+  }
+
+  const rows = [headerRow];
+  const visible = members.slice(0, maxVisibleMembers);
+  const hiddenCount = members.length - visible.length;
+  const nameColWidth = Math.max(10, Math.min(18, Math.max(...visible.map((m) => displayWidth(m.name))) + 1));
+
+  for (const member of visible) {
+    const isFocused = Boolean(focusedMemberId && member.id === focusedMemberId);
+    const badge = statusBadge(member.state, style, spinnerFrame);
+    const paintName = memberColorFn(member.name, style);
+    const pointer = isFocused ? style.accentBold("▸") : " ";
+    const nameStr = padEndVisible(paintName(truncateAnsi(member.name, nameColWidth, "…")), nameColWidth);
+    const age = member.startedAt ? formatAge(member.startedAt, member.endedAt) : "";
+    const ageText = age ? style.muted(age) : "";
+    const ageWidth = displayWidth(ageText);
+
+    const activityRaw = formatMemberActivityLabel(member);
+    const taskRaw = member.task && member.task !== activityRaw ? member.task : "";
+
+    // Layout: " <pointer><badge> <name>  <activity>   <task?>   <age>"
+    const prefixPart = ` ${pointer}${badge} ${nameStr} `;
+    const prefixW = displayWidth(prefixPart);
+    const reservedRight = ageWidth > 0 ? ageWidth + 2 : 0;
+    const bodyBudget = Math.max(8, maxWidth + 1 - prefixW - reservedRight);
+
+    let bodyStr = "";
+    if (ACTIVE_STATES.has(member.state)) {
+      const actCap = taskRaw && bodyBudget > 36 ? Math.floor(bodyBudget * 0.62) : bodyBudget;
+      const actText = style.text(truncateAnsi(activityRaw, actCap, "…"));
+      if (taskRaw && bodyBudget > 36) {
+        const taskBudget = bodyBudget - displayWidth(actText) - 3;
+        if (taskBudget >= 8) {
+          bodyStr = `${actText}  ${style.muted(truncateAnsi(taskRaw, taskBudget, "…"))}`;
+        } else {
+          bodyStr = actText;
+        }
+      } else {
+        bodyStr = actText;
+      }
+    } else {
+      const mutedAct = taskRaw && member.state === "waiting"
+        ? `${activityRaw} · ${taskRaw}`
+        : activityRaw;
+      bodyStr = style.muted(truncateAnsi(mutedAct, bodyBudget, "…"));
+    }
+
+    const leftCombined = `${prefixPart}${bodyStr}`;
+    const leftCombinedW = displayWidth(leftCombined);
+    if (ageWidth > 0 && leftCombinedW + ageWidth + 2 <= maxWidth + 1) {
+      const gap = Math.max(2, maxWidth + 1 - leftCombinedW - ageWidth);
+      rows.push(`${leftCombined}${" ".repeat(gap)}${ageText}`);
+    } else {
+      rows.push(truncateAnsi(leftCombined, cols, "…"));
+    }
+  }
+
+  if (hiddenCount > 0) {
+    rows.push(`   ${style.muted(`+${hiddenCount} more agents · press ^B for full board`)}`);
+  }
+
+  return rows;
+}
+
+/**
+ * Renders an inspected agent's live transcript (Codex-style recent steps + brief
+ * + latest reply) for display inside the main viewport via Alt+[ / Alt+].
+ */
+export function renderMemberTimeline(member, cols, style, spinnerFrame) {
+  if (!member) return [];
+  const contentWidth = Math.max(24, cols - 4);
+  const lines = [""];
+
+  const badge = statusBadge(member.state, style, spinnerFrame);
+  const paintName = memberColorFn(member.name, style);
+  const age = member.startedAt ? ` · ${formatAge(member.startedAt, member.endedAt)}` : "";
+  const banner = `${badge} ${paintName(member.name)}  ${style.muted(`[${member.kind} · ${member.state}${age}]`)}`;
+  lines.push(`  ${truncateAnsi(banner, contentWidth, "…")}`);
+
+  const metaBits = [];
+  if (member.model) metaBits.push(`model ${member.model}`);
+  if (member.workspace) metaBits.push(`workspace ${member.workspace}`);
+  if (member.updatedAt) metaBits.push(`updated ${formatAge(member.updatedAt, Date.now())} ago`);
+  if (metaBits.length > 0) {
+    lines.push(`  ${style.muted(truncateAnsi(metaBits.join(" · "), contentWidth, "…"))}`);
+  }
+  lines.push(`  ${style.muted("Alt+[/] switch agent · Esc back to main conversation · ^B full board")}`);
+  lines.push(`  ${style.border("─".repeat(Math.min(contentWidth, 72)))}`);
+  lines.push("");
+
+  if (member.brief) {
+    lines.push(`  ${style.accent("Assignment")}`);
+    for (const bl of wrapAnsiText(style.muted(member.brief), Math.max(16, contentWidth - 2))) {
+      lines.push(`    ${bl}`);
+    }
+    lines.push("");
+  }
+
+  const steps = Array.isArray(member.recentSteps) ? member.recentSteps : [];
+  if (steps.length > 0) {
+    lines.push(`  ${style.accent("Live Activity")}`);
+    for (const step of steps) {
+      if (step.kind === "tool") {
+        const icon = step.status === "running"
+          ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
+          : step.status === "failed"
+            ? style.error("✗")
+            : step.status === "waiting"
+              ? style.accentAlt("◌")
+              : style.muted("•");
+        const text = truncateAnsi(step.activity || step.name || "tool", Math.max(16, contentWidth - 4), "…");
+        lines.push(`  ${icon} ${step.status === "running" ? style.text(text) : style.muted(text)}`);
+      } else if (step.kind === "message" && step.text) {
+        lines.push("");
+        for (const ml of renderMarkdown(step.text, Math.max(16, contentWidth - 2), style)) {
+          lines.push(ml ? `  ${ml}` : "");
+        }
+        lines.push("");
+      }
+    }
+  } else if (member.output) {
+    lines.push(`  ${style.accent("Latest Output")}`);
+    for (const ml of renderMarkdown(member.output, Math.max(16, contentWidth - 2), style)) {
+      lines.push(ml ? `  ${ml}` : "");
+    }
+  } else {
+    lines.push(`  ${style.muted("Waiting for transcript activity…")}`);
+  }
+
+  if (member.activity && ACTIVE_STATES.has(member.state)) {
+    const spin = style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]);
+    lines.push("");
+    lines.push(`  ${spin} ${style.text(truncateAnsi(member.activity, Math.max(16, contentWidth - 4), "…"))}`);
+  }
+
+  lines.push("");
+  return lines;
+}
 
 /**
  * Compact 1-line transparent indicator shown above composer ONLY when
@@ -708,11 +951,30 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
 
   const buildRightContent = (rightWidth) => {
     if (activeTab === "board") {
+      const out = [];
+      if (tracker.planSummary) {
+        const ps = tracker.planSummary;
+        const progress = formatPlanProgressTag(ps);
+        const goalHeader = ps.goalTitle
+          ? `${style.accentBold("Overview")}  ${style.bold(ps.goalTitle)}${progress ? style.muted(` · ${progress}`) : ""}`
+          : `${style.accentBold("Overview")}${progress ? style.muted(` · ${progress}`) : ""}`;
+        out.push(truncateAnsi(goalHeader, rightWidth, "…"));
+        if (ps.goalLine) {
+          out.push(style.muted(truncateAnsi(ps.goalLine, rightWidth, "…")));
+        }
+        for (const thread of (ps.threads || []).slice(0, 6)) {
+          const tIcon = statusBadge(thread.status, style, spinnerFrame);
+          const detail = thread.detail ? `  ${style.muted(thread.detail)}` : "";
+          out.push(truncateAnsi(`  ${tIcon} ${style.text(thread.name)}${detail}`, rightWidth, "…"));
+        }
+        out.push(style.border("─".repeat(Math.min(rightWidth, 64))));
+      }
+
       const msgs = tracker.boardMessages;
       if (msgs.length === 0) {
-        return ["", style.muted("No shared board messages recorded yet.")];
+        out.push("", style.muted("No shared board messages recorded yet."));
+        return out;
       }
-      const out = [];
       for (const msg of msgs) {
         const header = `${style.accentBold(msg.from)} ${style.muted("→")} ${style.accentAlt(msg.to)}  ${style.muted(formatClock(msg.time))}`;
         out.push(truncateAnsi(header, rightWidth, "…"));
@@ -752,6 +1014,20 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
       out.push(style.accent("Assignment / Brief"));
       for (const bl of wrapAnsiText(style.text(m.brief), Math.max(16, rightWidth - 2))) {
         out.push(`  ${bl}`);
+      }
+      out.push("");
+    }
+
+    const recentTools = (m.recentSteps || []).filter((s) => s.kind === "tool").slice(-10);
+    if (recentTools.length > 0) {
+      out.push(style.accent("Recent Steps"));
+      for (const st of recentTools) {
+        const sIcon = st.status === "running"
+          ? style.warn(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])
+          : st.status === "failed"
+            ? style.error("✗")
+            : style.muted("•");
+        out.push(`  ${sIcon} ${style.muted(truncateAnsi(st.activity || st.name, Math.max(16, rightWidth - 6), "…"))}`);
       }
       out.push("");
     }
