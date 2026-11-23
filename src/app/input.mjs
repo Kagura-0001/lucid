@@ -106,20 +106,47 @@ export function dispatchInputBatch(app, events) {
   }
 }
 
-export function refreshPickerFilter(modal) {
+function buildPickerSearchHaystack(item) {
+  if (typeof item.searchText === "string" && item.searchText) {
+    return item.searchText.toLowerCase();
+  }
+  return [
+    item.label || "",
+    item.description || "",
+    item.preview || "",
+    item.cwd || "",
+    String(item.value || ""),
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+export function refreshPickerFilter(modal, { resetSelection = false } = {}) {
   if (!modal || modal.type !== "picker") return;
-  const q = (modal.filter || "").trim().toLowerCase();
   const all = modal.allItems || [];
-  const filtered = q
-    ? all.filter(
-        (item) =>
-          (item.label || "").toLowerCase().includes(q) ||
-          (item.description || "").toLowerCase().includes(q) ||
-          String(item.value || "").toLowerCase().includes(q),
-      )
+  const scope = modal.scopeFilter;
+  const scoped = scope && typeof scope.matches === "function"
+    ? all.filter((item) => scope.matches(item, scope.active))
     : all;
+  modal.scopedCount = scoped.length;
+
+  const tokens = (modal.filter || "")
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  const filtered = tokens.length > 0
+    ? scoped.filter((item) => {
+        const haystack = buildPickerSearchHaystack(item);
+        return tokens.every((token) => haystack.includes(token));
+      })
+    : scoped;
   modal.filteredItems = filtered;
-  modal.selected = Math.min(modal.selected, Math.max(0, filtered.length - 1));
+  if (resetSelection) {
+    modal.selected = 0;
+  } else {
+    modal.selected = Math.min(modal.selected, Math.max(0, filtered.length - 1));
+  }
 }
 
 function scheduleSelectionPatch(app) {
@@ -156,7 +183,7 @@ export function handleInputEvent(app, event) {
   if (event.type === "paste") {
     if (app.modal && app.modal.type === "picker") {
       app.modal.filter = (app.modal.filter || "") + event.text.replace(/\n/g, " ");
-      refreshPickerFilter(app.modal);
+      refreshPickerFilter(app.modal, { resetSelection: true });
       app.scheduleRender(true);
       return;
     }
@@ -431,7 +458,7 @@ export function handleModalInput(app, event) {
   if (modal.type === "picker") {
     if (event.type === "text") {
       modal.filter = (modal.filter || "") + event.text;
-      refreshPickerFilter(modal);
+      refreshPickerFilter(modal, { resetSelection: true });
       app.scheduleRender(true);
       return;
     }
@@ -442,12 +469,33 @@ export function handleModalInput(app, event) {
       app.modal = null;
       app.scheduleRender(true);
       invokeModalCallback(app, onCancel);
+    } else if ((event.name === "tab" || (event.ctrl && event.name === "a")) && modal.scopeFilter) {
+      modal.scopeFilter.active = modal.scopeFilter.active === "all" ? "cwd" : "all";
+      refreshPickerFilter(modal, { resetSelection: true });
+      app.scheduleRender(true);
+    } else if (event.ctrl && event.name === "u") {
+      if (modal.filter) {
+        modal.filter = "";
+        refreshPickerFilter(modal, { resetSelection: true });
+        app.scheduleRender(true);
+      }
     } else if (event.name === "backspace") {
       modal.filter = (modal.filter || "").slice(0, -1);
-      refreshPickerFilter(modal);
+      refreshPickerFilter(modal, { resetSelection: true });
       app.scheduleRender(true);
     } else if ((event.name === "up" || event.name === "down") && items.length > 0) {
       modal.selected = wrapIndex(modal.selected, event.name === "up" ? -1 : 1, items.length);
+      app.scheduleRender(true);
+    } else if ((event.name === "pageup" || event.name === "pagedown") && items.length > 0) {
+      const step = modal.layout === "cards" ? 5 : 8;
+      const delta = event.name === "pageup" ? -step : step;
+      modal.selected = clampScroll(modal.selected, delta, items.length - 1);
+      app.scheduleRender(true);
+    } else if (event.name === "home" && items.length > 0) {
+      modal.selected = 0;
+      app.scheduleRender(true);
+    } else if (event.name === "end" && items.length > 0) {
+      modal.selected = items.length - 1;
       app.scheduleRender(true);
     } else if (event.name === "enter" && items.length > 0) {
       const chosen = items[modal.selected];

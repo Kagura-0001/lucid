@@ -17,6 +17,8 @@ import path from "node:path";
  */
 
 const TRANSCRIPT_TAIL_BYTES = 192 * 1024;
+const PREVIEW_TAIL_BYTES = 256 * 1024;
+const PREVIEW_EXPANDED_TAIL_BYTES = 1024 * 1024;
 const MAX_BOARD_LINES = 300;
 const MAX_MESSAGES = 200;
 const MAX_RECENT_STEPS = 48;
@@ -87,6 +89,67 @@ function parseJsonLines(text) {
     }
   }
   return out;
+}
+
+export function extractUserRequestText(rawContent) {
+  if (typeof rawContent !== "string" || !rawContent) return "";
+  let text = rawContent;
+  const openMatch = /<USER_REQUEST>\s*/i.exec(text);
+  if (openMatch) {
+    text = text.slice(openMatch.index + openMatch[0].length);
+  }
+  const closeIdx = text.search(/<\/USER_REQUEST>|<ADDITIONAL_METADATA>|<USER_SETTINGS/i);
+  if (closeIdx >= 0) {
+    text = text.slice(0, closeIdx);
+  }
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function scanUserPromptsFromTail(text) {
+  let userTurnCount = 0;
+  let lastUserPrompt = "";
+  for (const line of text.split("\n")) {
+    if (!line || !line.includes('"USER_INPUT"')) continue;
+    try {
+      const step = JSON.parse(line);
+      if (step && step.type === "USER_INPUT") {
+        userTurnCount += 1;
+        const cleaned = extractUserRequestText(step.content);
+        if (cleaned) {
+          lastUserPrompt = cleaned;
+        }
+      }
+    } catch {
+      // Ignore truncated or in-flight JSON line
+    }
+  }
+  return { userTurnCount, lastUserPrompt };
+}
+
+/**
+ * Reads lightweight tail metadata (latest user prompt snippet and turn count)
+ * from an Antigravity session transcript on disk so /resume can show what each
+ * conversation was actually about without loading full transcripts.
+ */
+export function readSessionTranscriptPreview(dataDir, sessionId) {
+  if (!dataDir || !sessionId) return null;
+  const transcriptPath = path.join(dataDir, "brain", sessionId, ".system_generated", "logs", "transcript.jsonl");
+  const stats = safeStat(transcriptPath);
+  if (!stats || stats.size <= 0) return null;
+
+  let readBytes = PREVIEW_TAIL_BYTES;
+  let scanned = scanUserPromptsFromTail(readFileTail(transcriptPath, readBytes));
+  if (!scanned.lastUserPrompt && stats.size > readBytes) {
+    readBytes = PREVIEW_EXPANDED_TAIL_BYTES;
+    scanned = scanUserPromptsFromTail(readFileTail(transcriptPath, readBytes));
+  }
+
+  return {
+    lastUserPrompt: scanned.lastUserPrompt,
+    userTurnCount: scanned.userTurnCount,
+    exactTurnCount: stats.size <= readBytes,
+    mtimeMs: stats.mtimeMs || 0,
+  };
 }
 
 /**

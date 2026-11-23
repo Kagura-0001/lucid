@@ -425,20 +425,37 @@ export class LucidApp {
     }
   }
 
-  openPickerModal({ title, items, onSelect, initialFilter = "", onCancel = null }) {
-    const activeIdx = Math.max(0, items.findIndex((i) => i.active));
+  openPickerModal({
+    title,
+    items,
+    onSelect,
+    initialFilter = "",
+    onCancel = null,
+    selectActive = true,
+    layout = "compact",
+    scopeFilter = null,
+  }) {
     this.modal = {
       type: "picker",
       title,
+      layout,
+      scopeFilter,
       allItems: items,
       filteredItems: items,
+      scopedCount: items.length,
       filter: initialFilter,
-      selected: activeIdx,
+      selected: 0,
       onSelect,
       onCancel,
     };
-    if (initialFilter) {
-      refreshPickerFilter(this.modal);
+    if (initialFilter || scopeFilter) {
+      refreshPickerFilter(this.modal, { resetSelection: true });
+    }
+    if (selectActive && !initialFilter) {
+      const activeIdx = this.modal.filteredItems.findIndex((i) => i.active);
+      if (activeIdx >= 0) {
+        this.modal.selected = activeIdx;
+      }
     }
     this.scheduleRender();
   }

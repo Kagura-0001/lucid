@@ -1,3 +1,5 @@
+import path from "node:path";
+import { readSessionTranscriptPreview } from "../acp/agy_state.mjs";
 import { findLiveBgSession, listLiveBgSessions, terminatePid } from "../acp/bg_registry.mjs";
 import { AcpClient, fetchAgyQuota, hotSwapAcpClient } from "../acp/client.mjs";
 import { HostAcpClient, spawnSessionHost } from "../acp/host_client.mjs";
@@ -563,6 +565,45 @@ async function resolveSessionReference(app, ref) {
   return { sessionId: trimmed, title: "" };
 }
 
+function parseSessionTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function isSameWorkspaceDir(sessionCwd, targetCwd) {
+  if (!sessionCwd || !targetCwd) return true;
+  try {
+    return path.resolve(sessionCwd) === path.resolve(targetCwd);
+  } catch {
+    return sessionCwd === targetCwd;
+  }
+}
+
+export function sortSessionsByRecency(sessions) {
+  if (!Array.isArray(sessions) || sessions.length <= 1) {
+    return Array.isArray(sessions) ? [...sessions] : [];
+  }
+  return sessions
+    .map((session, index) => ({
+      session,
+      index,
+      updatedMs: parseSessionTimestamp(session?.updatedAt),
+    }))
+    .sort((a, b) => b.updatedMs - a.updatedMs || a.index - b.index)
+    .map((entry) => entry.session);
+}
+
+function formatTurnCountTag(preview) {
+  if (!preview || !preview.userTurnCount) return "";
+  const count = preview.userTurnCount;
+  if (preview.exactTurnCount) {
+    return count === 1 ? "1 msg" : `${count} msgs`;
+  }
+  return `${count}+ msgs`;
+}
+
 export async function openInitialSession(app) {
   if (app.cliOptions.session) {
     const resolved = await resolveSessionReference(app, app.cliOptions.session);
@@ -577,9 +618,11 @@ export async function openInitialSession(app) {
 
   if (app.cliOptions.continueLatest && app.acp.supportsSessionList()) {
     try {
-      const sessions = await app.acp.listSessions(app.cwd);
-      if (sessions.length > 0) {
-        await switchToSession(app, sessions[0].sessionId, sessions[0].title || "Latest session");
+      const sessions = sortSessionsByRecency(await app.acp.listSessions(app.cwd));
+      const sameDir = sessions.find((s) => isSameWorkspaceDir(s.cwd, app.cwd));
+      const latest = sameDir || sessions[0];
+      if (latest) {
+        await switchToSession(app, latest.sessionId, latest.title || "Latest session");
         return;
       }
     } catch {
@@ -600,12 +643,15 @@ const BG_STATUS_TAGS = {
 export async function openResumePicker(app, { query = "", startup = false } = {}) {
   try {
     const q = (query || "").trim();
-    const liveBg = app.cliOptions.direct
+    const liveBgAll = app.cliOptions.direct
       ? []
-      : listLiveBgSessions({ cwd: app.cwd, excludeHostId: app.acp?.hostId || "" });
+      : listLiveBgSessions({ allCwd: true, excludeHostId: app.acp?.hostId || "" });
+    const liveBgHere = liveBgAll.filter((s) => isSameWorkspaceDir(s.cwd, app.cwd));
 
-    if (q && liveBg.length > 0) {
-      const liveMatch = matchByIdOrPrefix(liveBg, q, (s) => [s.hostId, s.sessionId], 3);
+    if (q && liveBgAll.length > 0) {
+      const liveMatch =
+        matchByIdOrPrefix(liveBgHere, q, (s) => [s.hostId, s.sessionId], 3) ||
+        matchByIdOrPrefix(liveBgAll, q, (s) => [s.hostId, s.sessionId], 3);
       if (liveMatch) {
         await attachToBgHost(app, liveMatch, { keepPreviousHost: !startup });
         return;
@@ -613,7 +659,7 @@ export async function openResumePicker(app, { query = "", startup = false } = {}
     }
 
     const canListSaved = Boolean(app.acp && app.acp.supportsSessionList());
-    if (!canListSaved && liveBg.length === 0) {
+    if (!canListSaved && liveBgAll.length === 0) {
       if (!startup && q && (app.acp.supportsSessionLoad() || app.acp.supportsSessionResume())) {
         await switchToSession(app, q, q);
         return;
@@ -625,8 +671,9 @@ export async function openResumePicker(app, { query = "", startup = false } = {}
     }
 
     if (!startup) app.showToast("Loading sessions…");
-    const sessions = canListSaved ? await app.acp.listSessions(app.cwd) : [];
-    if (sessions.length === 0 && liveBg.length === 0) {
+    const rawSessions = canListSaved ? await app.acp.listSessions(app.cwd) : [];
+    const sessions = sortSessionsByRecency(rawSessions);
+    if (sessions.length === 0 && liveBgAll.length === 0) {
       app.pushNotice("info", `No saved sessions found for ${app.cwd}.`);
       if (startup) await createFreshSession(app);
       app.scheduleRender();
@@ -642,34 +689,96 @@ export async function openResumePicker(app, { query = "", startup = false } = {}
       }
     }
 
-    const liveSessionIds = new Set(liveBg.map((s) => s.sessionId).filter(Boolean));
-    const liveItems = liveBg.map((s) => ({
-      label: `${BG_STATUS_TAGS[s.status] || "◌ [bg idle]"} ${s.title || s.hostId}`,
-      value: `bg:${s.hostId}`,
-      description: `${formatRelativeTime(s.updatedAt || s.startedAt)} · ${s.hostId}`,
-      active: false,
-      bgMeta: s,
-    }));
+    const liveSessionIds = new Set(liveBgAll.map((s) => s.sessionId).filter(Boolean));
+    const agyDataDir = app.agyStateWatcher?.dataDir || "";
+
+    const liveItems = liveBgAll.map((s) => {
+      const cleanTitle = sanitizeUntrustedText(s.title || s.hostId);
+      const timeLabel = formatRelativeTime(s.updatedAt || s.startedAt);
+      const dirLabel = s.cwd ? path.basename(s.cwd) || s.cwd : "";
+      const preview = sanitizeUntrustedText(s.lastSummary || "");
+      const inCurrentCwd = isSameWorkspaceDir(s.cwd, app.cwd);
+      return {
+        label: `${BG_STATUS_TAGS[s.status] || "◌ [bg idle]"} ${cleanTitle}`,
+        rawTitle: cleanTitle,
+        value: `bg:${s.hostId}`,
+        shortId: s.hostId,
+        timeLabel,
+        metaParts: [],
+        description: `${timeLabel} · ${s.hostId}`,
+        preview: preview && preview !== cleanTitle ? preview : "",
+        cwd: s.cwd || "",
+        dirLabel,
+        inCurrentCwd,
+        active: false,
+        bgMeta: s,
+        searchText: [cleanTitle, preview, s.cwd || "", s.hostId, s.sessionId || ""].join(" "),
+      };
+    });
 
     const savedItems = sessions
       .filter((s) => !liveSessionIds.has(s.sessionId))
-      .map((s) => ({
-        label: s.title || s.sessionId.slice(0, 12),
-        value: s.sessionId,
-        description: `${formatRelativeTime(s.updatedAt)} · ${s.sessionId.slice(0, 8)}`,
-        active: s.sessionId === app.state.sessionId,
-      }));
+      .map((s) => {
+        const previewInfo = agyDataDir ? readSessionTranscriptPreview(agyDataDir, s.sessionId) : null;
+        const cleanTitle = sanitizeUntrustedText(s.title || s.sessionId.slice(0, 12));
+        const effectiveUpdated = parseSessionTimestamp(s.updatedAt) || previewInfo?.mtimeMs || 0;
+        const timeLabel = formatRelativeTime(effectiveUpdated);
+        const turnTag = formatTurnCountTag(previewInfo);
+        const dirLabel = s.cwd ? path.basename(s.cwd) || s.cwd : "";
+        const promptPreview = previewInfo?.lastUserPrompt ? sanitizeUntrustedText(previewInfo.lastUserPrompt) : "";
+        const shortId = s.sessionId.slice(0, 8);
+        const metaParts = turnTag ? [turnTag] : [];
+        const inCurrentCwd = isSameWorkspaceDir(s.cwd, app.cwd);
+        return {
+          label: cleanTitle,
+          rawTitle: cleanTitle,
+          value: s.sessionId,
+          shortId,
+          timeLabel,
+          metaParts,
+          description: [timeLabel, turnTag, shortId].filter(Boolean).join(" · "),
+          preview: promptPreview,
+          cwd: s.cwd || "",
+          dirLabel,
+          inCurrentCwd,
+          active: s.sessionId === app.state.sessionId,
+          updatedMs: effectiveUpdated,
+          searchText: [cleanTitle, promptPreview, s.cwd || "", s.sessionId].join(" "),
+        };
+      });
+
+    // Re-sort savedItems in case any session lacked updatedAt and fell back to transcript mtime.
+    savedItems.sort((a, b) => (b.updatedMs || 0) - (a.updatedMs || 0));
+
+    const allItems = [...liveItems, ...savedItems];
+    const hasCurrentCwdItems = allItems.some((item) => item.inCurrentCwd);
+    const hasOtherCwdItems = allItems.some((item) => !item.inCurrentCwd);
+    const currentDirName = path.basename(app.cwd) || app.cwd;
+
+    const scopeFilter = hasOtherCwdItems
+      ? {
+          active: hasCurrentCwdItems ? "cwd" : "all",
+          labels: {
+            cwd: currentDirName,
+            all: "All dirs",
+          },
+          matches: (item, mode) => mode === "all" || Boolean(item.inCurrentCwd),
+        }
+      : null;
 
     app.openPickerModal({
       title: liveItems.length > 0 ? "Resume Conversation (Live Background First)" : "Resume Conversation",
       initialFilter: q,
-      items: [...liveItems, ...savedItems],
+      items: allItems,
+      selectActive: false,
+      layout: "cards",
+      scopeFilter,
       onSelect: async (chosen) => {
         if (chosen.bgMeta) {
           await attachToBgHost(app, chosen.bgMeta, { keepPreviousHost: !startup });
           return;
         }
-        await switchToSession(app, chosen.value, chosen.label);
+        await switchToSession(app, chosen.value, chosen.rawTitle || chosen.label);
         if (startup) await applyStartupOverrides(app);
       },
       onCancel: startup

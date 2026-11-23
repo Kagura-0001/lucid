@@ -899,7 +899,10 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
   const height = viewportRows.length;
   if (!modal || height < 4 || cols < 36) return viewportRows;
 
-  const boxWidth = Math.min(Math.max(44, Math.floor(cols * 0.78)), cols - 4, 86);
+  const isCardPicker = modal.type === "picker" && modal.layout === "cards";
+  const boxWidth = isCardPicker
+    ? Math.min(Math.max(56, Math.floor(cols * 0.88)), cols - 4, 112)
+    : Math.min(Math.max(44, Math.floor(cols * 0.78)), cols - 4, 86);
   const innerWidth = boxWidth - 4;
   const contentLines = [];
 
@@ -936,17 +939,112 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
     contentLines.push("");
     contentLines.push(style.muted("Press 1-9 or ↑/↓ + Enter to confirm · Esc to cancel"));
   } else if (modal.type === "picker") {
+    const items = modal.filteredItems || [];
+    const scope = modal.scopeFilter || null;
+    const totalInScope = typeof modal.scopedCount === "number" ? modal.scopedCount : (modal.allItems || []).length;
+    const countLabel = modal.filter
+      ? `${items.length}/${totalInScope}`
+      : `${items.length}`;
+
+    const rightHeaderBits = [];
+    if (scope) {
+      const scopeName = scope.active === "all"
+        ? (scope.labels?.all || "All dirs")
+        : (scope.labels?.cwd || "This dir");
+      const toggleHint = scope.active === "all" ? "Tab: this dir" : "Tab: all dirs";
+      rightHeaderBits.push(`${style.accent(`[${scopeName}]`)} ${style.muted(toggleHint)}`);
+    }
+    rightHeaderBits.push(style.muted(countLabel));
+    const rightHeader = rightHeaderBits.join(style.border(" · "));
+
+    const placeholder = isCardPicker
+      ? "Search title, last message, or ID…"
+      : "Type to filter · ↑/↓ move · Enter select · Esc close";
     const queryDisplay = modal.filter
       ? `${style.muted("Filter:")} ${style.text(modal.filter)}${style.accent("▏")}`
-      : style.muted("Type to filter · ↑/↓ move · Enter select · Esc close");
-    contentLines.push(truncateAnsi(queryDisplay, innerWidth, "…"));
+      : style.muted(placeholder);
+    contentLines.push(alignLeftRight(queryDisplay, rightHeader, innerWidth, 2));
     contentLines.push(style.border("─".repeat(innerWidth)));
 
-    const items = modal.filteredItems || [];
-    const maxItems = Math.max(4, Math.min(12, height - 8));
     if (items.length === 0) {
-      contentLines.push(style.muted("No matching items."));
+      const emptyMsg = scope && scope.active === "cwd" && (modal.allItems || []).length > 0
+        ? "No matching sessions in this directory. Press Tab to view all directories."
+        : "No matching items.";
+      contentLines.push(style.muted(emptyMsg));
+    } else if (isCardPicker) {
+      const maxItems = Math.max(3, Math.min(10, Math.floor((height - 9) / 2)));
+      const { start, slice } = sliceCenteredWindow(items, modal.selected, maxItems);
+      const showDirTag = Boolean(scope && scope.active === "all");
+
+      for (let i = 0; i < slice.length; i += 1) {
+        const entry = slice[i];
+        const isSel = start + i === modal.selected;
+        const label = entry.label || "";
+        const currentTag = entry.active ? " (current)" : "";
+
+        const metaBits = [];
+        if (entry.timeLabel) metaBits.push(entry.timeLabel);
+        if (Array.isArray(entry.metaParts)) {
+          for (const part of entry.metaParts) {
+            if (part) metaBits.push(part);
+          }
+        }
+        if (showDirTag && entry.dirLabel) {
+          metaBits.push(entry.dirLabel);
+        } else if (!showDirTag && entry.shortId) {
+          metaBits.push(entry.shortId);
+        }
+        const metaRaw = metaBits.join(" · ");
+
+        if (isSel) {
+          const rightBudget = metaRaw ? displayWidth(metaRaw) + 3 : 0;
+          const titleBudget = Math.max(12, innerWidth - 4 - rightBudget);
+          const leftRaw = ` ▸ ${truncateAnsi(`${label}${currentTag}`, titleBudget, "…")}`;
+          const rowLine = alignLeftRight(leftRaw, metaRaw ? `${metaRaw} ` : "", innerWidth, 2);
+          contentLines.push(style.selected(padEndVisible(rowLine, innerWidth)));
+        } else {
+          const marker = entry.active ? style.success("●") : " ";
+          const rightStyled = metaRaw ? style.muted(metaRaw) : "";
+          const rightWidth = rightStyled ? displayWidth(rightStyled) + 2 : 0;
+          const titleBudget = Math.max(12, innerWidth - 3 - rightWidth);
+          const titleText = truncateAnsi(label, titleBudget, "…");
+          const leftStyled = ` ${marker} ${entry.active ? style.bold(titleText) : style.text(titleText)}${
+            entry.active ? style.success(currentTag) : ""
+          }`;
+          contentLines.push(alignLeftRight(leftStyled, rightStyled, innerWidth, 2));
+        }
+
+        const previewWidth = Math.max(12, innerWidth - 5);
+        if (entry.preview) {
+          const prefix = isSel ? style.accent("❯") : style.muted("❯");
+          const snippet = truncateAnsi(entry.preview, previewWidth, "…");
+          contentLines.push(`   ${prefix} ${style.muted(snippet)}`);
+        } else {
+          const fallbackParts = [];
+          if (entry.cwd) fallbackParts.push(entry.cwd);
+          if (entry.shortId) fallbackParts.push(entry.shortId);
+          const fallback = fallbackParts.join(" · ");
+          contentLines.push(`   ${style.muted(truncateAnsi(fallback || "No message preview", previewWidth, "…"))}`);
+        }
+      }
+
+      contentLines.push(style.border("─".repeat(innerWidth)));
+      const rangeText = items.length > slice.length
+        ? `${start + 1}-${start + slice.length} of ${items.length}`
+        : `${items.length} ${items.length === 1 ? "session" : "sessions"}`;
+      const hintParts = ["↑/↓ move", "Enter resume"];
+      if (scope) {
+        hintParts.push(scope.active === "all" ? "Tab this dir" : "Tab all dirs");
+      }
+      if (modal.filter) {
+        hintParts.push("^U clear");
+      }
+      hintParts.push("Esc close");
+      contentLines.push(
+        alignLeftRight(style.muted(hintParts.join(" · ")), style.muted(rangeText), innerWidth, 2),
+      );
     } else {
+      const maxItems = Math.max(4, Math.min(12, height - 8));
       const { start, slice } = sliceCenteredWindow(items, modal.selected, maxItems);
       for (let i = 0; i < slice.length; i += 1) {
         const entry = slice[i];
