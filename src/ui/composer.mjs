@@ -15,10 +15,22 @@ export class Composer {
     this.scrollTop = 0;
     this.pastedRegistry = new Map();
     this.nextPasteId = 1;
+    this._graphemeText = "";
+    this._graphemeCache = [];
   }
 
   getGraphemes() {
-    return splitGraphemes(this.text);
+    if (this._graphemeText !== this.text) {
+      this._graphemeText = this.text;
+      this._graphemeCache = splitGraphemes(this.text);
+    }
+    return this._graphemeCache;
+  }
+
+  clearHistory() {
+    this.history = [];
+    this.historyIndex = -1;
+    this.historyDraft = "";
   }
 
   setText(newText, cursorAtEnd = true) {
@@ -56,10 +68,12 @@ export class Composer {
   insert(str) {
     if (!str) return;
     const normalized = String(str).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const graphemes = this.getGraphemes();
+    const graphemes = [...this.getGraphemes()];
     const inserted = splitGraphemes(normalized);
     graphemes.splice(this.cursor, 0, ...inserted);
     this.text = graphemes.join("");
+    this._graphemeText = this.text;
+    this._graphemeCache = graphemes;
     this.cursor += inserted.length;
     this.historyIndex = -1;
   }
@@ -130,9 +144,11 @@ export class Composer {
 
   deleteGraphemeRange(start, count) {
     if (count <= 0) return false;
-    const graphemes = this.getGraphemes();
+    const graphemes = [...this.getGraphemes()];
     graphemes.splice(start, count);
     this.text = graphemes.join("");
+    this._graphemeText = this.text;
+    this._graphemeCache = graphemes;
     this.cursor = start;
     this.historyIndex = -1;
     return true;
@@ -316,10 +332,12 @@ export class Composer {
   }
 
   replaceRange(startIdx, endIdx, replacement) {
-    const graphemes = this.getGraphemes();
+    const graphemes = [...this.getGraphemes()];
     const inserted = splitGraphemes(replacement);
     graphemes.splice(startIdx, endIdx - startIdx, ...inserted);
     this.text = graphemes.join("");
+    this._graphemeText = this.text;
+    this._graphemeCache = graphemes;
     this.cursor = startIdx + inserted.length;
     this.historyIndex = -1;
   }

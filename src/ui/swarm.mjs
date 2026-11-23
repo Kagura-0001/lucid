@@ -333,17 +333,25 @@ export class MultiAgentTracker {
     if (!output) return;
     const cleanOutput = sanitizeUntrustedText(output);
     const lines = cleanOutput.split(/\r?\n/);
+    const workerMatchers = [];
+    for (const [wName, w] of this.workers) {
+      const escaped = wName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      workerMatchers.push({
+        worker: w,
+        regex: new RegExp(`(?:^|[^a-z0-9_-])${escaped}(?:$|[^a-z0-9_-])`, "i"),
+      });
+    }
+    const now = Date.now();
     for (const line of lines) {
-      for (const [wName, w] of this.workers) {
-        const escaped = wName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const nameMatch = new RegExp(`(?:^|[^a-z0-9_-])${escaped}(?:$|[^a-z0-9_-])`, "i").test(line);
-        const stateMatch = nameMatch && /\b(working|waiting|stopped|killed)\b/i.exec(line);
-        if (stateMatch) {
-          const wState = stateMatch[1].toLowerCase();
-          w.state = wState;
-          w.updatedAt = Date.now();
+      const stateMatch = /\b(working|waiting|stopped|killed)\b/i.exec(line);
+      if (!stateMatch) continue;
+      const wState = stateMatch[1].toLowerCase();
+      for (const { worker, regex } of workerMatchers) {
+        if (regex.test(line)) {
+          worker.state = wState;
+          worker.updatedAt = now;
           if (wState === "killed" || wState === "stopped") {
-            w.endedAt = w.endedAt || Date.now();
+            worker.endedAt = worker.endedAt || now;
           }
         }
       }
@@ -352,10 +360,10 @@ export class MultiAgentTracker {
     if (hintName && this.workers.has(hintName)) {
       const w = this.workers.get(hintName);
       w.output = cleanOutput;
-      w.updatedAt = Date.now();
+      w.updatedAt = now;
       if (status === "failed" || status === "error") {
         w.state = "failed";
-        w.endedAt = Date.now();
+        w.endedAt = now;
       }
     }
   }
@@ -814,9 +822,40 @@ function renderMemberHeader(member, width, style, spinnerFrame, { live }) {
   return out;
 }
 
-function pushMarkdownSection(out, heading, text, width, style) {
+const boardMessageMdCache = new WeakMap();
+
+function renderCachedBoardMessageBody(msg, width, style) {
+  const key = `${width}|${style.name}|${style.depth}|${msg.body}`;
+  const cached = boardMessageMdCache.get(msg);
+  if (cached && cached.key === key) {
+    return cached.lines;
+  }
+  const lines = safeRenderMarkdown(msg.body, width, style);
+  boardMessageMdCache.set(msg, { key, lines });
+  return lines;
+}
+
+const memberSectionMdCache = new WeakMap();
+
+function renderCachedMemberMarkdown(owner, slotKey, text, width, style) {
+  let slots = memberSectionMdCache.get(owner);
+  if (!slots) {
+    slots = new Map();
+    memberSectionMdCache.set(owner, slots);
+  }
+  const cacheKey = `${width}|${style.name}|${style.depth}|${text}`;
+  const cached = slots.get(slotKey);
+  if (cached && cached.cacheKey === cacheKey) {
+    return cached.lines;
+  }
+  const lines = safeRenderMarkdown(text, width, style);
+  slots.set(slotKey, { cacheKey, lines });
+  return lines;
+}
+
+function pushMarkdownSection(out, owner, slotKey, heading, text, width, style) {
   out.push(style.accent(heading));
-  for (const ml of safeRenderMarkdown(text, Math.max(16, width - 2), style)) {
+  for (const ml of renderCachedMemberMarkdown(owner, slotKey, text, Math.max(16, width - 2), style)) {
     out.push(ml ? `  ${ml}` : "");
   }
 }
@@ -824,7 +863,7 @@ function pushMarkdownSection(out, heading, text, width, style) {
 function renderMemberSections(member, width, style, spinnerFrame, { live }) {
   const out = [];
   if (!live && member.latestPost?.text) {
-    pushMarkdownSection(out, "Latest Board Post", member.latestPost.text, width, style);
+    pushMarkdownSection(out, member, "latestPost", "Latest Board Post", member.latestPost.text, width, style);
     out.push("");
   }
 
@@ -842,7 +881,8 @@ function renderMemberSections(member, width, style, spinnerFrame, { live }) {
 
   if (steps.length > 0) {
     out.push(style.accent(live ? "Live Activity" : "Recent Steps"));
-    for (const step of steps) {
+    for (let sIdx = 0; sIdx < steps.length; sIdx += 1) {
+      const step = steps[sIdx];
       if (step.kind === "tool") {
         const icon = statusBadge(step.status, style, spinnerFrame);
         const label = truncateAnsi(step.activity || step.name || "tool", Math.max(16, width - 6), "…");
@@ -850,7 +890,7 @@ function renderMemberSections(member, width, style, spinnerFrame, { live }) {
         out.push(`  ${icon} ${styled}`);
       } else if (live && step.kind === "message" && step.text) {
         out.push("");
-        for (const ml of safeRenderMarkdown(step.text, Math.max(16, width - 2), style)) {
+        for (const ml of renderCachedMemberMarkdown(step, "msg", step.text, Math.max(16, width - 2), style)) {
           out.push(ml ? `  ${ml}` : "");
         }
         out.push("");
@@ -865,12 +905,12 @@ function renderMemberSections(member, width, style, spinnerFrame, { live }) {
       (!live || (member.output !== lastMessageStep?.text && member.output !== member.latestPost?.text)),
   );
   if (showLatestOutput) {
-    pushMarkdownSection(out, "Latest Output", member.output, width, style);
+    pushMarkdownSection(out, member, "output", "Latest Output", member.output, width, style);
     if (live && member.latestPost?.text) out.push("");
   }
 
   if (live && member.latestPost?.text) {
-    pushMarkdownSection(out, "Latest Board Post", member.latestPost.text, width, style);
+    pushMarkdownSection(out, member, "latestPost", "Latest Board Post", member.latestPost.text, width, style);
   }
 
   if (!showLatestOutput && !member.latestPost?.text && (!live || steps.length === 0)) {
@@ -970,7 +1010,7 @@ export function renderSwarmBoardView(tracker, boardState, cols, height, style, s
       for (const msg of msgs) {
         const header = `${style.accentBold(msg.from)} ${style.muted("→")} ${style.accentAlt(msg.to)}  ${style.muted(formatClock(msg.time))}`;
         out.push(truncateAnsi(header, rightWidth, "…"));
-        const bodyLines = safeRenderMarkdown(msg.body, Math.max(16, rightWidth - 2), style);
+        const bodyLines = renderCachedBoardMessageBody(msg, Math.max(16, rightWidth - 2), style);
         for (const bl of bodyLines) {
           out.push(bl ? `  ${bl}` : "");
         }

@@ -40,9 +40,25 @@ function safeStat(filePath) {
   }
 }
 
+async function safeStatAsync(filePath) {
+  try {
+    return await fs.promises.stat(filePath);
+  } catch {
+    return null;
+  }
+}
+
 function readJsonFile(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonFileAsync(filePath) {
+  try {
+    return JSON.parse(await fs.promises.readFile(filePath, "utf8"));
   } catch {
     return null;
   }
@@ -70,6 +86,34 @@ function readFileTail(filePath, maxBytes) {
     if (fd !== null) {
       try {
         fs.closeSync(fd);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+}
+
+async function readFileTailAsync(filePath, maxBytes) {
+  let handle = null;
+  try {
+    handle = await fs.promises.open(filePath, "r");
+    const size = (await handle.stat()).size;
+    const start = Math.max(0, size - maxBytes);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    let text = buffer.toString("utf8");
+    if (start > 0) {
+      const firstNewline = text.indexOf("\n");
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+    }
+    return text;
+  } catch {
+    return "";
+  } finally {
+    if (handle !== null) {
+      try {
+        await handle.close();
       } catch {
         // Ignore
       }
@@ -416,6 +460,7 @@ export class AgyStateWatcher {
     this.sessionId = "";
     this.fileMtimes = new Map();
     this.transcriptCache = new Map(); // conversationId -> { mtime, summary }
+    this.subagentFileCache = new Map(); // fileName -> { mtime, size, record }
     this.seenMessageFiles = new Map(); // fileName -> parsed message
     this.snapshot = null;
   }
@@ -425,6 +470,7 @@ export class AgyStateWatcher {
     this.sessionId = sessionId || "";
     this.fileMtimes.clear();
     this.transcriptCache.clear();
+    this.subagentFileCache.clear();
     this.seenMessageFiles.clear();
     this.snapshot = null;
   }
@@ -436,6 +482,13 @@ export class AgyStateWatcher {
   /** Records a path's mtime; returns true when it changed since the last poll. */
   trackChange(key, filePath) {
     const mtime = safeStat(filePath)?.mtimeMs || 0;
+    const previous = this.fileMtimes.get(key);
+    this.fileMtimes.set(key, mtime);
+    return previous !== mtime;
+  }
+
+  async trackChangeAsync(key, filePath) {
+    const mtime = (await safeStatAsync(filePath))?.mtimeMs || 0;
     const previous = this.fileMtimes.get(key);
     this.fileMtimes.set(key, mtime);
     return previous !== mtime;
@@ -454,6 +507,85 @@ export class AgyStateWatcher {
     const summary = { ...summarizeTranscriptTail(steps), transcriptPath, updatedAt: mtime, startedAt };
     this.transcriptCache.set(conversationId, { mtime, summary });
     return { summary, changed: true };
+  }
+
+  async readTranscriptSummaryAsync(conversationId) {
+    const transcriptPath = path.join(this.systemDir(conversationId), "logs", "transcript.jsonl");
+    const stats = await safeStatAsync(transcriptPath);
+    const mtime = stats?.mtimeMs || 0;
+    const cached = this.transcriptCache.get(conversationId);
+    if (cached && cached.mtime === mtime) {
+      return { summary: cached.summary, changed: false };
+    }
+    const steps = mtime ? parseJsonLines(await readFileTailAsync(transcriptPath, TRANSCRIPT_TAIL_BYTES)) : [];
+    const startedAt = stats?.birthtimeMs || stats?.ctimeMs || 0;
+    const summary = { ...summarizeTranscriptTail(steps), transcriptPath, updatedAt: mtime, startedAt };
+    this.transcriptCache.set(conversationId, { mtime, summary });
+    return { summary, changed: true };
+  }
+
+  readSubagentRecords(subagentsDir) {
+    const subagentRecords = [];
+    let names = [];
+    try {
+      names = fs.readdirSync(subagentsDir).filter((name) => name.endsWith(".json"));
+    } catch {
+      this.subagentFileCache.clear();
+      return subagentRecords;
+    }
+    const present = new Set(names);
+    for (const cachedName of [...this.subagentFileCache.keys()]) {
+      if (!present.has(cachedName)) this.subagentFileCache.delete(cachedName);
+    }
+    for (const name of names) {
+      const filePath = path.join(subagentsDir, name);
+      const stats = safeStat(filePath);
+      if (!stats) continue;
+      const cached = this.subagentFileCache.get(name);
+      if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
+        if (cached.record) subagentRecords.push(cached.record);
+        continue;
+      }
+      const record = readJsonFile(filePath);
+      const valid = record && record.conversationId ? record : null;
+      this.subagentFileCache.set(name, { mtime: stats.mtimeMs, size: stats.size, record: valid });
+      if (valid) subagentRecords.push(valid);
+    }
+    return subagentRecords;
+  }
+
+  async readSubagentRecordsAsync(subagentsDir) {
+    const subagentRecords = [];
+    let names = [];
+    try {
+      names = (await fs.promises.readdir(subagentsDir)).filter((name) => name.endsWith(".json"));
+    } catch {
+      this.subagentFileCache.clear();
+      return subagentRecords;
+    }
+    const present = new Set(names);
+    for (const cachedName of [...this.subagentFileCache.keys()]) {
+      if (!present.has(cachedName)) this.subagentFileCache.delete(cachedName);
+    }
+    const loaded = await Promise.all(
+      names.map(async (name) => {
+        const filePath = path.join(subagentsDir, name);
+        const stats = await safeStatAsync(filePath);
+        if (!stats) return null;
+        const cached = this.subagentFileCache.get(name);
+        if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
+          return cached.record;
+        }
+        const record = await readJsonFileAsync(filePath);
+        const valid = record && record.conversationId ? record : null;
+        this.subagentFileCache.set(name, { mtime: stats.mtimeMs, size: stats.size, record: valid });
+        return valid;
+      }),
+    );
+    for (const record of loaded) {
+      if (record) subagentRecords.push(record);
+    }
+    return subagentRecords;
   }
 
   readMessages(messagesDir) {
@@ -476,66 +608,45 @@ export class AgyStateWatcher {
     return messages.slice(-MAX_MESSAGES);
   }
 
-  /**
-   * Re-reads whatever changed. Returns the new snapshot when anything changed,
-   * or null when nothing did (so callers can skip re-rendering).
-   */
-  poll() {
-    if (!this.sessionId || !this.dataDir) return null;
-    const baseDir = this.systemDir(this.sessionId);
-    let changed = false;
-
-    const subagentsDir = path.join(baseDir, "subagents");
-    const messagesDir = path.join(baseDir, "messages");
-    const swarmDir = path.join(baseDir, "swarm");
-    const membersPath = path.join(swarmDir, "members.json");
-    const boardPath = path.join(swarmDir, "board.jsonl");
-    const planPath = path.join(swarmDir, "plan.json");
-
-    const subagentsChanged = this.trackChange("subagents", subagentsDir);
-    const messagesChanged = this.trackChange("messages", messagesDir);
-    const membersChanged = this.trackChange("members", membersPath);
-    const boardChanged = this.trackChange("board", boardPath);
-    const planChanged = this.trackChange("plan", planPath);
-    changed = subagentsChanged || messagesChanged || membersChanged || boardChanged || planChanged || !this.snapshot;
-
-    const previous = this.snapshot || {};
-
-    // Subagent state files are rewritten in place (ALIVE -> KILLED), which does not
-    // always bump the directory mtime, so read the (small) files every poll and
-    // compare their states with the previous poll.
-    const subagentRecords = [];
+  async readMessagesAsync(messagesDir) {
+    let names = [];
     try {
-      for (const name of fs.readdirSync(subagentsDir)) {
-        if (!name.endsWith(".json")) continue;
-        const record = readJsonFile(path.join(subagentsDir, name));
-        if (record && record.conversationId) subagentRecords.push(record);
-      }
+      names = (await fs.promises.readdir(messagesDir)).filter((name) => name.endsWith(".json") && name !== "read.json");
     } catch {
-      // No subagents yet.
+      return [];
     }
-    const subagentSignature = subagentRecords
-      .map((record) => `${record.conversationId}:${record.state}`)
-      .sort()
-      .join("|");
-    if (subagentSignature !== previous.subagentSignature) {
-      changed = true;
+    const unseen = names.filter((name) => !this.seenMessageFiles.has(name));
+    if (unseen.length > 0) {
+      const parsed = await Promise.all(
+        unseen.map(async (name) => ({ name, message: await readJsonFileAsync(path.join(messagesDir, name)) })),
+      );
+      for (const { name, message } of parsed) {
+        if (message && typeof message.content === "string") {
+          this.seenMessageFiles.set(name, message);
+        }
+      }
     }
+    const messages = [...this.seenMessageFiles.values()]
+      .filter((message) => message.sender && message.sender !== "system")
+      .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    return messages.slice(-MAX_MESSAGES);
+  }
 
-    const messages = messagesChanged || !previous.messages ? this.readMessages(messagesDir) : previous.messages;
-    const members = membersChanged || !previous.membersFile ? readJsonFile(membersPath) : previous.membersFile;
-    const plan = planChanged || previous.plan === undefined ? readJsonFile(planPath) : previous.plan;
-    const board = boardChanged || !previous.board
-      ? parseJsonLines(readFileTail(boardPath, 512 * 1024)).slice(-MAX_BOARD_LINES)
-      : previous.board;
-
+  buildSnapshotFromParts({
+    changed,
+    subagentSignature,
+    subagentRecords,
+    messages,
+    members,
+    plan,
+    board,
+    summaryByConvId,
+  }) {
     const latestMessageBySender = new Map();
     for (const message of messages) {
       latestMessageBySender.set(message.sender, message);
     }
 
-    // Swarm workers are also registered as subagents ("Swarm Worker (name)");
-    // list them once, as swarm members.
     const memberEntries = members && members.members && typeof members.members === "object" ? members.members : {};
     const swarmConversationIds = new Set(
       Object.values(memberEntries)
@@ -546,27 +657,34 @@ export class AgyStateWatcher {
     const subagents = subagentRecords
       .filter((record) => !swarmConversationIds.has(record.conversationId))
       .map((record) => {
-      const isKilled = /KILLED/.test(record.state || "");
-      const { summary, changed: transcriptChanged } = this.readTranscriptSummary(record.conversationId);
-      if (transcriptChanged) changed = true;
-      const reply = latestMessageBySender.get(record.conversationId);
-      let state = summary.phase;
-      if (isKilled) state = "killed";
-      else if (summary.phase === "idle") state = reply ? "completed" : "idle";
-      return {
-        conversationId: record.conversationId,
-        role: record.subagentDescriptor?.role || "Subagent",
-        typeName: record.subagentDescriptor?.typeName || "subagent",
-        state,
-        activity: isKilled ? "" : summary.activity,
-        lastText: summary.lastText,
-        reply: reply ? reply.content : "",
-        updatedAt: summary.updatedAt,
-        startedAt: summary.startedAt,
-        transcriptPath: summary.transcriptPath,
-        recentSteps: summary.recentSteps || [],
-      };
-    });
+        const isKilled = /KILLED/.test(record.state || "");
+        const summary = summaryByConvId.get(record.conversationId) || {
+          activity: "",
+          phase: "working",
+          lastText: "",
+          updatedAt: 0,
+          startedAt: 0,
+          transcriptPath: "",
+          recentSteps: [],
+        };
+        const reply = latestMessageBySender.get(record.conversationId);
+        let state = summary.phase;
+        if (isKilled) state = "killed";
+        else if (summary.phase === "idle") state = reply ? "completed" : "idle";
+        return {
+          conversationId: record.conversationId,
+          role: record.subagentDescriptor?.role || "Subagent",
+          typeName: record.subagentDescriptor?.typeName || "subagent",
+          state,
+          activity: isKilled ? "" : summary.activity,
+          lastText: summary.lastText,
+          reply: reply ? reply.content : "",
+          updatedAt: summary.updatedAt,
+          startedAt: summary.startedAt,
+          transcriptPath: summary.transcriptPath,
+          recentSteps: summary.recentSteps || [],
+        };
+      });
 
     const workers = [];
     for (const [name, member] of Object.entries(memberEntries)) {
@@ -574,9 +692,7 @@ export class AgyStateWatcher {
       if (member.conversation_id === this.sessionId) continue;
       const phase = String(member.phase || "").toUpperCase();
       const isKilled = member.killed || phase === "KILLED";
-      const summaryRes = member.conversation_id ? this.readTranscriptSummary(member.conversation_id) : null;
-      if (summaryRes?.changed) changed = true;
-      const summary = summaryRes?.summary || null;
+      const summary = member.conversation_id ? summaryByConvId.get(member.conversation_id) || null : null;
 
       const wakeMode = String(member.wake_mode || "").toLowerCase();
       const isParkedByWakeMode = wakeMode === "mentions" || wakeMode === "anything";
@@ -632,5 +748,149 @@ export class AgyStateWatcher {
       plan,
     };
     return this.snapshot;
+  }
+
+  /**
+   * Re-reads whatever changed synchronously. Returns the new snapshot when
+   * anything changed, or null when nothing did.
+   */
+  poll() {
+    if (!this.sessionId || !this.dataDir) return null;
+    const baseDir = this.systemDir(this.sessionId);
+    const subagentsDir = path.join(baseDir, "subagents");
+    const messagesDir = path.join(baseDir, "messages");
+    const swarmDir = path.join(baseDir, "swarm");
+    const membersPath = path.join(swarmDir, "members.json");
+    const boardPath = path.join(swarmDir, "board.jsonl");
+    const planPath = path.join(swarmDir, "plan.json");
+
+    const subagentsChanged = this.trackChange("subagents", subagentsDir);
+    const messagesChanged = this.trackChange("messages", messagesDir);
+    const membersChanged = this.trackChange("members", membersPath);
+    const boardChanged = this.trackChange("board", boardPath);
+    const planChanged = this.trackChange("plan", planPath);
+    let changed = subagentsChanged || messagesChanged || membersChanged || boardChanged || planChanged || !this.snapshot;
+
+    const previous = this.snapshot || {};
+    const subagentRecords = this.readSubagentRecords(subagentsDir);
+    const subagentSignature = subagentRecords
+      .map((record) => `${record.conversationId}:${record.state}`)
+      .sort()
+      .join("|");
+    if (subagentSignature !== previous.subagentSignature) {
+      changed = true;
+    }
+
+    const messages = messagesChanged || !previous.messages ? this.readMessages(messagesDir) : previous.messages;
+    const members = membersChanged || !previous.membersFile ? readJsonFile(membersPath) : previous.membersFile;
+    const plan = planChanged || previous.plan === undefined ? readJsonFile(planPath) : previous.plan;
+    const board = boardChanged || !previous.board
+      ? parseJsonLines(readFileTail(boardPath, 512 * 1024)).slice(-MAX_BOARD_LINES)
+      : previous.board;
+
+    const memberEntries = members && members.members && typeof members.members === "object" ? members.members : {};
+    const convIds = new Set();
+    for (const record of subagentRecords) convIds.add(record.conversationId);
+    for (const member of Object.values(memberEntries)) {
+      if (member?.conversation_id && member.conversation_id !== this.sessionId) {
+        convIds.add(member.conversation_id);
+      }
+    }
+
+    const summaryByConvId = new Map();
+    for (const convId of convIds) {
+      const res = this.readTranscriptSummary(convId);
+      if (res.changed) changed = true;
+      summaryByConvId.set(convId, res.summary);
+    }
+
+    return this.buildSnapshotFromParts({
+      changed,
+      subagentSignature,
+      subagentRecords,
+      messages,
+      members,
+      plan,
+      board,
+      summaryByConvId,
+    });
+  }
+
+  /**
+   * Non-blocking async variant of poll() used by the TUI timer so reading
+   * dozens of worker transcripts never blocks the main event loop.
+   */
+  async pollAsync() {
+    const activeSessionId = this.sessionId;
+    if (!activeSessionId || !this.dataDir) return null;
+    const baseDir = this.systemDir(activeSessionId);
+    const subagentsDir = path.join(baseDir, "subagents");
+    const messagesDir = path.join(baseDir, "messages");
+    const swarmDir = path.join(baseDir, "swarm");
+    const membersPath = path.join(swarmDir, "members.json");
+    const boardPath = path.join(swarmDir, "board.jsonl");
+    const planPath = path.join(swarmDir, "plan.json");
+
+    const [subagentsChanged, messagesChanged, membersChanged, boardChanged, planChanged] = await Promise.all([
+      this.trackChangeAsync("subagents", subagentsDir),
+      this.trackChangeAsync("messages", messagesDir),
+      this.trackChangeAsync("members", membersPath),
+      this.trackChangeAsync("board", boardPath),
+      this.trackChangeAsync("plan", planPath),
+    ]);
+    if (this.sessionId !== activeSessionId) return null;
+
+    let changed = subagentsChanged || messagesChanged || membersChanged || boardChanged || planChanged || !this.snapshot;
+    const previous = this.snapshot || {};
+
+    const [subagentRecords, messages, members, plan, board] = await Promise.all([
+      this.readSubagentRecordsAsync(subagentsDir),
+      messagesChanged || !previous.messages ? this.readMessagesAsync(messagesDir) : Promise.resolve(previous.messages),
+      membersChanged || !previous.membersFile ? readJsonFileAsync(membersPath) : Promise.resolve(previous.membersFile),
+      planChanged || previous.plan === undefined ? readJsonFileAsync(planPath) : Promise.resolve(previous.plan),
+      boardChanged || !previous.board
+        ? readFileTailAsync(boardPath, 512 * 1024).then((txt) => parseJsonLines(txt).slice(-MAX_BOARD_LINES))
+        : Promise.resolve(previous.board),
+    ]);
+    if (this.sessionId !== activeSessionId) return null;
+
+    const subagentSignature = subagentRecords
+      .map((record) => `${record.conversationId}:${record.state}`)
+      .sort()
+      .join("|");
+    if (subagentSignature !== previous.subagentSignature) {
+      changed = true;
+    }
+
+    const memberEntries = members && members.members && typeof members.members === "object" ? members.members : {};
+    const convIds = new Set();
+    for (const record of subagentRecords) convIds.add(record.conversationId);
+    for (const member of Object.values(memberEntries)) {
+      if (member?.conversation_id && member.conversation_id !== activeSessionId) {
+        convIds.add(member.conversation_id);
+      }
+    }
+
+    const summaryResults = await Promise.all(
+      [...convIds].map(async (convId) => ({ convId, res: await this.readTranscriptSummaryAsync(convId) })),
+    );
+    if (this.sessionId !== activeSessionId) return null;
+
+    const summaryByConvId = new Map();
+    for (const { convId, res } of summaryResults) {
+      if (res.changed) changed = true;
+      summaryByConvId.set(convId, res.summary);
+    }
+
+    return this.buildSnapshotFromParts({
+      changed,
+      subagentSignature,
+      subagentRecords,
+      messages,
+      members,
+      plan,
+      board,
+      summaryByConvId,
+    });
   }
 }

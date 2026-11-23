@@ -333,39 +333,13 @@ test("Shift+Tab cycles into a session-level Bypass mode and back out", async () 
   assert.equal(launched.getModeCycle().some((entry) => entry.id === "bypass"), false);
 });
 
-test("when mouseCapture is OFF, Alternate Scroll Up/Down bursts scroll timeline instead of moving composer cursor", async () => {
-  const { LucidApp } = await import("../src/app.mjs");
-  const app = new LucidApp({ cwd: "/tmp", noMouse: true });
-  app.scheduleRender = () => {};
-  app.state.maxScrollOffset = 50;
-  app.state.scrollOffset = 0;
-  app.state.composer.pushHistory("previous prompt");
-
-  // Simulate a terminal Alternate Scroll (?1007h) wheel-up notch: 3x Up in one stdin batch
-  app.dispatchInputBatch([
-    { type: "key", name: "up", ctrl: false, alt: false, shift: false },
-    { type: "key", name: "up", ctrl: false, alt: false, shift: false },
-    { type: "key", name: "up", ctrl: false, alt: false, shift: false },
-  ]);
-
-  assert.equal(app.state.scrollOffset, 3);
-  assert.equal(app.state.composer.text, "", "wheel burst must not load prompt history into composer");
-
-  // Scrolling back down to bottom returns scrollOffset to 0
-  app.dispatchInputBatch([
-    { type: "key", name: "down", ctrl: false, alt: false, shift: false },
-    { type: "key", name: "down", ctrl: false, alt: false, shift: false },
-    { type: "key", name: "down", ctrl: false, alt: false, shift: false },
-  ]);
-  assert.equal(app.state.scrollOffset, 0);
-});
-
-test("when mouseCapture is OFF, single Up/Down recalls prompt history while trailing wheel ticks continue scrolling", async () => {
+test("keyboard Up/Down arrows strictly navigate composer history and never scroll timeline, even in rapid bursts", async () => {
   const { LucidApp } = await import("../src/app.mjs");
   const app = new LucidApp({ cwd: "/tmp", noMouse: true });
   app.scheduleRender = () => {};
   app.scheduleScrollFlush = () => {};
   app.state.maxScrollOffset = 50;
+  app.state.scrollOffset = 0;
   app.state.composer.pushHistory("first prompt");
   app.state.composer.pushHistory("/help");
   app.state.composer.pushHistory("previous prompt");
@@ -373,35 +347,19 @@ test("when mouseCapture is OFF, single Up/Down recalls prompt history while trai
   const up = { type: "key", name: "up", ctrl: false, alt: false, shift: false };
   const down = { type: "key", name: "down", ctrl: false, alt: false, shift: false };
 
-  // Outside a wheel burst, a single Up/Down navigates prompt history rather than scrolling.
-  app.dispatchInputBatch([up]);
-  assert.equal(app.state.composer.text, "previous prompt", "single Up should recall latest user prompt");
-  assert.equal(app.state.scrollOffset, 0, "single Up outside a scroll burst must not scroll timeline");
-
-  // Navigating past a /command in history must not open the slash popup and trap Up/Down.
-  app.dispatchInputBatch([up]);
-  assert.equal(app.state.composer.text, "/help");
-  assert.equal(app.popup, null, "history recall onto a /command must not open slash autocomplete");
-  app.dispatchInputBatch([up]);
-  assert.equal(app.state.composer.text, "first prompt");
-
-  // Return down through history back to the empty draft.
-  app.dispatchInputBatch([down]);
-  assert.equal(app.state.composer.text, "/help");
-  app.dispatchInputBatch([down]);
-  assert.equal(app.state.composer.text, "previous prompt");
-  app.dispatchInputBatch([down]);
-  assert.equal(app.state.composer.text, "");
-
-  // Immediately after a wheel burst, a single trailing Up continues scrolling without touching history.
+  // Rapid burst of 3x Up arrows (e.g. holding the key down) walks prompt history and never scrolls.
   app.dispatchInputBatch([up, up, up]);
-  assert.equal(app.state.scrollOffset, 3);
-  app.dispatchInputBatch([up]);
-  assert.equal(app.state.scrollOffset, 4);
+  assert.equal(app.state.scrollOffset, 0, "keyboard Up bursts must never scroll the timeline");
+  assert.equal(app.state.composer.text, "first prompt");
+  assert.equal(app.popup, null, "history recall onto /help must not open slash autocomplete");
+
+  // Rapid burst of 3x Down arrows returns to the empty draft without scrolling.
+  app.dispatchInputBatch([down, down, down]);
+  assert.equal(app.state.scrollOffset, 0, "keyboard Down bursts must never scroll the timeline");
   assert.equal(app.state.composer.text, "");
 });
 
-test("even when mouseCapture is ON, Alternate Scroll Up/Down bursts scroll timeline without recalling history", async () => {
+test("mouse wheel strictly scrolls timeline and never recalls composer history", async () => {
   const { LucidApp } = await import("../src/app.mjs");
   const app = new LucidApp({ cwd: "/tmp" });
   app.scheduleRender = () => {};
@@ -411,14 +369,86 @@ test("even when mouseCapture is ON, Alternate Scroll Up/Down bursts scroll timel
   app.state.scrollOffset = 0;
   app.state.composer.pushHistory("previous prompt");
 
-  const up = { type: "key", name: "up", ctrl: false, alt: false, shift: false };
-  app.dispatchInputBatch([up, up, up]);
-  assert.equal(app.state.scrollOffset, 3, "outer terminal/tmux arrow burst must scroll even when mouseCapture is ON");
-  assert.equal(app.state.composer.text, "", "wheel burst must not load prompt history into composer");
+  app.dispatchInputBatch([
+    { type: "mouse", action: "wheelUp", col: 10, row: 10 },
+    { type: "mouse", action: "wheelUp", col: 10, row: 10 },
+  ]);
+  assert.equal(app.state.scrollOffset, 6, "mouse wheelUp scrolls timeline");
+  assert.equal(app.state.composer.text, "", "mouse wheel must never touch composer history");
 
-  app.lastAltScrollAt = 0;
-  app.dispatchInputBatch([up]);
-  assert.equal(app.state.composer.text, "previous prompt", "single Up keypress recalls prompt history");
+  app.dispatchInputBatch([
+    { type: "mouse", action: "wheelDown", col: 10, row: 10 },
+  ]);
+  assert.equal(app.state.scrollOffset, 3, "mouse wheelDown scrolls timeline back");
+  assert.equal(app.state.composer.text, "");
+});
+
+test("streaming new lines anchors viewport when user has scrolled up to read history", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const app = new LucidApp({ cwd: "/tmp" });
+  app.scheduleRender = () => {};
+  app.state.sessionId = "sess-anchor";
+  const initialLines = Array.from({ length: 40 }, (_, i) => `Line ${i}`).join("\n\n");
+  const item = { type: "assistant", text: initialLines, streaming: true, _rev: 0 };
+  app.state.items = [item];
+
+  // Initial frame at bottom (scrollOffset = 0)
+  app.buildScreenFrame(80, 20);
+  const baseCount = app.prevTimelineLineCount;
+
+  // User scrolls up 10 lines
+  app.state.scrollOffset = 10;
+  app.buildScreenFrame(80, 20);
+  const firstLineBefore = app.timelineLayout.firstLineIndex;
+
+  // Agent streams 4 more paragraphs at bottom
+  item.text += "\n\nNew paragraph A\n\nNew paragraph B\n\nNew paragraph C\n\nNew paragraph D";
+  item._rev += 1;
+  app.timelineDirty = true;
+  app.buildScreenFrame(80, 20);
+
+  assert.ok(app.prevTimelineLineCount > baseCount);
+  assert.equal(
+    app.timelineLayout.firstLineIndex,
+    firstLineBefore,
+    "scrolled-up viewport must stay anchored on the exact same first visible line while streaming",
+  );
+});
+
+test("incremental streaming markdown matches full renderMarkdown and caches stable prefix", async () => {
+  const { renderMarkdown, renderMarkdownStreamingCached } = await import("../src/ui/markdown.mjs");
+  const style = createThemeStyler("transparent", 24);
+  const item = {
+    type: "assistant",
+    streaming: true,
+    text: [
+      "## Summary",
+      "",
+      "Intro paragraph with **bold** and $O(n)$.",
+      "",
+      "```js",
+      "const x = 1;",
+      "```",
+      "",
+      "| A | B |",
+      "| --- | --- |",
+      "| 1 | 2 |",
+      "",
+      "Streaming tail line",
+    ].join("\n"),
+  };
+
+  const full = renderMarkdown(item.text, 80, style);
+  const inc = renderMarkdownStreamingCached(item, 80, style);
+  assert.deepEqual(inc, full);
+
+  // Append more tokens to active tail: prefix stays cached, output still matches full render exactly.
+  item.text += " with more tokens";
+  assert.deepEqual(renderMarkdownStreamingCached(item, 80, style), renderMarkdown(item.text, 80, style));
+
+  // Unclosed code fence at end must not split inside the fence.
+  item.text += "\n\n```python\ndef foo():\n\n    return 42";
+  assert.deepEqual(renderMarkdownStreamingCached(item, 80, style), renderMarkdown(item.text, 80, style));
 });
 
 test("applyHostSnapshot seeds composer prompt history so Up recalls previous session prompts", async () => {

@@ -62,47 +62,15 @@ export function sliceViewportRows(timelineLines, viewportHeight, scrollOffset, s
   return { maxScroll, scrollOffset: clampedOffset, startIdx, rawViewportRows, visibleRows };
 }
 
-function isPlainVerticalArrow(ev) {
-  return (
-    ev &&
-    ev.type === "key" &&
-    !ev.ctrl &&
-    !ev.alt &&
-    !ev.shift &&
-    (ev.name === "up" || ev.name === "down")
-  );
-}
-
 /**
- * Catches Alternate Scroll arrow bursts (2+ same-direction Up/Down arrows in one
- * chunk, or trailing ticks within 180 ms) from terminals or multiplexers such as
- * tmux with `mouse off` that still translate wheel notches into arrow keys even
- * when ?1007l or ?1000h is active. Single Up/Down presses still recall prompt history.
+ * Dispatches a batch of decoded stdin events in order.
+ * Keyboard Up/Down arrows strictly control composer cursor/history and never
+ * scroll the timeline; mouse wheel events strictly scroll and never touch
+ * composer history.
  */
 export function dispatchInputBatch(app, events) {
-  let i = 0;
-  while (i < events.length) {
-    const ev = events[i];
-    if (!app.modal && !app.boardOpen && !app.popup && isPlainVerticalArrow(ev)) {
-      let j = i + 1;
-      while (j < events.length && isPlainVerticalArrow(events[j]) && events[j].name === ev.name) {
-        j += 1;
-      }
-      const runLen = j - i;
-      const now = Date.now();
-      const continuingAltScroll = now - app.lastAltScrollAt < 180;
-
-      if (runLen >= 2 || continuingAltScroll) {
-        const direction = ev.name === "up" ? 1 : -1;
-        app.lastAltScrollAt = now;
-        app.scrollBy(direction * runLen);
-        i = j;
-        continue;
-      }
-    }
-
-    handleInputEvent(app, ev);
-    i += 1;
+  for (let i = 0; i < events.length; i += 1) {
+    handleInputEvent(app, events[i]);
   }
 }
 

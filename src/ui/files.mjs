@@ -123,47 +123,86 @@ export function tryLoadDroppedImage(pastedText, cwd) {
   }
 }
 
+function parseClipboardImageBuffer(buf, requirePngSig = false) {
+  if (!buf || buf.length < 16 || buf.length > MAX_IMAGE_BYTES) return null;
+  const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+  const isJpeg = buf[0] === 0xff && buf[1] === 0xd8;
+  if (requirePngSig && !isPng) return null;
+  if (!isPng && !isJpeg) return null;
+
+  const mimeType = isPng ? "image/png" : "image/jpeg";
+  const ext = isPng ? "png" : "jpg";
+  return {
+    path: null,
+    label: `clipboard-${Date.now().toString().slice(-4)}.${ext}`,
+    mimeType,
+    sizeBytes: buf.length,
+    data: buf.toString("base64"),
+  };
+}
+
+function getClipboardImageProbes() {
+  if (process.platform === "darwin") {
+    return [{ cmd: "pngpaste", args: ["-"] }];
+  }
+  // Over headless SSH without X11/Wayland, probing clipboard tools can block or fail.
+  if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+    return [];
+  }
+  return [
+    { cmd: "wl-paste", args: ["--type", "image/png"] },
+    { cmd: "xclip", args: ["-selection", "clipboard", "-t", "image/png", "-o"] },
+    { cmd: "xsel", args: ["--clipboard", "--output"], requirePngSig: true },
+  ];
+}
+
 /**
  * Best-effort local clipboard image capture (Wayland wl-paste, X11 xclip, macOS pngpaste).
  * Returns an image attachment object or null when no local clipboard image is available.
  */
 export function tryReadClipboardImage() {
-  const candidates =
-    process.platform === "darwin"
-      ? [{ cmd: "pngpaste", args: ["-"] }]
-      : [
-          { cmd: "wl-paste", args: ["--type", "image/png"] },
-          { cmd: "xclip", args: ["-selection", "clipboard", "-t", "image/png", "-o"] },
-          { cmd: "xsel", args: ["--clipboard", "--output"], requirePngSig: true },
-        ];
-
-  for (const probe of candidates) {
+  for (const probe of getClipboardImageProbes()) {
     try {
       const res = spawnSync(probe.cmd, probe.args, {
         encoding: null,
         maxBuffer: MAX_IMAGE_BYTES,
         timeout: 2000,
       });
-      if (res.status !== 0 || !res.stdout || res.stdout.length < 16) continue;
-      const buf = res.stdout;
-      const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
-      const isJpeg = buf[0] === 0xff && buf[1] === 0xd8;
-      if (probe.requirePngSig && !isPng) continue;
-      if (!isPng && !isJpeg) continue;
-      if (buf.length > MAX_IMAGE_BYTES) continue;
-
-      const mimeType = isPng ? "image/png" : "image/jpeg";
-      const ext = isPng ? "png" : "jpg";
-      return {
-        path: null,
-        label: `clipboard-${Date.now().toString().slice(-4)}.${ext}`,
-        mimeType,
-        sizeBytes: buf.length,
-        data: buf.toString("base64"),
-      };
+      if (res.status !== 0) continue;
+      const parsed = parseClipboardImageBuffer(res.stdout, probe.requirePngSig);
+      if (parsed) return parsed;
     } catch {
       // Try next clipboard utility
     }
+  }
+  return null;
+}
+
+/**
+ * Non-blocking version of tryReadClipboardImage so pressing Ctrl+V never freezes
+ * the TUI event loop.
+ */
+export async function tryReadClipboardImageAsync() {
+  for (const probe of getClipboardImageProbes()) {
+    const parsed = await new Promise((resolve) => {
+      try {
+        execFile(
+          probe.cmd,
+          probe.args,
+          { encoding: "buffer", maxBuffer: MAX_IMAGE_BYTES, timeout: 2000 },
+          (err, stdout) => {
+            if (err) {
+              resolve(null);
+              return;
+            }
+            resolve(parseClipboardImageBuffer(stdout, probe.requirePngSig));
+          },
+        );
+      } catch {
+        resolve(null);
+      }
+    });
+    if (parsed) return parsed;
   }
   return null;
 }
@@ -194,9 +233,17 @@ export class WorkspaceFileIndex {
           this.loading = false;
           return;
         }
-        this.files = walkDirectory(this.cwd, MAX_INDEXED_FILES);
-        this.loaded = true;
-        this.loading = false;
+        walkDirectoryAsync(this.cwd, MAX_INDEXED_FILES)
+          .then((walked) => {
+            this.files = walked;
+          })
+          .catch(() => {
+            this.files = [];
+          })
+          .finally(() => {
+            this.loaded = true;
+            this.loading = false;
+          });
       },
     );
   }
@@ -223,7 +270,7 @@ export class WorkspaceFileIndex {
   }
 }
 
-function walkDirectory(rootDir, maxCount) {
+async function walkDirectoryAsync(rootDir, maxCount) {
   const results = [];
   const queue = [""];
 
@@ -232,7 +279,7 @@ function walkDirectory(rootDir, maxCount) {
     const absDir = relDir ? path.join(rootDir, relDir) : rootDir;
     let entries;
     try {
-      entries = fs.readdirSync(absDir, { withFileTypes: true });
+      entries = await fs.promises.readdir(absDir, { withFileTypes: true });
     } catch {
       continue;
     }

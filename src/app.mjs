@@ -41,7 +41,7 @@ import { InputParser } from "./term/input.mjs";
 import { TerminalRenderer } from "./term/renderer.mjs";
 import { sanitizeUntrustedText } from "./term/unicode.mjs";
 import { Composer } from "./ui/composer.mjs";
-import { WorkspaceFileIndex, buildPromptBlocks, formatBytes, tryReadClipboardImage } from "./ui/files.mjs";
+import { WorkspaceFileIndex, buildPromptBlocks, formatBytes, tryReadClipboardImageAsync } from "./ui/files.mjs";
 import { isToolTerminalStatus } from "./ui/format.mjs";
 import { cloneSelection } from "./ui/selection.mjs";
 import { MultiAgentTracker, renderMemberTimeline, renderSwarmBoardView } from "./ui/swarm.mjs";
@@ -134,9 +134,12 @@ export class LucidApp {
 
     this.selection = null;
     this.timelineLayout = null;
+    this.timelineDirty = true;
+    this.prevTimelineLineCount = 0;
+    this.prevTimelineSessionId = null;
+    this.prevTimelineCols = 0;
     this.selectionScheduler = createPacedScheduler(22, () => flushSelectionPatch(this));
     this.scrollScheduler = createPacedScheduler(24, () => flushScroll(this));
-    this.lastAltScrollAt = 0;
     this.pendingChunkEvents = null;
     this.pendingNativeBypass = null;
     this.nativeBypassFlushing = false;
@@ -147,6 +150,7 @@ export class LucidApp {
         })
       : null;
     this.agyStateTimer = null;
+    this.agyPollInFlight = false;
 
     this.renderTimer = null;
     this.renderPriority = false;
@@ -179,11 +183,12 @@ export class LucidApp {
     this.spinnerTimer = setInterval(() => {
       if (this.state.toast && Date.now() >= this.state.toast.expiresAt) {
         this.state.toast = null;
-        this.scheduleRender();
+        this.scheduleRender(false, { spinnerOnly: true });
       }
-      if (this.state.connecting || this.state.busy || this.hasRunningTools() || this.state.multiAgent.hasRunningMembers()) {
+      const timelineAnimated = this.hasAnimatedTimeline();
+      if (this.state.connecting || this.state.busy || timelineAnimated || this.state.multiAgent.hasRunningMembers()) {
         this.state.spinnerFrame = (this.state.spinnerFrame + 1) % 10;
-        this.scheduleRender();
+        this.scheduleRender(false, { spinnerOnly: !timelineAnimated });
       }
     }, 120);
 
@@ -195,24 +200,40 @@ export class LucidApp {
   }
 
   pollAgyState() {
-    if (!this.agyStateWatcher || this.exiting) return;
+    if (!this.agyStateWatcher || this.exiting || this.agyPollInFlight) return;
     this.agyStateWatcher.setSession(this.state.sessionId);
-    let snapshot = null;
-    try {
-      snapshot = this.agyStateWatcher.poll();
-    } catch {
-      return;
-    }
-    if (snapshot) {
-      this.state.multiAgent.applyAgyState(snapshot);
-      maybeFlushPendingNativeBypass(this);
-      this.scheduleRender();
-    }
+    this.agyPollInFlight = true;
+    this.agyStateWatcher
+      .pollAsync()
+      .then((snapshot) => {
+        if (!snapshot || this.exiting) return;
+        this.state.multiAgent.applyAgyState(snapshot);
+        maybeFlushPendingNativeBypass(this);
+        this.scheduleRender();
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.agyPollInFlight = false;
+      });
   }
 
   hasRunningTools() {
     for (const [, tool] of this.toolMap) {
       if (!isToolTerminalStatus(tool.status)) return true;
+    }
+    return false;
+  }
+
+  hasAnimatedTimeline() {
+    if (this.state.items.length === 0) {
+      return Boolean(this.state.connecting);
+    }
+    if (this.hasRunningTools()) return true;
+    for (let i = this.state.items.length - 1; i >= 0; i -= 1) {
+      const item = this.state.items[i];
+      if (item.streaming || (item.type === "shell" && item.status === "running")) {
+        return true;
+      }
     }
     return false;
   }
@@ -612,8 +633,9 @@ export class LucidApp {
     this.scheduleRender(true);
   }
 
-  attachFromClipboard() {
-    const img = tryReadClipboardImage();
+  async attachFromClipboard() {
+    const img = await tryReadClipboardImageAsync();
+    if (this.exiting) return;
     if (img) {
       this.state.stagedImages.push(img);
       this.showToast(`Attached clipboard image (${formatBytes(img.sizeBytes)})`);
@@ -682,7 +704,7 @@ export class LucidApp {
     this.persistConfig(
       { mouseCapture: this.state.mouseCapture },
       this.state.mouseCapture
-        ? "Mouse capture ON (wheel scrolls · drag selects · ↑/↓ prompt history)"
+        ? "Mouse capture ON (wheel scrolls · drag selects · ↑/↓ history only)"
         : "Mouse capture OFF (native drag-select · PgUp/PgDn or Alt+↑/↓ to scroll)",
     );
   }
@@ -802,8 +824,11 @@ export class LucidApp {
   }
 
   // Frame rendering & lifecycle
-  scheduleRender(priority = false) {
+  scheduleRender(priority = false, { spinnerOnly = false } = {}) {
     if (this.exiting || this.replayingSnapshot) return;
+    if (!spinnerOnly) {
+      this.timelineDirty = true;
+    }
     if (this.renderTimer) {
       if (!priority || this.renderPriority) return;
       clearTimeout(this.renderTimer);
@@ -820,9 +845,11 @@ export class LucidApp {
 
   buildScreenFrame(cols, rows) {
     const headerLines = renderHeader(this.state, cols, this.style);
+    const prevLayout = this.timelineLayout;
     this.timelineLayout = null;
 
     if (this.boardOpen && !this.modal) {
+      this.timelineDirty = true;
       const boardHeight = Math.max(6, rows - headerLines.length);
       const renderedBoard = renderSwarmBoardView(
         this.state.multiAgent,
@@ -859,9 +886,40 @@ export class LucidApp {
     const reservedBottom = composerBlock.lines.length + popupLines.length;
     const viewportHeight = Math.max(3, rows - headerLines.length - reservedBottom);
 
-    const timelineLines = focusedMember
-      ? renderMemberTimeline(focusedMember, cols, this.style, this.state.spinnerFrame)
-      : renderTimeline(this.state, cols, this.style);
+    const canReuseTimeline =
+      !this.timelineDirty &&
+      !focusedMember &&
+      prevLayout &&
+      prevLayout.cols === cols &&
+      Array.isArray(prevLayout.lines);
+
+    const timelineLines = canReuseTimeline
+      ? prevLayout.lines
+      : focusedMember
+        ? renderMemberTimeline(focusedMember, cols, this.style, this.state.spinnerFrame)
+        : renderTimeline(this.state, cols, this.style);
+
+    if (!focusedMember) {
+      // Anchor the viewport when the user has scrolled up to read earlier output
+      // so newly streamed lines below do not push the visible text downward.
+      if (
+        this.state.scrollOffset > 0 &&
+        this.prevTimelineLineCount > 0 &&
+        this.prevTimelineSessionId === this.state.sessionId &&
+        this.prevTimelineCols === cols
+      ) {
+        const lineDelta = timelineLines.length - this.prevTimelineLineCount;
+        if (lineDelta > 0) {
+          this.state.scrollOffset += lineDelta;
+        }
+      }
+      this.prevTimelineLineCount = timelineLines.length;
+      this.prevTimelineSessionId = this.state.sessionId;
+      this.prevTimelineCols = cols;
+      this.timelineDirty = false;
+    } else {
+      this.timelineDirty = true;
+    }
 
     const slice = sliceViewportRows(
       timelineLines,

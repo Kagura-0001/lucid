@@ -92,6 +92,7 @@ export function resetConversationState(
     app.state.busy = false;
     app.state.activePromptCount = 0;
     app.state.turnStartedAt = 0;
+    app.state.composer?.clearHistory?.();
   }
 
   if (cancelPermissions && app.permissionQueue.length > 0) {

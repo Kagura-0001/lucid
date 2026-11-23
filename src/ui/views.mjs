@@ -4,7 +4,7 @@ import { PASTED_TOKEN_REGEX } from "./composer.mjs";
 import { renderDiffLines } from "./diff.mjs";
 import { formatBytes } from "./files.mjs";
 import { alignLeftRight, formatDuration, isToolTerminalStatus, sliceCenteredWindow, spinnerChar } from "./format.mjs";
-import { safeRenderMarkdown } from "./markdown.mjs";
+import { renderMarkdownStreamingCached, safeRenderMarkdown } from "./markdown.mjs";
 import { renderSwarmDock } from "./swarm.mjs";
 import {
   classifyToolItemCached,
@@ -406,7 +406,9 @@ function renderUserItem(item, contentWidth, style, state) {
 }
 
 function renderAssistantItem(item, contentWidth, style) {
-  const mdLines = safeRenderMarkdown(item.text || "", contentWidth, style);
+  const mdLines = item.streaming
+    ? renderMarkdownStreamingCached(item, contentWidth, style)
+    : safeRenderMarkdown(item.text || "", contentWidth, style);
   return mdLines.map((ml) => (ml ? `  ${ml}` : ""));
 }
 
@@ -1091,7 +1093,19 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
     contentLines.push("");
     contentLines.push(style.muted("Press Esc or Enter to close"));
   } else if (modal.type === "artifact") {
-    const rendered = safeRenderMarkdown(modal.content || "", innerWidth, style);
+    const artifactContent = modal.content || "";
+    const cacheKey = `${innerWidth}|${style.name}|${style.depth}`;
+    let rendered;
+    if (
+      modal._renderCache &&
+      modal._renderCache.key === cacheKey &&
+      modal._renderCache.content === artifactContent
+    ) {
+      rendered = modal._renderCache.lines;
+    } else {
+      rendered = safeRenderMarkdown(artifactContent, innerWidth, style);
+      modal._renderCache = { key: cacheKey, content: artifactContent, lines: rendered };
+    }
     const maxBodyRows = Math.max(4, height - 6);
     const maxScroll = Math.max(0, rendered.length - maxBodyRows);
     const offset = Math.max(0, Math.min(modal.scrollOffset || 0, maxScroll));

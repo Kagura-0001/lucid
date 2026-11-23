@@ -653,3 +653,106 @@ export function safeRenderMarkdown(text, maxWidth, style) {
     return wrapAnsiText(String(text || ""), Math.max(16, maxWidth));
   }
 }
+
+const streamingMarkdownCache = new WeakMap();
+
+/**
+ * Finds the last blank line outside fenced code blocks and display math blocks,
+ * so completed leading blocks can be cached while only the active tail re-renders.
+ */
+function findLastStableMarkdownBreak(rawLines) {
+  let inFence = false;
+  let fenceChar = "";
+  let fenceLen = 0;
+  let inMath = false;
+  let mathCloseToken = "";
+  let lastBreak = -1;
+
+  for (let i = 0; i < rawLines.length; i += 1) {
+    const trimmed = rawLines[i].trim();
+
+    if (inFence) {
+      if (trimmed.startsWith(fenceChar.repeat(fenceLen)) && trimmed.replaceAll(fenceChar, "").trim() === "") {
+        inFence = false;
+      }
+      continue;
+    }
+
+    if (inMath) {
+      if (rawLines[i].includes(mathCloseToken)) {
+        inMath = false;
+      }
+      continue;
+    }
+
+    if (trimmed === "") {
+      lastBreak = i;
+      continue;
+    }
+
+    const fenceMatch = /^(`{3,}|~{3,})\s*([^\s`]*)/.exec(trimmed);
+    if (fenceMatch) {
+      inFence = true;
+      fenceChar = fenceMatch[1][0];
+      fenceLen = fenceMatch[1].length;
+      continue;
+    }
+
+    if (trimmed.startsWith("$$") || trimmed.startsWith("\\[")) {
+      const closeToken = trimmed.startsWith("\\[") ? "\\]" : "$$";
+      const afterOpen = trimmed.slice(2);
+      if (!afterOpen.includes(closeToken)) {
+        inMath = true;
+        mathCloseToken = closeToken;
+      }
+    }
+  }
+
+  return lastBreak;
+}
+
+/**
+ * Incremental Markdown renderer for streaming assistant items.
+ * Caches all completed leading blocks in a WeakMap keyed by `item` and only
+ * re-renders the active trailing paragraph/fence/table as tokens stream in.
+ */
+export function renderMarkdownStreamingCached(item, maxWidth, style) {
+  const fullText = String(item?.text ?? "");
+  const normalized = fullText.replace(/\r\n/g, "\n");
+  const rawLines = normalized.split("\n");
+  const breakIdx = findLastStableMarkdownBreak(rawLines);
+  if (breakIdx <= 0) {
+    return safeRenderMarkdown(normalized, maxWidth, style);
+  }
+
+  const prefixText = rawLines.slice(0, breakIdx).join("\n");
+  const tailText = rawLines.slice(breakIdx + 1).join("\n");
+  if (!prefixText.trim()) {
+    return safeRenderMarkdown(normalized, maxWidth, style);
+  }
+
+  const layoutKey = `${maxWidth}|${style.name}|${style.depth}`;
+  let cached = item && typeof item === "object" ? streamingMarkdownCache.get(item) : null;
+  let prefixLines;
+  if (cached && cached.layoutKey === layoutKey && cached.prefixText === prefixText) {
+    prefixLines = cached.prefixLines;
+  } else {
+    prefixLines = safeRenderMarkdown(prefixText, maxWidth, style);
+    if (item && typeof item === "object") {
+      streamingMarkdownCache.set(item, { layoutKey, prefixText, prefixLines });
+    }
+  }
+
+  if (!tailText.trim()) {
+    return prefixLines;
+  }
+
+  const tailLines = safeRenderMarkdown(tailText, maxWidth, style);
+  if (tailLines.length === 0) {
+    return prefixLines;
+  }
+  if (prefixLines.length === 0) {
+    return tailLines;
+  }
+  return [...prefixLines, "", ...tailLines];
+}
