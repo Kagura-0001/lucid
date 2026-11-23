@@ -321,6 +321,29 @@ export function summarizeTranscriptTail(steps) {
     }
     return { activity: "running", phase: "working", lastText, lastAt, recentSteps };
   }
+
+  // A completed swarm_wait/wait tool response ("Waiting for any message posted
+  // after #N.") means the worker is parked asleep on the board, not thinking.
+  const lastContent = typeof last.content === "string" ? last.content : "";
+  if (last.type === "SYSTEM_MESSAGE" && /subagents and background tasks have been stopped/i.test(lastContent)) {
+    return { activity: "", phase: "idle", lastText, lastAt, recentSteps };
+  }
+  if (last.type === "GENERIC") {
+    if (/\bWaiting for\b/i.test(lastContent)) {
+      return { activity: "waiting on board", phase: "waiting", lastText, lastAt, recentSteps };
+    }
+    for (let i = steps.length - 2; i >= 0; i -= 1) {
+      const step = steps[i];
+      if (step.type === "PLANNER_RESPONSE") {
+        const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+        const prevCall = calls[calls.length - 1];
+        if (prevCall && /^(swarm_wait|wait)$/.test(prevCall.name || "")) {
+          return { activity: "waiting on board", phase: "waiting", lastText, lastAt, recentSteps };
+        }
+        break;
+      }
+    }
+  }
   return { activity: "thinking", phase: "working", lastText, lastAt, recentSteps };
 }
 
@@ -492,14 +515,23 @@ export class AgyStateWatcher {
       if (summaryRes?.changed) changed = true;
       const summary = summaryRes?.summary || null;
 
+      const wakeMode = String(member.wake_mode || "").toLowerCase();
+      const isParkedByWakeMode = wakeMode === "mentions" || wakeMode === "anything";
       let state;
+      let activity = "";
       if (isKilled) {
         state = "killed";
       } else if (phase && phase !== "RUNNING") {
         state = phase.toLowerCase();
+      } else if (isParkedByWakeMode) {
+        // agy's members.json explicitly records wake_mode ("mentions" / "anything")
+        // when the worker is parked asleep on the board, vs "working" when active.
+        state = "waiting";
+        activity = summary?.phase === "waiting" ? summary.activity : "waiting on board";
       } else if (summary) {
         // A swarm worker whose turn ended is asleep on the board, i.e. waiting.
         state = summary.phase === "idle" ? "waiting" : summary.phase;
+        activity = summary.activity || "";
       } else {
         state = "working";
       }
@@ -511,7 +543,7 @@ export class AgyStateWatcher {
         model: member.model || member.applied_model || "",
         workspace: member.workspace_mode || "",
         state,
-        activity: !isKilled && (!phase || phase === "RUNNING") ? summary?.activity || "" : "",
+        activity: !isKilled && (!phase || phase === "RUNNING") ? activity : "",
         lastText: summary?.lastText || "",
         task: taskText,
         updatedAt: summary?.updatedAt || 0,

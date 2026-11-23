@@ -184,23 +184,51 @@ export class MultiAgentTracker {
       return;
     }
 
-    // 2. Track Subagent invocations
+    // 2. Ignore define_subagent and handle manage_subagents BEFORE subagent
+    // invocation checks so titles like "Run define_subagent" / "Run manage_subagents"
+    // never get recorded as phantom running subagents.
+    if (toolName === "define_subagent" || titleLower.includes("define_subagent")) {
+      return;
+    }
+
+    if (toolName === "manage_subagents" || titleLower.includes("manage_subagents")) {
+      if (input) {
+        if (input.Action === "kill_all") {
+          for (const [, sub] of this.subagents) {
+            if (sub.state === "working" || sub.state === "running") {
+              sub.state = "killed";
+              sub.endedAt = Date.now();
+            }
+          }
+        } else if (input.Action === "kill" && Array.isArray(input.ConversationIds)) {
+          for (const [, sub] of this.subagents) {
+            if (sub.conversationId && input.ConversationIds.includes(sub.conversationId)) {
+              sub.state = "killed";
+              sub.endedAt = Date.now();
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    // 3. Track Subagent invocations
     if (
       toolName === "invoke_subagent" ||
-      titleLower.includes("subagent") ||
+      titleLower.includes("invoke_subagent") ||
       (input && input.TypeName && input.Role && input.Prompt)
     ) {
       this.handleSubagentTool(toolCallId, title, input, output, status);
       return;
     }
 
-    // 3. Track inter-agent / board messages
+    // 4. Track inter-agent / board messages
     if (toolName === "send_message" || (input && input.Recipient && input.Message)) {
       this.handleSendMessageTool(toolCallId, input, output);
       return;
     }
 
-    // 3b. Native swarm board posts by the coordinator
+    // 4b. Native swarm board posts by the coordinator
     if (toolName === "post_message" && input && typeof input.text === "string") {
       const mention = /^@([a-z0-9][a-z0-9_#-]*)/i.exec(input.text.trim());
       this.pushBoardMessage({
@@ -208,26 +236,6 @@ export class MultiAgentTracker {
         to: mention ? `@${mention[1]}` : input.channel ? `#${input.channel}` : "all",
         body: input.text,
       });
-      return;
-    }
-
-    // 4. Track manage_subagents kill
-    if (toolName === "manage_subagents" && input) {
-      if (input.Action === "kill_all") {
-        for (const [, sub] of this.subagents) {
-          if (sub.state === "working" || sub.state === "running") {
-            sub.state = "killed";
-            sub.endedAt = Date.now();
-          }
-        }
-      } else if (input.Action === "kill" && Array.isArray(input.ConversationIds)) {
-        for (const [, sub] of this.subagents) {
-          if (sub.conversationId && input.ConversationIds.includes(sub.conversationId)) {
-            sub.state = "killed";
-            sub.endedAt = Date.now();
-          }
-        }
-      }
       return;
     }
 
@@ -495,35 +503,41 @@ export class MultiAgentTracker {
       if (diskWorker.lastText) worker.output = sanitizeUntrustedText(diskWorker.lastText);
       worker.updatedAt = diskWorker.updatedAt || Date.now();
       if (diskWorker.startedAt) worker.startedAt = diskWorker.startedAt;
-      const isFinished = worker.state === "killed" || worker.state === "stopped";
-      worker.endedAt = isFinished ? worker.endedAt || Date.now() : null;
+      const isFinished = worker.state === "killed" || worker.state === "stopped" || worker.state === "waiting";
+      worker.endedAt = isFinished ? worker.endedAt || diskWorker.updatedAt || Date.now() : null;
       this.workers.set(diskWorker.name, worker);
     }
 
     for (const diskSub of snapshot.subagents || []) {
       const key = `conv:${diskSub.conversationId}`;
       let sub = this.subagents.get(key);
-      if (!sub) {
-        // Adopt the entry created from the invoke_subagent tool call (same role),
-        // so its prompt/brief and start time carry over.
-        let adoptedKey = null;
-        for (const [candidateKey, candidate] of this.subagents) {
-          const isToolCallEntry = !candidateKey.startsWith("conv:");
-          if (isToolCallEntry && candidate.role === diskSub.role && !candidate.conversationId) {
-            adoptedKey = candidateKey;
-            break;
-          }
+
+      // Always reconcile any tool-call placeholder entry matching this conversationId
+      // or role (even if `conv:` already existed) so no duplicate ghost stays running.
+      let adopted = null;
+      for (const [candidateKey, candidate] of [...this.subagents]) {
+        if (candidateKey.startsWith("conv:")) continue;
+        const sameConv = candidate.conversationId && candidate.conversationId === diskSub.conversationId;
+        const sameRoleUnbound = !candidate.conversationId && candidate.role === diskSub.role;
+        if (sameConv || sameRoleUnbound) {
+          if (!adopted) adopted = candidate;
+          this.subagents.delete(candidateKey);
         }
-        sub = adoptedKey ? this.subagents.get(adoptedKey) : null;
-        if (adoptedKey) this.subagents.delete(adoptedKey);
-        sub = sub || createMemberRecord("subagent", {
+      }
+
+      if (!sub) {
+        sub = adopted || createMemberRecord("subagent", {
           id: `sub:${key}`,
           name: sanitizeUntrustedText(diskSub.role),
           role: sanitizeUntrustedText(diskSub.role),
           typeName: sanitizeUntrustedText(diskSub.typeName),
         });
+        sub.id = `sub:${key}`;
         this.subagents.set(key, sub);
+      } else if (adopted && !sub.brief && adopted.brief) {
+        sub.brief = adopted.brief;
       }
+
       sub.conversationId = diskSub.conversationId;
       sub.typeName = sanitizeUntrustedText(diskSub.typeName || sub.typeName);
       sub.state = diskSub.state;
@@ -535,7 +549,18 @@ export class MultiAgentTracker {
       sub.updatedAt = diskSub.updatedAt || Date.now();
       if (diskSub.startedAt) sub.startedAt = diskSub.startedAt;
       const isFinished = ["completed", "killed", "failed", "idle"].includes(sub.state);
-      sub.endedAt = isFinished ? sub.endedAt || Date.now() : null;
+      sub.endedAt = isFinished ? sub.endedAt || diskSub.updatedAt || Date.now() : null;
+    }
+
+    // Reconcile orphaned tool-call-only subagent entries once disk state is authoritative:
+    // agy creates subagents/<cid>.json within ~1-2s of invoke_subagent, so any older
+    // unbound tool-call entry (e.g. replayed from session history) is stale.
+    const now = Date.now();
+    for (const [candidateKey, candidate] of [...this.subagents]) {
+      if (candidateKey.startsWith("conv:")) continue;
+      if (now - (candidate.updatedAt || candidate.startedAt || 0) > 15_000) {
+        this.subagents.delete(candidateKey);
+      }
     }
 
     // The board feed becomes the real swarm board plus messages from subagents.

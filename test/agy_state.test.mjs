@@ -310,3 +310,69 @@ test("subagent state flips to killed when agy rewrites its state file", () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test("define_subagent / manage_subagents never become phantom subagents, parked swarm_wait is waiting, and duplicate tool-call subagents reconcile", () => {
+  // 1. Completed swarm_wait GENERIC step must report waiting, not thinking/working.
+  const parked = summarizeTranscriptTail([
+    { type: "PLANNER_RESPONSE", tool_calls: [{ name: "swarm_wait", args: { since: "69" } }] },
+    { type: "GENERIC", status: "DONE", content: "Waiting for any message posted after #69." },
+  ]);
+  assert.equal(parked.phase, "waiting");
+  assert.equal(parked.activity, "waiting on board");
+
+  // 2. Server-restart notice must report idle, not thinking.
+  const stopped = summarizeTranscriptTail([
+    { type: "SYSTEM_MESSAGE", status: "DONE", content: "[Notice] All your subagents and background tasks have been stopped due to server restart." },
+  ]);
+  assert.equal(stopped.phase, "idle");
+
+  // 3. define_subagent and manage_subagents must not create phantom running subagents.
+  const tracker = new MultiAgentTracker();
+  tracker.ingestToolUpdate({
+    toolCallId: "def_1",
+    name: "define_subagent",
+    title: "Run define_subagent",
+    status: "completed",
+  });
+  tracker.ingestToolUpdate({
+    toolCallId: "mgr_1",
+    name: "manage_subagents",
+    title: "Run manage_subagents",
+    rawInput: { Action: "list" },
+    status: "completed",
+  });
+  assert.equal(tracker.subagents.size, 0);
+
+  // 4. Reconciling tool-call subagent whose conversationId was already parsed OR already exists under conv:.
+  tracker.ingestToolUpdate({
+    toolCallId: "sub_call_1",
+    name: "invoke_subagent",
+    title: "Run invoke_subagent",
+    rawInput: { TypeName: "research", Role: "RL Surveyor", Prompt: "Audit PO" },
+    content: [{ type: "text", text: 'conversationId: "7eb23c3d-1111-2222-3333-444444444444"' }],
+    status: "completed",
+  });
+  tracker.applyAgyState({
+    swarmTitle: "Codec WDS",
+    workers: [],
+    subagents: [
+      {
+        conversationId: "7eb23c3d-1111-2222-3333-444444444444",
+        role: "RL Surveyor",
+        typeName: "research",
+        state: "completed",
+        activity: "",
+        reply: "Done",
+        startedAt: Date.now() - 60000,
+        updatedAt: Date.now() - 10000,
+      },
+    ],
+    board: [],
+    messages: [],
+  });
+  assert.equal(tracker.subagents.size, 1);
+  assert.equal(tracker.getSummaryCounts().subagentsRunning, 0);
+  const reconciled = [...tracker.subagents.values()][0];
+  assert.equal(reconciled.state, "completed");
+  assert.equal(reconciled.brief, "Audit PO");
+});

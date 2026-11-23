@@ -940,6 +940,10 @@ export class LucidApp {
       clearInterval(this.agyStateTimer);
       this.agyStateTimer = null;
     }
+    if (this.idleStreamTimer) {
+      clearTimeout(this.idleStreamTimer);
+      this.idleStreamTimer = null;
+    }
 
     if (!detach) {
       drainCancelledPermissions(this.permissionQueue);

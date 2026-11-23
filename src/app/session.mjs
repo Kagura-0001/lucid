@@ -49,7 +49,15 @@ export function finalizeStreamingItems(app, targetType = null) {
   }
 }
 
+export function clearIdleStreamTimer(app) {
+  if (app.idleStreamTimer) {
+    clearTimeout(app.idleStreamTimer);
+    app.idleStreamTimer = null;
+  }
+}
+
 export function finalizeAllStreaming(app) {
+  clearIdleStreamTimer(app);
   finalizeStreamingItems(app);
   for (const item of app.state.items) {
     if (item.fromReplay) item.fromReplay = false;
@@ -738,6 +746,7 @@ export async function switchToSession(app, sessionId, titleLabel = "") {
   finalizeAllStreaming(app);
   seedComposerHistoryFromItems(app);
   app.applySessionMetadata(res);
+  app.pollAgyState?.();
   if (app.state.sessionTitle) {
     app.renderer.setTitle(app.state.sessionTitle);
   }
@@ -779,6 +788,22 @@ function appendStreamingChunk(app, kind, rawUpdate) {
       last._rev = (last._rev || 0) + 1;
     } else {
       items.push({ type: "assistant", text: chunk, streaming: true, _rev: 0 });
+    }
+  }
+  if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
+    // Out-of-turn / reactive wakeup chunks (e.g. /goal completion or async
+    // subagent wakeup after promptDone) arrive while state.busy is false, so no
+    // promptDone follows them. Finalize automatically once chunks go quiet.
+    clearIdleStreamTimer(app);
+    if (!app.state.busy && !app.replayingSnapshot) {
+      app.idleStreamTimer = setTimeout(() => {
+        app.idleStreamTimer = null;
+        if (!app.state.busy && !app.exiting) {
+          finalizeAllStreaming(app);
+          app.scheduleRender();
+        }
+      }, 2500);
+      app.idleStreamTimer.unref?.();
     }
   }
   app.scheduleRender();
