@@ -118,11 +118,43 @@ export function serializeBlocksForStreamJson(blocks) {
   return parts.join("\n\n").trim();
 }
 
+const TRANSCRIPT_THINKING_TAIL_BYTES = 256 * 1024;
+
+function readTailUtf8(filePath, maxBytes) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const size = fs.fstatSync(fd).size;
+    if (size <= 0) return "";
+    const start = Math.max(0, size - maxBytes);
+    const length = size - start;
+    const buf = Buffer.allocUnsafe(length);
+    fs.readSync(fd, buf, 0, length, start);
+    let text = buf.toString("utf8");
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl >= 0 ? text.slice(nl + 1) : "";
+    }
+    return text;
+  } catch {
+    return "";
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+}
+
 function readTranscriptStepThinking(dataDir, sessionId, stepIndex) {
   if (!dataDir || !sessionId || typeof stepIndex !== "number") return null;
   const transcriptPath = path.join(dataDir, "brain", sessionId, ".system_generated", "logs", "transcript.jsonl");
   try {
-    const text = fs.readFileSync(transcriptPath, "utf8");
+    const text = readTailUtf8(transcriptPath, TRANSCRIPT_THINKING_TAIL_BYTES);
+    if (!text) return null;
     const lines = text.split("\n");
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       const line = lines[i].trim();

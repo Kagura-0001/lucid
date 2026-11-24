@@ -13,6 +13,32 @@ const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const PERM_HOOK_SCRIPT_PATH = path.resolve(THIS_DIR, "perm_hook.mjs");
 export const LUCID_HOOK_NAME = "lucid-permission-bridge";
 
+// Only match tools that can mutate files/state, execute commands, or hit external
+// MCP/web/browser surfaces. Read-only tools (view_file, grep_search, list_dir,
+// find_by_name, exit_plan_mode, subagents, etc.) never spawn a hook subprocess.
+export const PERM_HOOK_MATCHER = [
+  "run_command",
+  "write_to_file",
+  "replace_file_content",
+  "multi_replace_file_content",
+  "sed_file",
+  "notebook_edit",
+  "notebook_execution",
+  "call_mcp_tool",
+  "read_url_content",
+  "execute_browser_javascript",
+  "open_browser_url",
+  "click_browser_pixel",
+  "browser_click_element",
+  "browser_input",
+  "browser_press_key",
+  "browser_drag_pixel_to_pixel",
+  "browser_select_option",
+  "delete_knowledge",
+  "manage_task",
+  "schedule",
+].join("|");
+
 const MAX_UNIX_SOCKET_PATH_BYTES = 96;
 
 export function getAgyHooksPath(geminiDir = "") {
@@ -49,7 +75,7 @@ export function ensureLucidPermissionHook({
   const desiredEntry = {
     PreToolUse: [
       {
-        matcher: ".*",
+        matcher: PERM_HOOK_MATCHER,
         hooks: [
           {
             type: "command",
@@ -74,8 +100,9 @@ export function ensureLucidPermissionHook({
     }
   }
 
-  const currentCmd = existing[LUCID_HOOK_NAME]?.PreToolUse?.[0]?.hooks?.[0]?.command;
-  if (currentCmd === desiredCommand) {
+  const currentRule = existing[LUCID_HOOK_NAME]?.PreToolUse?.[0];
+  const currentCmd = currentRule?.hooks?.[0]?.command;
+  if (currentRule?.matcher === PERM_HOOK_MATCHER && currentCmd === desiredCommand) {
     return { ok: true, updated: false, hooksPath };
   }
 
