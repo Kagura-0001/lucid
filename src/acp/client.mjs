@@ -236,7 +236,7 @@ export class AcpClient extends EventEmitter {
     return this.rpc.request("session/set_model", { sessionId, modelId: modelValue }, 10000);
   }
 
-  async stop(activeSessionId = null) {
+  async stop(activeSessionId = null, { killGraceMs = 1500 } = {}) {
     this.stopping = true;
     if (activeSessionId) {
       await this.closeSession(activeSessionId);
@@ -263,7 +263,7 @@ export class AcpClient extends EventEmitter {
               // Ignore
             }
             resolve();
-          }, 1500);
+          }, killGraceMs);
           child.once("exit", () => {
             clearTimeout(timer);
             resolve();
@@ -299,7 +299,8 @@ export async function hotSwapAcpClient({
 
   onBindNext(nextAcp);
   // Stop without session/close so the on-disk session stays intact for resume.
-  await currentClient.stop(null).catch(() => {});
+  // Use a shorter SIGKILL grace window because agy acp can ignore SIGTERM.
+  await currentClient.stop(null, { killGraceMs: 300 }).catch(() => {});
 
   const modelOpt = findConfigOption(sessionMeta.configOptions, "model");
   const restoreModel = modelOpt?.currentValue || sessionMeta.models?.currentModelId || "";
@@ -332,29 +333,18 @@ export async function hotSwapAcpClient({
     throw new Error("Replacement ACP backend does not support resuming or loading the active session");
   }
 
-  const updates = [res];
+  const restoreTasks = [];
   if (modeId) {
-    try {
-      updates.push(await nextAcp.setMode(sessionId, modeId));
-    } catch {
-      // Best-effort mode restore
-    }
+    restoreTasks.push(nextAcp.setMode(sessionId, modeId).catch(() => null));
   }
   if (restoreModel) {
-    try {
-      updates.push(await nextAcp.setModel(sessionId, restoreModel, preferConfigModel));
-    } catch {
-      // Best-effort model restore
-    }
+    restoreTasks.push(nextAcp.setModel(sessionId, restoreModel, preferConfigModel).catch(() => null));
   }
   if (effortOpt?.id && restoreEffort) {
-    try {
-      updates.push(await nextAcp.setConfigOption(sessionId, effortOpt.id, restoreEffort));
-    } catch {
-      // Best-effort thought_level restore
-    }
+    restoreTasks.push(nextAcp.setConfigOption(sessionId, effortOpt.id, restoreEffort).catch(() => null));
   }
-  return { nextAcp, updates };
+  const restoredUpdates = restoreTasks.length > 0 ? await Promise.all(restoreTasks) : [];
+  return { nextAcp, updates: [res, ...restoredUpdates] };
 }
 
 /**

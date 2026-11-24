@@ -396,3 +396,115 @@ rl.on("line", (line) => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("switchMode into Bypass updates immediately, skips restart when cycling past quickly, and upgrades in background when held", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "lucid-bypass-instant-"));
+  const bgDir = path.join(tmpDir, "bg");
+  const logPath = path.join(tmpDir, "rpc.jsonl");
+  const mockPath = path.join(tmpDir, "instant_agent.cjs");
+
+  const MOCK_INSTANT_AGENT = `
+const fs = require("node:fs");
+const readline = require("node:readline");
+const logPath = process.argv[2];
+const argvFlags = process.argv.slice(3);
+fs.appendFileSync(logPath, JSON.stringify({ event: "spawn", pid: process.pid, argvFlags }) + "\\n");
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+let mode = "default";
+
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: 1,
+        agentInfo: { name: "Mock Instant Agy", version: "1.5.14" },
+        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, load: {}, list: {}, close: {} } },
+      },
+    });
+    return;
+  }
+  if (msg.method === "session/new" || msg.method === "session/resume") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId: "bg-sess-instant",
+        modes: { currentModeId: mode, availableModes: [{ id: "default", name: "Default" }, { id: "auto", name: "Auto" }] },
+      },
+    });
+    return;
+  }
+  if (msg.method === "session/set_mode" || msg.method === "session/set_config_option") {
+    mode = msg.params.modeId || msg.params.value || mode;
+    send({ jsonrpc: "2.0", id: msg.id, result: { modes: { currentModeId: mode } } });
+    return;
+  }
+  if (msg.id) send({ jsonrpc: "2.0", id: msg.id, result: {} });
+});
+`;
+  fs.writeFileSync(mockPath, MOCK_INSTANT_AGENT, "utf8");
+
+  const launchSpec = {
+    name: "Mock Instant Agy",
+    command: process.execPath,
+    args: [mockPath, logPath],
+    supportsQuotaCli: false,
+    supportsDangerouslySkipPermissions: true,
+  };
+
+  let client = null;
+  try {
+    const spawned = spawnSessionHost({ cwd: tmpDir, launchSpec, bgDir });
+    client = new HostAcpClient({ hostId: spawned.hostId, socketPath: spawned.socketPath, launchSpec, hostPid: spawned.pid });
+    await client.start(10000);
+    await client.createSession(tmpDir, []);
+
+    const app = new LucidApp({ cwd: tmpDir, direct: true });
+    app.scheduleRender = () => {};
+    app.launchSpec = launchSpec;
+    app.nativeBypassDebounceMs = 80;
+    app.acp = client;
+    app.bindAcpClient(client);
+    app.state.connected = true;
+    app.state.sessionId = "bg-sess-instant";
+    app.state.modes = [{ id: "default", name: "Default" }, { id: "auto", name: "Auto" }];
+    app.state.modeId = "default";
+
+    // 1. Cycling into Bypass and immediately out cancels the debounced restart (zero extra spawns).
+    await app.switchMode("bypass");
+    assert.equal(app.state.sessionBypass, true);
+    assert.equal(app.state.modeId, "auto");
+    assert.equal(app.state.nativeBypassActive, false, "switchMode returns without blocking on backend restart");
+
+    await app.switchMode("default");
+    assert.equal(app.state.sessionBypass, false);
+    assert.equal(app.state.modeId, "default");
+
+    await new Promise((r) => setTimeout(r, 140));
+    const spawnsAfterCycle = fs.readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(spawnsAfterCycle.length, 1, "cycling past Bypass quickly must not restart the backend");
+
+    // 2. Staying in Bypass past the debounce window upgrades the backend quietly in the background.
+    await app.switchMode("bypass");
+    for (let i = 0; i < 40 && !app.state.nativeBypassActive; i += 1) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.equal(app.state.nativeBypassActive, true, "holding Bypass completes background native upgrade");
+    const spawnsAfterHold = fs.readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(spawnsAfterHold.length, 2);
+    assert.equal(spawnsAfterHold[1].argvFlags.includes("--dangerously-skip-permissions"), true);
+
+    await client.stop();
+    client = null;
+    await new Promise((r) => setTimeout(r, 100));
+  } finally {
+    if (client) await client.stop().catch(() => {});
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

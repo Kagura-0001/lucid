@@ -19,6 +19,7 @@ import {
   applyHostSnapshot,
   applyToolUpdate,
   bindAcpClient,
+  clearNativeBypassDebounce,
   connectAndStartSession,
   drainCancelledPermissions,
   finalizeAllStreaming,
@@ -143,6 +144,9 @@ export class LucidApp {
     this.pendingChunkEvents = null;
     this.pendingNativeBypass = null;
     this.nativeBypassFlushing = false;
+    this.nativeBypassDebounceTimer = null;
+    this.nativeBypassDebounceTarget = null;
+    this.modeSwitchSeq = 0;
 
     this.agyStateWatcher = isAgyCommand(this.launchSpec.command)
       ? new AgyStateWatcher({
@@ -789,6 +793,8 @@ export class LucidApp {
       attachedImages,
     });
 
+    clearNativeBypassDebounce(this, { deferIfPending: true });
+
     this.state.activePromptCount += 1;
     if (!this.state.busy) {
       this.state.busy = true;
@@ -1019,6 +1025,7 @@ export class LucidApp {
       clearTimeout(this.idleStreamTimer);
       this.idleStreamTimer = null;
     }
+    clearNativeBypassDebounce(this);
 
     if (!detach) {
       drainCancelledPermissions(this.permissionQueue);

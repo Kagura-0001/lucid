@@ -10,6 +10,7 @@ import { formatRelativeTime, isToolTerminalStatus } from "../ui/format.mjs";
 import { extractCleanOutputPreview, parseExitCode } from "../ui/tool_format.mjs";
 
 const MAX_TOOL_OUTPUT = 64 * 1024;
+const NATIVE_BYPASS_DEBOUNCE_MS = 700;
 
 export function summarizeRawInput(rawInput) {
   if (!rawInput) return "";
@@ -232,6 +233,84 @@ export async function syncSessionBypass(app, enabled, { modeId = "" } = {}) {
   }
 }
 
+export function clearNativeBypassDebounce(app, { deferIfPending = false } = {}) {
+  if (app.nativeBypassDebounceTimer) {
+    clearTimeout(app.nativeBypassDebounceTimer);
+    app.nativeBypassDebounceTimer = null;
+  }
+  const target = app.nativeBypassDebounceTarget || null;
+  app.nativeBypassDebounceTarget = null;
+  if (deferIfPending && target && target.enabled !== Boolean(app.state.nativeBypassActive)) {
+    app.pendingNativeBypass = target;
+  }
+}
+
+function canHotSwapNativeBypass(app) {
+  if (!supportsNativeBypassFlag(app.launchSpec) || app.state.launchBypass || !app.state.sessionId || !app.acp) {
+    return false;
+  }
+  if (app.acp.isHosted) return true;
+  return (
+    typeof app.acp.stop === "function" &&
+    (typeof app.acp.resumeSession === "function" || typeof app.acp.loadSession === "function")
+  );
+}
+
+function scheduleNativeBypassSync(app, enabled, { modeId = "" } = {}) {
+  const target = Boolean(enabled);
+  clearNativeBypassDebounce(app);
+  if (!canHotSwapNativeBypass(app)) {
+    app.pendingNativeBypass = null;
+    return { scheduled: false, deferred: false };
+  }
+  if (target === Boolean(app.state.nativeBypassActive)) {
+    app.pendingNativeBypass = null;
+    return { scheduled: false, deferred: false };
+  }
+  if (app.state.busy || app.state.multiAgent?.hasRunningMembers?.()) {
+    app.pendingNativeBypass = { enabled: target, modeId };
+    return { scheduled: false, deferred: true };
+  }
+
+  app.pendingNativeBypass = null;
+  app.nativeBypassDebounceTarget = { enabled: target, modeId };
+  const delayMs = typeof app.nativeBypassDebounceMs === "number" ? app.nativeBypassDebounceMs : NATIVE_BYPASS_DEBOUNCE_MS;
+  app.nativeBypassDebounceTimer = setTimeout(() => {
+    app.nativeBypassDebounceTimer = null;
+    const queued = app.nativeBypassDebounceTarget;
+    app.nativeBypassDebounceTarget = null;
+    if (!queued || app.exiting) return;
+    if (queued.enabled !== Boolean(app.state.sessionBypass)) return;
+    if (queued.enabled === Boolean(app.state.nativeBypassActive)) return;
+    if (app.state.busy || app.state.multiAgent?.hasRunningMembers?.()) {
+      app.pendingNativeBypass = queued;
+      return;
+    }
+    if (app.nativeBypassFlushing) {
+      app.pendingNativeBypass = queued;
+      return;
+    }
+    app.nativeBypassFlushing = true;
+    syncSessionBypass(app, queued.enabled, { modeId: queued.modeId })
+      .then((res) => {
+        if (app.exiting || !res?.restarted) return;
+        app.showToast(
+          queued.enabled
+            ? "Bypass backend ready — Swarm sub-workers auto-approved"
+            : "Standard backend restored",
+        );
+        app.scheduleRender();
+      })
+      .catch(() => {})
+      .finally(() => {
+        app.nativeBypassFlushing = false;
+        maybeFlushPendingNativeBypass(app);
+      });
+  }, delayMs);
+  app.nativeBypassDebounceTimer.unref?.();
+  return { scheduled: true, deferred: false };
+}
+
 export function maybeFlushPendingNativeBypass(app) {
   if (
     !app.pendingNativeBypass ||
@@ -244,6 +323,9 @@ export function maybeFlushPendingNativeBypass(app) {
   }
   const pending = app.pendingNativeBypass;
   app.pendingNativeBypass = null;
+  if (pending.enabled !== Boolean(app.state.sessionBypass) || pending.enabled === Boolean(app.state.nativeBypassActive)) {
+    return;
+  }
   app.nativeBypassFlushing = true;
   syncSessionBypass(app, pending.enabled, { modeId: pending.modeId })
     .then((res) => {
@@ -258,44 +340,78 @@ export function maybeFlushPendingNativeBypass(app) {
     .catch(() => {})
     .finally(() => {
       app.nativeBypassFlushing = false;
+      maybeFlushPendingNativeBypass(app);
     });
 }
 
 export async function switchSessionMode(app, targetId, bypassModeId) {
+  const seq = (app.modeSwitchSeq || 0) + 1;
+  app.modeSwitchSeq = seq;
   try {
     if (targetId === bypassModeId) {
+      const prevModeId = app.state.modeId;
+      const autoModeId = resolveModeId(app, "auto");
       app.state.sessionBypass = true;
       app.approvePendingPermissions();
-      const autoModeId = resolveModeId(app, "auto");
-      const res = await syncSessionBypass(app, true, { modeId: autoModeId || "auto" });
-      if (!res?.restarted && autoModeId && autoModeId !== app.state.modeId && app.state.sessionId) {
-        const modeRes = await app.acp.setMode(app.state.sessionId, autoModeId);
-        app.applySessionMetadata(modeRes);
+      if (autoModeId) {
         app.state.modeId = autoModeId;
       }
-      if (res?.restarted) {
-        app.showToast("Mode → Bypass (backend upgraded with --dangerously-skip-permissions; sub-workers included)", "error");
-      } else if (res?.deferred) {
-        app.showToast("Mode → Bypass (ACP auto-approved; will upgrade backend for sub-workers when idle)", "error");
+
+      const syncPlan = scheduleNativeBypassSync(app, true, { modeId: autoModeId || "auto" });
+      if (syncPlan.deferred) {
+        app.showToast("Mode → Bypass (auto-approving; backend upgrade queued until idle)", "error");
+      } else if (syncPlan.scheduled) {
+        app.showToast("Mode → Bypass (active now; upgrading sub-worker backend in background)", "error");
       } else {
         app.showToast("Mode → Bypass (every tool permission auto-approved this session)", "error");
       }
-    } else {
-      const wasBypass = Boolean(app.state.sessionBypass || app.state.nativeBypassActive || app.pendingNativeBypass);
-      const res = wasBypass ? await syncSessionBypass(app, false, { modeId: targetId }) : null;
-      if (!wasBypass || !res?.restarted) {
-        const modeRes = await app.acp.setMode(app.state.sessionId, targetId);
-        app.applySessionMetadata(modeRes);
-        app.state.modeId = targetId;
+      app.scheduleRender(true);
+
+      if (app.acp?.isHosted) {
+        await app.acp.setBypassPermissions(true, { immediateOnly: true });
       }
+      if (seq === app.modeSwitchSeq && autoModeId && autoModeId !== prevModeId && app.state.sessionId) {
+        const modeRes = await app.acp.setMode(app.state.sessionId, autoModeId);
+        if (seq === app.modeSwitchSeq) {
+          app.applySessionMetadata(modeRes);
+          app.state.modeId = autoModeId;
+        }
+      }
+    } else {
+      const wasBypass = Boolean(
+        app.state.sessionBypass ||
+          app.state.nativeBypassActive ||
+          app.pendingNativeBypass ||
+          app.nativeBypassDebounceTimer,
+      );
+      app.state.sessionBypass = false;
+      app.state.modeId = targetId;
       app.userConfig.mode = targetId;
       saveUserConfig(app.userConfig);
+
+      const syncPlan = wasBypass
+        ? scheduleNativeBypassSync(app, false, { modeId: targetId })
+        : { scheduled: false, deferred: false };
       const target = app.state.modes.find((mode) => mode.id === targetId);
-      const suffix = res?.deferred ? " (backend downgrade queued until idle)" : "";
+      const suffix = syncPlan.deferred ? " (backend downgrade queued until idle)" : "";
       app.showToast(`Mode → ${target?.name || targetId}${suffix}`);
+      app.scheduleRender(true);
+
+      if (wasBypass && app.acp?.isHosted) {
+        await app.acp.setBypassPermissions(false, { immediateOnly: true });
+      }
+      if (seq === app.modeSwitchSeq && app.state.sessionId) {
+        const modeRes = await app.acp.setMode(app.state.sessionId, targetId);
+        if (seq === app.modeSwitchSeq) {
+          app.applySessionMetadata(modeRes);
+          app.state.modeId = targetId;
+        }
+      }
     }
   } catch (err) {
-    app.showToast(`Mode switch failed: ${err.message}`, "error");
+    if (seq === app.modeSwitchSeq) {
+      app.showToast(`Mode switch failed: ${err.message}`, "error");
+    }
   }
   app.scheduleRender();
 }

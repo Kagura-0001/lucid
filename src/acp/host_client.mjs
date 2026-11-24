@@ -298,8 +298,9 @@ export class HostAcpClient extends EventEmitter {
         enabled: Boolean(enabled),
         modeId: opts.modeId || "",
         hasRunningMembers: Boolean(opts.hasRunningMembers),
+        immediateOnly: Boolean(opts.immediateOnly),
       },
-      25000,
+      opts.immediateOnly ? 5000 : 35000,
     ).catch(() => ({ ok: false, restarted: false, deferred: false }));
   }
 

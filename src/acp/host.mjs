@@ -329,11 +329,16 @@ export class SessionHost {
     });
   }
 
-  async syncNativeBypass(enabled, { modeId = "", hasRunningMembers = false } = {}) {
+  async syncNativeBypass(enabled, { modeId = "", hasRunningMembers = false, immediateOnly = false } = {}) {
     const target = Boolean(enabled);
     this.bypassPermissions = target;
     if (target) {
       this.approveAllPendingPermissions();
+    }
+
+    if (immediateOnly) {
+      this.flushMetaNow();
+      return { ok: true, nativeBypass: this.nativeBypassActive, restarted: false, deferred: false };
     }
 
     const canSwapBackend =
@@ -518,6 +523,7 @@ export class SessionHost {
           const res = await this.syncNativeBypass(Boolean(msg.enabled), {
             modeId: msg.modeId || "",
             hasRunningMembers: Boolean(msg.hasRunningMembers),
+            immediateOnly: Boolean(msg.immediateOnly),
           });
           this.reply(socket, id, res);
           return;
@@ -561,9 +567,11 @@ export class SessionHost {
           this.reply(socket, id, { ok: true });
           return;
         case "setMode":
+          if (this.bypassSwapPromise) await this.bypassSwapPromise.catch(() => {});
           this.applyMetaAndReply(socket, id, await this.acp.setMode(msg.sessionId, msg.modeId), msg.modeId);
           return;
         case "setConfigOption":
+          if (this.bypassSwapPromise) await this.bypassSwapPromise.catch(() => {});
           this.applyMetaAndReply(
             socket,
             id,
@@ -571,6 +579,7 @@ export class SessionHost {
           );
           return;
         case "setModel":
+          if (this.bypassSwapPromise) await this.bypassSwapPromise.catch(() => {});
           this.applyMetaAndReply(
             socket,
             id,
@@ -650,6 +659,9 @@ export class SessionHost {
     let stopReason = "";
     let errorMessage = "";
     try {
+      if (this.bypassSwapPromise) {
+        await this.bypassSwapPromise.catch(() => {});
+      }
       const result = await this.acp.sendPrompt(sessionId, blocks);
       stopReason = result?.stopReason || "end_turn";
     } catch (err) {
