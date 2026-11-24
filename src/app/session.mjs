@@ -396,9 +396,16 @@ export async function switchSessionMode(app, targetId, bypassModeId) {
       app.scheduleRender(true);
 
       if (app.acp?.isHosted) {
-        await app.acp.setBypassPermissions(true, { immediateOnly: !app.state.orchestratorConfig });
+        await app.acp.setBypassPermissions(true, {
+          modeId: autoModeId || "auto",
+          immediateOnly: !app.state.orchestratorConfig,
+        });
+        if (app.state.orchestratorConfig) {
+          app.state.nativeBypassActive = true;
+        }
       } else if (app.orchestratorStream) {
         app.orchestratorStream.configure({ bypassPermissions: true, modeId: autoModeId || "auto" });
+        app.state.nativeBypassActive = true;
       }
       if (
         !app.state.orchestratorConfig &&
@@ -434,9 +441,16 @@ export async function switchSessionMode(app, targetId, bypassModeId) {
       app.scheduleRender(true);
 
       if (wasBypass && app.acp?.isHosted) {
-        await app.acp.setBypassPermissions(false, { immediateOnly: !app.state.orchestratorConfig });
+        await app.acp.setBypassPermissions(false, {
+          modeId: targetId,
+          immediateOnly: !app.state.orchestratorConfig,
+        });
+        if (app.state.orchestratorConfig) {
+          app.state.nativeBypassActive = false;
+        }
       } else if (app.orchestratorStream) {
         app.orchestratorStream.configure({ bypassPermissions: false, modeId: targetId });
+        app.state.nativeBypassActive = false;
       }
       if (seq === app.modeSwitchSeq && app.state.sessionId) {
         if (app.acp?.isHosted || !app.state.orchestratorConfig) {

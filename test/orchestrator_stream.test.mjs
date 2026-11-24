@@ -18,8 +18,10 @@ import { OrchestratorStreamClient, serializeBlocksForStreamJson } from "../src/a
 import { LucidApp } from "../src/app.mjs";
 import { buildModelPickerItems } from "../src/app/commands.mjs";
 import { stripAnsi } from "../src/term/unicode.mjs";
+import { Composer } from "../src/ui/composer.mjs";
+import { MultiAgentTracker, renderSwarmDock } from "../src/ui/swarm.mjs";
 import { createThemeStyler } from "../src/ui/themes.mjs";
-import { applyOverlayModal } from "../src/ui/views.mjs";
+import { applyOverlayModal, renderComposerBlock, renderHeader } from "../src/ui/views.mjs";
 
 test("evaluateHookPolicy enforces default, accept-edits, auto, plan, bypass, and unset-sock pass-through", () => {
   // Unset LUCID_PERM_SOCK -> immediate pass-through
@@ -529,4 +531,107 @@ test("/model unified Orchestrator row configures Planner+Executor models/efforts
   } finally {
     fs.rmSync(tmpData, { recursive: true, force: true });
   }
+});
+
+test("Swarm UX: honest bypass badge, /swarm non-native warning, background running banner, and finished monitor collapse", async () => {
+  const style = createThemeStyler("tokyo-night", "truecolor");
+
+  // 1) Header distinguishes pending main-only bypass vs native bypass
+  const mainOnlyHeader = renderHeader(
+    {
+      cwd: "/tmp/proj",
+      modelLabel: "Gemini 4 Neon",
+      modeId: "auto",
+      bypassPermissions: true,
+      nativeBypassActive: false,
+    },
+    120,
+    style,
+  )
+    .map(stripAnsi)
+    .join("\n");
+  assert.ok(mainOnlyHeader.includes("bypass (main only)"), mainOnlyHeader);
+
+  const nativeHeader = renderHeader(
+    {
+      cwd: "/tmp/proj",
+      modelLabel: "Gemini 4 Neon",
+      modeId: "auto",
+      bypassPermissions: true,
+      nativeBypassActive: true,
+    },
+    120,
+    style,
+  )
+    .map(stripAnsi)
+    .join("\n");
+  assert.ok(nativeHeader.includes("bypass") && !nativeHeader.includes("main only"), nativeHeader);
+
+  // 2) Composer shows active Swarm status banner even when main turn is idle (swarm_wait / end_turn)
+  const tracker = new MultiAgentTracker();
+  tracker.applyAgyState({
+    swarmTitle: "Audit 6 Tasks",
+    workers: [
+      { name: "verifier", state: "working", activity: "reading reports", startedAt: Date.now() - 45_000 },
+      { name: "monitor", state: "waiting", activity: "waiting on board", startedAt: Date.now() - 90_000 },
+    ],
+    subagents: [],
+    board: [],
+    messages: [],
+  });
+  const idleWithSwarm = renderComposerBlock(
+    {
+      cwd: "/tmp/proj",
+      busy: false,
+      spinnerFrame: 0,
+      scrollOffset: 0,
+      mouseCapture: true,
+      expandTools: false,
+      thoughtMode: "fold",
+      composer: new Composer(),
+      multiAgent: tracker,
+      items: [],
+    },
+    120,
+    style,
+  );
+  const idleBannerText = idleWithSwarm.lines.map(stripAnsi).join("\n");
+  assert.ok(idleBannerText.includes("Swarm running: verifier"), idleBannerText);
+  assert.ok(idleBannerText.includes("waiting for wakeup"), idleBannerText);
+
+  // 3) Once all non-monitor workers are killed, passive monitor collapses into a quiet completed bar
+  tracker.applyAgyState({
+    swarmTitle: "Audit 6 Tasks",
+    workers: [
+      { name: "verifier", state: "killed", activity: "", startedAt: Date.now() - 60_000 },
+      { name: "analyst", state: "killed", activity: "", startedAt: Date.now() - 60_000 },
+      { name: "monitor", state: "waiting", activity: "waiting on board", startedAt: Date.now() - 120_000 },
+    ],
+    subagents: [],
+    board: [],
+    messages: [],
+  });
+  assert.equal(tracker.isSwarmFinished(), true);
+  const finishedDock = renderSwarmDock(tracker, 120, style, 0).map(stripAnsi);
+  assert.equal(finishedDock.length, 1);
+  assert.ok(finishedDock[0].includes('Swarm "Audit 6 Tasks"'), finishedDock[0]);
+  assert.ok(finishedDock[0].includes("completed (2 workers)"), finishedDock[0]);
+  assert.equal(finishedDock[0].includes("monitor"), false);
+
+  // 4) Sending /swarm on agy acp without nativeBypassActive emits an actionable warning notice
+  const app = new LucidApp({ cwd: "/tmp" });
+  app.scheduleRender = () => {};
+  app.state.connected = true;
+  app.state.sessionId = "sess-swarm-warn";
+  app.state.nativeBypassActive = false;
+  app.acp = {
+    isHosted: false,
+    agentCapabilities: {},
+    async sendPrompt() {
+      return { stopReason: "end_turn" };
+    },
+  };
+  await app.sendUserPrompt("/swarm split the audit");
+  const warnNotices = app.state.items.filter((i) => i.type === "notice" && i.level === "warn").map((i) => i.text);
+  assert.ok(warnNotices.some((t) => t.includes("60s") && t.includes("Bypass")), warnNotices.join("\n"));
 });

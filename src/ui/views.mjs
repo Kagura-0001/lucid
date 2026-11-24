@@ -79,7 +79,11 @@ export function renderHeader(state, cols, style) {
   }
 
   if (state.bypassPermissions) {
-    leftParts.push(style.errorBold("bypass"));
+    if (state.nativeBypassActive === false) {
+      leftParts.push(style.warnBold("bypass (main only)"));
+    } else {
+      leftParts.push(style.errorBold("bypass"));
+    }
   }
 
   const rightParts = [];
@@ -862,6 +866,23 @@ export function renderComposerBlock(state, cols, style) {
       } else {
         statusBanner = `${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`;
       }
+    }
+  } else if (state.multiAgent?.hasRunningMembers?.()) {
+    const spin = spinnerChar(state.spinnerFrame);
+    const activeMembers = state.multiAgent
+      .getInspectableMembers()
+      .filter((m) => m.state === "working" || m.state === "running");
+    if (activeMembers.length > 0) {
+      const hasSwarmWorker = activeMembers.some((m) => m.kind === "swarm");
+      const names = activeMembers.slice(0, 2).map((m) => m.name).join(", ");
+      const more = activeMembers.length > 2 ? ` +${activeMembers.length - 2}` : "";
+      const earliestStart = activeMembers.reduce(
+        (min, m) => (m.startedAt && (!min || m.startedAt < min) ? m.startedAt : min),
+        0,
+      );
+      const elapsed = earliestStart ? ` · ${formatDuration(Date.now() - earliestStart)}` : "";
+      const label = hasSwarmWorker ? "Swarm running" : "Agents running";
+      statusBanner = `${style.warn(spin)} ${style.muted(`${label}: ${names}${more}${elapsed} · waiting for wakeup · ^B board`)}`;
     }
   }
 

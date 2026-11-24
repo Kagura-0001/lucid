@@ -897,6 +897,18 @@ export class LucidApp {
       mentionSourceText: displayText || text,
     });
 
+    if (
+      /^\/swarm(\s|$)/i.test(String(text || "").trim()) &&
+      isAgyCommand(this.launchSpec?.command) &&
+      !this.state.orchestratorConfig &&
+      !this.state.nativeBypassActive
+    ) {
+      const hint = this.state.sessionBypass
+        ? "Bypass backend upgrade is still pending (main only) — Swarm workers cannot show permission modals over ACP and will time out after 60s on restricted commands."
+        : "agy acp does not forward Swarm worker permission prompts (workers time out after 60s on restricted commands). Switch to Bypass (Shift+Tab while idle) or launch lucid --bypass before starting /swarm.";
+      this.pushNotice("warn", hint);
+    }
+
     this.state.items.push({
       type: "user",
       text: text || "(image attachment)",

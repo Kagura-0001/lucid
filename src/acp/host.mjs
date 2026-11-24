@@ -442,8 +442,14 @@ export class SessionHost {
   async syncNativeBypass(enabled, { modeId = "", hasRunningMembers = false, immediateOnly = false } = {}) {
     const target = Boolean(enabled);
     this.bypassPermissions = target;
+    if (this.orchestratorConfig && modeId) {
+      this.modeId = modeId;
+    }
     if (this.orchestratorStream) {
-      this.orchestratorStream.configure({ bypassPermissions: target });
+      this.orchestratorStream.configure({
+        bypassPermissions: target,
+        ...(this.orchestratorConfig && modeId ? { modeId } : {}),
+      });
     }
     if (target) {
       this.approveAllPendingPermissions();
@@ -454,7 +460,13 @@ export class SessionHost {
         this.nativeBypassActive = target;
       }
       this.flushMetaNow();
-      return { ok: true, nativeBypass: this.nativeBypassActive, restarted: false, deferred: false };
+      return {
+        ok: true,
+        nativeBypass: this.nativeBypassActive,
+        modeId: this.modeId,
+        restarted: false,
+        deferred: false,
+      };
     }
 
     const canSwapBackend =

@@ -62,7 +62,32 @@ export class MultiAgentTracker {
   getInspectableMembers() {
     return [...this.workers.values(), ...this.subagents.values()]
       .filter((member) => member.state !== "killed")
-      .sort((a, b) => (STRIP_STATE_ORDER[a.state] ?? 9) - (STRIP_STATE_ORDER[b.state] ?? 9));
+      .sort((a, b) => {
+        const stateDiff = (STRIP_STATE_ORDER[a.state] ?? 9) - (STRIP_STATE_ORDER[b.state] ?? 9);
+        if (stateDiff !== 0) return stateDiff;
+        const aMon = a.kind === "swarm" && a.name === "monitor" ? 1 : 0;
+        const bMon = b.kind === "swarm" && b.name === "monitor" ? 1 : 0;
+        return aMon - bMon;
+      });
+  }
+
+  /**
+   * Returns true when a Swarm has finished all real worker tasks and only the
+   * passive `monitor` worker remains parked on the board (agy leaves `monitor`
+   * alive after killing all other workers).
+   */
+  isSwarmFinished() {
+    if (this.workers.size === 0) return false;
+    if (this.hasRunningMembers()) return false;
+    let nonMonitorTotal = 0;
+    for (const [, w] of this.workers) {
+      if (w.name === "monitor") continue;
+      nonMonitorTotal += 1;
+      if (w.state !== "killed" && w.state !== "stopped" && w.state !== "completed") {
+        return false;
+      }
+    }
+    return nonMonitorTotal > 0;
   }
 
   getMemberById(memberId) {
@@ -715,6 +740,19 @@ export function renderSwarmDock(tracker, cols, style, spinnerFrame, options = {}
     if (bits.length === 0) return [];
     bits.push(style.muted("^B board"));
     return [` ${truncateAnsi(bits.join(style.border(" · ")), maxWidth, "…")}`];
+  }
+
+  // Once all non-monitor Swarm workers have been killed/completed, agy keeps
+  // `monitor` parked indefinitely. Collapse to a quiet one-line completion bar
+  // instead of displaying `1 waiting · monitor waiting on board` forever.
+  if (tracker.isSwarmFinished() && !focusedMemberId && counts.subagentsRunning === 0) {
+    const nonMonitorDone = [...tracker.workers.values()].filter((w) => w.name !== "monitor").length;
+    const titleText = counts.swarmTitle ? `Swarm "${counts.swarmTitle}"` : "Swarm";
+    const bits = [`completed (${nonMonitorDone} ${nonMonitorDone === 1 ? "worker" : "workers"})`];
+    if (counts.artifactCount > 0) bits.push(`◇ ${counts.artifactCount}`);
+    const leftDone = `${style.success("✓")} ${style.muted(titleText)}${style.muted(` · ${bits.join(" · ")}`)}`;
+    const rightDone = style.muted("^B board");
+    return [` ${alignLeftRight(leftDone, rightDone, maxWidth, 3)}`];
   }
 
   // Build top summary bar of the dock
