@@ -59,9 +59,30 @@ export function clearIdleStreamTimer(app) {
   }
 }
 
+export function finalizeRunningTools(app) {
+  const now = Date.now();
+  for (const [, tool] of app.toolMap) {
+    if (isToolTerminalStatus(tool.status)) continue;
+    tool.status = "completed";
+    if (!tool.durationMs && tool.startedAt) {
+      tool.durationMs = Math.max(0, now - tool.startedAt);
+    }
+    tool._rev = (tool._rev || 0) + 1;
+  }
+  for (const item of app.state.items) {
+    if (item.type !== "tool" || isToolTerminalStatus(item.status)) continue;
+    item.status = "completed";
+    if (!item.durationMs && item.startedAt) {
+      item.durationMs = Math.max(0, now - item.startedAt);
+    }
+    item._rev = (item._rev || 0) + 1;
+  }
+}
+
 export function finalizeAllStreaming(app) {
   clearIdleStreamTimer(app);
   finalizeStreamingItems(app);
+  finalizeRunningTools(app);
   for (const item of app.state.items) {
     if (item.fromReplay) item.fromReplay = false;
   }

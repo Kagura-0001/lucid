@@ -178,8 +178,15 @@ export class MultiAgentTracker {
     const output = extractOutputText(update);
     const status = update.status || "";
 
-    // 1. Track Swarm tool calls
-    if (toolName === "swarm" || titleLower.startsWith("swarm") || (input && typeof input.action === "string" && ["add", "status", "kill", "title", "model"].includes(input.action) && (input.brief || input.title || input.name || titleLower.includes("swarm")))) {
+    // 1. Track Swarm tool calls (require swarm tool name or explicit swarm action object
+    // so arbitrary shell commands starting with "swarm" never create phantom workers).
+    const hasSwarmAction = Boolean(
+      input &&
+        typeof input.action === "string" &&
+        ["add", "status", "kill", "title", "model"].includes(input.action) &&
+        (input.brief || input.title || input.name || titleLower.includes("swarm")),
+    );
+    if (toolName === "swarm" || titleLower === "run swarm" || hasSwarmAction) {
       this.handleSwarmTool(toolCallId, input, output, status);
       return;
     }

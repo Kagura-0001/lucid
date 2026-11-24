@@ -376,3 +376,39 @@ test("define_subagent / manage_subagents never become phantom subagents, parked 
   assert.equal(reconciled.state, "completed");
   assert.equal(reconciled.brief, "Audit PO");
 });
+
+test("backgrounded run_command tools left in_progress by agy finalize cleanly when the turn ends", async () => {
+  const { LucidApp } = await import("../src/app.mjs");
+  const app = new LucidApp({ cwd: "/tmp", direct: true });
+  app.scheduleRender = () => {};
+  app.state.sessionId = "sess-bg-tool";
+  app.state.busy = true;
+  app.state.activePromptCount = 1;
+
+  app.handleSessionUpdate({
+    sessionId: "sess-bg-tool",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-bg-1",
+      name: "run_command",
+      title: "Profile hotSwapAcpClient",
+      status: "in_progress",
+    },
+  });
+  app.handleSessionUpdate({
+    sessionId: "sess-bg-tool",
+    update: {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-bg-1",
+      status: "in_progress",
+      content: { type: "text", text: "Tool is running as a background task with task id: sess-bg-tool/task-59" },
+    },
+  });
+  assert.equal(app.hasRunningTools(), true);
+
+  // Turn completes without agy ever sending a terminal tool_call_update for tc-bg-1.
+  app.finishPromptTurn(0);
+  assert.equal(app.state.busy, false);
+  assert.equal(app.hasRunningTools(), false, "no tool spinner should remain active after turn finishes");
+  assert.equal(app.toolMap.get("tc-bg-1")?.status, "completed");
+});
