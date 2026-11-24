@@ -11,7 +11,7 @@ import { Composer } from "../src/ui/composer.mjs";
 import { parseAutoCompactOverride } from "../src/ui/format.mjs";
 import { MultiAgentTracker } from "../src/ui/swarm.mjs";
 import { createThemeStyler } from "../src/ui/themes.mjs";
-import { renderComposerBlock, renderHeader, renderTimeline } from "../src/ui/views.mjs";
+import { applyOverlayModal, renderComposerBlock, renderHeader, renderTimeline } from "../src/ui/views.mjs";
 
 test("InputParser decodes Kitty CSI-u spaces, shifted symbols, Unicode, and ignores key release", () => {
   const events = [];
@@ -391,4 +391,150 @@ test("parseAutoCompactOverride parses agy 1.5.15+ formats and renderHeader displ
     if (prevEnv === undefined) delete process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE;
     else process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE = prevEnv;
   }
+});
+
+test("/model opens unified agy-style picker with inline effort cycling and combined apply", async () => {
+  const app = new LucidApp({ cwd: "/tmp" });
+  app.scheduleRender = () => {};
+  app.state.connected = true;
+  app.state.sessionId = "sess-model-1";
+  app.state.models = [
+    { modelId: "gemini-4-neon-low", name: "Gemini 4 Neon (Low)" },
+    { modelId: "gemini-4-neon-medium", name: "Gemini 4 Neon (Medium)" },
+    { modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
+    { modelId: "gemini-4-neon-xhigh", name: "Gemini 4 Neon (Extra)" },
+    { modelId: "claude-opus-5-5-low", name: "Claude Opus 5.5 (Low)" },
+    { modelId: "claude-opus-5-5-medium", name: "Claude Opus 5.5 (Medium)" },
+    { modelId: "claude-opus-5-5-high", name: "Claude Opus 5.5 (High)" },
+    { modelId: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
+    { modelId: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+  ];
+  app.state.configOptions = [
+    {
+      id: "model",
+      name: "Model",
+      currentValue: "gemini-4-neon",
+      options: [
+        { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+        { value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+        { value: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
+        { value: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+      ],
+    },
+    {
+      id: "thought_level",
+      name: "Thinking Level",
+      currentValue: "high",
+      options: [
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+        { value: "xhigh", name: "Extra" },
+      ],
+    },
+  ];
+  app.state.modelLabel = "Gemini 4 Neon";
+  app.state.effortLabel = "High";
+
+  const rpcCalls = [];
+  app.acp = {
+    async setModel(sessionId, value, preferConfig) {
+      rpcCalls.push({ kind: "setModel", sessionId, value, preferConfig });
+      if (value === "claude-opus-5-5") {
+        return {
+          configOptions: [
+            { ...app.state.configOptions[0], currentValue: "claude-opus-5-5" },
+            {
+              id: "thought_level",
+              name: "Thinking Level",
+              currentValue: "high",
+              options: [
+                { value: "low", name: "Low" },
+                { value: "medium", name: "Medium" },
+                { value: "high", name: "High" },
+              ],
+            },
+          ],
+        };
+      }
+      return {
+        configOptions: [{ ...app.state.configOptions[0], currentValue: value }],
+      };
+    },
+    async setConfigOption(sessionId, configId, value) {
+      rpcCalls.push({ kind: "setConfigOption", sessionId, configId, value });
+      const next = app.state.configOptions.map((opt) =>
+        opt.id === configId ? { ...opt, currentValue: value } : opt,
+      );
+      return { configOptions: next };
+    },
+  };
+
+  await app.runLocalCommand("model", "");
+  assert.equal(app.modal?.type, "picker");
+  assert.equal(app.modal?.layout, "model");
+  assert.equal(app.modal?.selected, 0);
+
+  const items = app.modal.filteredItems;
+  assert.deepEqual(
+    items[0].efforts.map((e) => e.label),
+    ["Low", "Medium", "High", "Extra"],
+  );
+  assert.equal(items[0].selectedEffortIdx, 2); // current "high"
+  assert.deepEqual(
+    items[1].efforts.map((e) => e.label),
+    ["Low", "Medium", "High"],
+  );
+  assert.equal(items[1].selectedEffortIdx, 2); // defaults to High
+  assert.equal(items[2].isOrchestrator, true);
+  assert.equal(items[2].efforts.length, 0);
+  assert.equal(items[3].efforts.length, 0);
+  assert.equal(items[3].rightTag, "Medium");
+
+  // Render overlay to verify visual pills and footer hints
+  const style = createThemeStyler("tokyo-night", "truecolor");
+  const baseRows = Array.from({ length: 24 }, () => " ".repeat(100));
+  const rendered = applyOverlayModal(baseRows, 100, app.modal, style).map(stripAnsi).join("\n");
+  assert.ok(rendered.includes("Select Model & Effort"), rendered);
+  assert.ok(rendered.includes("◂ Low · Medium · [High] · Extra ▸"), rendered);
+  assert.ok(rendered.includes("←/→ or Tab effort"), rendered);
+
+  // Press Right on current model (Gemini 4 Neon) -> High to Extra, Enter applies only setConfigOption
+  app.handleModalInput({ type: "key", name: "right" });
+  assert.equal(items[0].selectedEffortIdx, 3);
+  app.handleModalInput({ type: "key", name: "tab" }); // wraps Extra -> Low
+  assert.equal(items[0].selectedEffortIdx, 0);
+  app.handleModalInput({ type: "key", name: "tab", shift: true }); // wraps Low -> Extra
+  assert.equal(items[0].selectedEffortIdx, 3);
+  app.handleModalInput({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.deepEqual(rpcCalls, [
+    { kind: "setConfigOption", sessionId: "sess-model-1", configId: "thought_level", value: "xhigh" },
+  ]);
+  assert.equal(app.state.effortLabel, "Extra");
+
+  // Reopen /model, move down to Claude Opus 5.5, press Left -> High to Medium, Enter applies setModel + setConfigOption
+  rpcCalls.length = 0;
+  await app.runLocalCommand("model", "");
+  app.handleModalInput({ type: "key", name: "down" });
+  assert.equal(app.modal.selected, 1);
+  app.handleModalInput({ type: "key", name: "left" });
+  assert.equal(app.modal.filteredItems[1].selectedEffortIdx, 1); // Medium
+
+  // Check Orchestrator row footer hint when moved down once more, then back up to Opus
+  app.handleModalInput({ type: "key", name: "down" });
+  const orchRendered = applyOverlayModal(baseRows, 100, app.modal, style).map(stripAnsi).join("\n");
+  assert.ok(orchRendered.includes("Orchestrator role effort: native agy /model"), orchRendered);
+  app.handleModalInput({ type: "key", name: "up" });
+
+  app.handleModalInput({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.deepEqual(rpcCalls, [
+    { kind: "setModel", sessionId: "sess-model-1", value: "claude-opus-5-5", preferConfig: true },
+    { kind: "setConfigOption", sessionId: "sess-model-1", configId: "thought_level", value: "medium" },
+  ]);
+  assert.equal(app.state.modelLabel, "Claude Opus 5.5");
+  assert.equal(app.state.effortLabel, "Medium");
 });

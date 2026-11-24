@@ -441,6 +441,13 @@ export function handleModalInput(app, event) {
       modal.scopeFilter.active = modal.scopeFilter.active === "all" ? "cwd" : "all";
       refreshPickerFilter(modal, { resetSelection: true });
       app.scheduleRender(true);
+    } else if ((event.name === "left" || event.name === "right" || event.name === "tab") && items.length > 0) {
+      const current = items[modal.selected];
+      if (current && Array.isArray(current.efforts) && current.efforts.length > 1) {
+        const delta = event.name === "left" || (event.name === "tab" && event.shift) ? -1 : 1;
+        current.selectedEffortIdx = wrapIndex(current.selectedEffortIdx || 0, delta, current.efforts.length);
+        app.scheduleRender(true);
+      }
     } else if (event.ctrl && event.name === "u") {
       if (modal.filter) {
         modal.filter = "";

@@ -971,9 +971,12 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
   if (!modal || height < 4 || cols < 36) return viewportRows;
 
   const isCardPicker = modal.type === "picker" && modal.layout === "cards";
+  const isModelPicker = modal.type === "picker" && modal.layout === "model";
   const boxWidth = isCardPicker
     ? Math.min(Math.max(56, Math.floor(cols * 0.88)), cols - 4, 112)
-    : Math.min(Math.max(44, Math.floor(cols * 0.78)), cols - 4, 86);
+    : isModelPicker
+      ? Math.min(Math.max(56, Math.floor(cols * 0.84)), cols - 4, 102)
+      : Math.min(Math.max(44, Math.floor(cols * 0.78)), cols - 4, 86);
   const innerWidth = boxWidth - 4;
   const contentLines = [];
 
@@ -1025,12 +1028,17 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
       const toggleHint = scope.active === "all" ? "Tab: this dir" : "Tab: all dirs";
       rightHeaderBits.push(`${style.accent(`[${scopeName}]`)} ${style.muted(toggleHint)}`);
     }
+    if (isModelPicker) {
+      rightHeaderBits.push(style.muted("←/→ effort"));
+    }
     rightHeaderBits.push(style.muted(countLabel));
     const rightHeader = rightHeaderBits.join(style.border(" · "));
 
     const placeholder = isCardPicker
       ? "Search title, last message, or ID…"
-      : "Type to filter · ↑/↓ move · Enter select · Esc close";
+      : isModelPicker
+        ? "Search model…"
+        : "Type to filter · ↑/↓ move · Enter select · Esc close";
     const queryDisplay = modal.filter
       ? `${style.muted("Filter:")} ${style.text(modal.filter)}${style.accent("▏")}`
       : style.muted(placeholder);
@@ -1111,6 +1119,82 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
         hintParts.push("^U clear");
       }
       hintParts.push("Esc close");
+      contentLines.push(
+        alignLeftRight(style.muted(hintParts.join(" · ")), style.muted(rangeText), innerWidth, 2),
+      );
+    } else if (isModelPicker) {
+      const maxItems = Math.max(4, Math.min(14, height - 9));
+      const { start, slice } = sliceCenteredWindow(items, modal.selected, maxItems);
+      const compactEfforts = innerWidth < 66;
+
+      for (let i = 0; i < slice.length; i += 1) {
+        const entry = slice[i];
+        const isSel = start + i === modal.selected;
+        const label = entry.label || "";
+        const currentTag = entry.active ? " (current)" : "";
+        const efforts = Array.isArray(entry.efforts) ? entry.efforts : [];
+        const selIdx = Math.max(0, Math.min(entry.selectedEffortIdx || 0, Math.max(0, efforts.length - 1)));
+
+        if (isSel) {
+          let rightRaw = "";
+          if (efforts.length > 1) {
+            const fullPills = efforts.map((e, idx) => (idx === selIdx ? `[${e.label}]` : e.label)).join(" · ");
+            const compactPill = `[${efforts[selIdx].label}]`;
+            rightRaw = compactEfforts ? `◂ ${compactPill} ▸ ` : `◂ ${fullPills} ▸ `;
+          } else if (efforts.length === 1) {
+            rightRaw = `${efforts[0].label} `;
+          } else if (entry.rightTag) {
+            rightRaw = `${entry.rightTag} `;
+          }
+          const rightBudget = rightRaw ? displayWidth(rightRaw) + 2 : 0;
+          const leftBudget = Math.max(14, innerWidth - 4 - rightBudget);
+          const leftRaw = ` ▸ ${truncateAnsi(`${label}${currentTag}`, leftBudget, "…")}`;
+          const rowLine = alignLeftRight(leftRaw, rightRaw, innerWidth, 2);
+          contentLines.push(style.selected(padEndVisible(rowLine, innerWidth)));
+        } else {
+          const marker = entry.active ? style.success("●") : " ";
+          let rightStyled = "";
+          if (efforts.length > 1) {
+            if (compactEfforts) {
+              const activeEffort = efforts[selIdx];
+              rightStyled = entry.active ? style.accentAlt(activeEffort.label) : style.muted(activeEffort.label);
+            } else {
+              rightStyled = efforts
+                .map((e, idx) => (entry.active && idx === selIdx ? style.accentAlt(e.label) : style.muted(e.label)))
+                .join(style.border(" · "));
+            }
+          } else if (efforts.length === 1) {
+            rightStyled = entry.active ? style.accentAlt(efforts[0].label) : style.muted(efforts[0].label);
+          } else if (entry.rightTag) {
+            rightStyled = style.muted(entry.rightTag);
+          }
+          const rightWidth = rightStyled ? displayWidth(rightStyled) + 2 : 0;
+          const titleBudget = Math.max(14, innerWidth - 3 - rightWidth);
+          const titleText = truncateAnsi(label, titleBudget, "…");
+          const leftStyled = ` ${marker} ${entry.active ? style.bold(titleText) : style.text(titleText)}${
+            entry.active ? style.success(currentTag) : ""
+          }`;
+          contentLines.push(alignLeftRight(leftStyled, rightStyled, innerWidth, 2));
+        }
+      }
+
+      contentLines.push(style.border("─".repeat(innerWidth)));
+      const selectedEntry = items[modal.selected] || null;
+      const hintParts = [];
+      if (selectedEntry?.isOrchestrator) {
+        hintParts.push("Orchestrator role effort: native agy /model", "Enter apply");
+      } else if (Array.isArray(selectedEntry?.efforts) && selectedEntry.efforts.length > 1) {
+        hintParts.push("↑/↓ model", "←/→ or Tab effort", "Enter apply");
+      } else {
+        hintParts.push("↑/↓ model", "Enter apply");
+      }
+      if (modal.filter) {
+        hintParts.push("^U clear");
+      }
+      hintParts.push("Esc close");
+      const rangeText = items.length > slice.length
+        ? `${start + 1}-${start + slice.length} of ${items.length}`
+        : `${items.length} ${items.length === 1 ? "model" : "models"}`;
       contentLines.push(
         alignLeftRight(style.muted(hintParts.join(" · ")), style.muted(rangeText), innerWidth, 2),
       );

@@ -22,31 +22,127 @@ const THOUGHT_MODE_ALIASES = {
   off: "hidden",
 };
 
+const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"];
+const EFFORT_DISPLAY_NAMES = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra",
+  max: "Max",
+};
+
+function discoverModelEfforts(modelId, rawModels, activeEffortOpt, isCurrentModel) {
+  const byValue = new Map();
+
+  // Discover exact supported effort variants from `availableModels` (e.g. "gemini-4-neon-xhigh").
+  const prefix = `${modelId}-`;
+  for (const m of Array.isArray(rawModels) ? rawModels : []) {
+    const id = String(m?.modelId || "");
+    if (!id.startsWith(prefix)) continue;
+    const suffix = id.slice(prefix.length).toLowerCase();
+    if (!EFFORT_ORDER.includes(suffix)) continue;
+    byValue.set(suffix, {
+      value: suffix,
+      label: EFFORT_DISPLAY_NAMES[suffix] || suffix,
+      modelId: id,
+    });
+  }
+
+  // Prefer canonical labels from active `thought_level` configOption when available.
+  if (isCurrentModel && activeEffortOpt && Array.isArray(activeEffortOpt.options)) {
+    for (const opt of activeEffortOpt.options) {
+      const val = String(opt?.value || "").toLowerCase();
+      if (!val) continue;
+      const existing = byValue.get(val);
+      byValue.set(val, {
+        value: opt.value,
+        label: opt.name || existing?.label || EFFORT_DISPLAY_NAMES[val] || opt.value,
+        modelId: existing?.modelId || "",
+      });
+    }
+  }
+
+  return [...byValue.values()].sort((a, b) => {
+    const ia = EFFORT_ORDER.indexOf(String(a.value).toLowerCase());
+    const ib = EFFORT_ORDER.indexOf(String(b.value).toLowerCase());
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+}
+
+function defaultEffortIndex(efforts, currentEffortValue, isCurrentModel) {
+  if (!Array.isArray(efforts) || efforts.length === 0) return 0;
+  if (isCurrentModel && currentEffortValue) {
+    const curIdx = efforts.findIndex((e) => String(e.value).toLowerCase() === String(currentEffortValue).toLowerCase());
+    if (curIdx >= 0) return curIdx;
+  }
+  const highIdx = efforts.findIndex((e) => String(e.value).toLowerCase() === "high");
+  if (highIdx >= 0) return highIdx;
+  const medIdx = efforts.findIndex((e) => String(e.value).toLowerCase() === "medium");
+  if (medIdx >= 0) return medIdx;
+  return 0;
+}
+
+export function buildModelPickerItems(app) {
+  const modelOpt = app.getConfigOption("model");
+  const effortOpt = app.getConfigOption("thought_level") || app.getConfigOption("effort");
+  const rawModels = Array.isArray(app.state.models) ? app.state.models : [];
+  const dataDir = app.agyStateWatcher?.dataDir || "";
+  const orchConfigured = readAgyOrchestratorSettings(dataDir);
+
+  if (modelOpt && Array.isArray(modelOpt.options) && modelOpt.options.length > 0) {
+    return {
+      preferConfig: true,
+      currentModelValue: modelOpt.currentValue || "",
+      items: modelOpt.options.map((o) => {
+        const label = o.name || o.value;
+        const isCurrent = o.value === modelOpt.currentValue;
+        const isOrchestrator = /orchestrator/i.test(label) || /orchestrator/i.test(o.value);
+        const efforts = isOrchestrator ? [] : discoverModelEfforts(o.value, rawModels, effortOpt, isCurrent);
+        const selectedEffortIdx = defaultEffortIndex(efforts, effortOpt?.currentValue || "", isCurrent);
+        const fixedEffortMatch = !isOrchestrator && efforts.length === 0 ? /\((Low|Medium|High|XHigh|Extra|Max)\)\s*$/i.exec(label) : null;
+        const rightTag = isOrchestrator
+          ? (orchConfigured || "Planner/Executor · high")
+          : fixedEffortMatch
+            ? fixedEffortMatch[1]
+            : "";
+        return {
+          label,
+          value: o.value,
+          description: rightTag || o.value,
+          active: isCurrent,
+          efforts,
+          selectedEffortIdx,
+          isOrchestrator,
+          rightTag,
+          searchText: [label, o.value, rightTag, ...efforts.map((e) => e.label)].join(" "),
+        };
+      }),
+    };
+  }
+
+  return {
+    preferConfig: false,
+    currentModelValue: "",
+    items: rawModels.map((m) => ({
+      label: m.name || m.modelId,
+      value: m.modelId,
+      description: m.modelId,
+      active: (m.name || m.modelId) === app.state.modelLabel,
+      efforts: [],
+      selectedEffortIdx: 0,
+      isOrchestrator: /orchestrator/i.test(m.name || m.modelId),
+      rightTag: "",
+    })),
+  };
+}
+
 export const COMMAND_SPECS = [
   {
     name: "model",
-    description: "Switch active model",
+    description: "Switch model & thinking effort (←/→ effort)",
     needsConnection: true,
     async run(app) {
-      const modelOpt = app.getConfigOption("model");
-      let items = [];
-      let preferConfig = false;
-      if (modelOpt && Array.isArray(modelOpt.options) && modelOpt.options.length > 0) {
-        preferConfig = true;
-        items = modelOpt.options.map((o) => ({
-          label: o.name || o.value,
-          value: o.value,
-          description: o.value,
-          active: o.value === modelOpt.currentValue,
-        }));
-      } else if (app.state.models.length > 0) {
-        items = app.state.models.map((m) => ({
-          label: m.name || m.modelId,
-          value: m.modelId,
-          description: m.modelId,
-          active: (m.name || m.modelId) === app.state.modelLabel,
-        }));
-      }
+      const { items, preferConfig, currentModelValue } = buildModelPickerItems(app);
 
       if (items.length === 0) {
         app.pushNotice("warn", "No selectable models exposed by this ACP agent.");
@@ -55,13 +151,44 @@ export const COMMAND_SPECS = [
       }
 
       app.openPickerModal({
-        title: "Select Model",
+        title: "Select Model & Effort",
+        layout: "model",
         items,
         onSelect: async (chosen) => {
-          const res = await app.acp.setModel(app.state.sessionId, chosen.value, preferConfig);
-          app.applySessionMetadata(res);
-          app.state.modelLabel = chosen.label;
-          app.showToast(`Model → ${chosen.label}`);
+          const chosenEffort =
+            Array.isArray(chosen.efforts) && chosen.efforts.length > 0
+              ? chosen.efforts[chosen.selectedEffortIdx || 0]
+              : null;
+
+          const modelChanged = !preferConfig || chosen.value !== currentModelValue;
+          if (modelChanged) {
+            const res = await app.acp.setModel(app.state.sessionId, chosen.value, preferConfig);
+            app.applySessionMetadata(res);
+            app.state.modelLabel = chosen.label;
+          }
+
+          let appliedEffortLabel = app.state.effortLabel || "";
+          if (chosenEffort) {
+            const latestEffortOpt = app.getConfigOption("thought_level") || app.getConfigOption("effort");
+            if (
+              latestEffortOpt &&
+              String(latestEffortOpt.currentValue || "").toLowerCase() !== String(chosenEffort.value).toLowerCase()
+            ) {
+              const effortRes = await app.acp.setConfigOption(
+                app.state.sessionId,
+                latestEffortOpt.id,
+                chosenEffort.value,
+              );
+              app.applySessionMetadata(effortRes);
+              app.state.effortLabel = chosenEffort.label;
+              appliedEffortLabel = chosenEffort.label;
+            } else if (latestEffortOpt) {
+              appliedEffortLabel = chosenEffort.label;
+            }
+          }
+
+          const toastLabel = appliedEffortLabel ? `${chosen.label} (${appliedEffortLabel})` : chosen.label;
+          app.showToast(`Model → ${toastLabel}`);
           app.scheduleRender();
         },
       });
