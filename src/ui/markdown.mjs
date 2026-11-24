@@ -1,3 +1,4 @@
+import path from "node:path";
 import { osc8Link } from "../term/ansi.mjs";
 import { displayWidth, padEndVisible, wrapAnsiLine, wrapAnsiText } from "../term/unicode.mjs";
 import { renderLatexMath } from "./math.mjs";
@@ -214,11 +215,197 @@ function findClosingInlineMathDollar(text, contentStart) {
   return -1;
 }
 
+const WEB_SCHEME_RE = /^(?:https?:\/\/|mailto:)/i;
+const CUSTOM_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
+
+function parseMarkdownLinkAt(text, startIdx) {
+  if (text[startIdx] !== "[") return null;
+  const len = text.length;
+  let i = startIdx + 1;
+  let bracketDepth = 1;
+  while (i < len && bracketDepth > 0) {
+    if (text[i] === "\\" && i + 1 < len) {
+      i += 2;
+      continue;
+    }
+    if (text[i] === "[") bracketDepth += 1;
+    else if (text[i] === "]") bracketDepth -= 1;
+    i += 1;
+  }
+  if (bracketDepth !== 0 || i >= len || text[i] !== "(") return null;
+
+  const rawLabel = text.slice(startIdx + 1, i - 1);
+  if (!rawLabel) return null;
+
+  let j = i + 1;
+  while (j < len && /\s/.test(text[j])) j += 1;
+  if (j >= len) return null;
+
+  let rawUrl = "";
+  if (text[j] === "<") {
+    const closeAngle = text.indexOf(">", j + 1);
+    if (closeAngle === -1) return null;
+    rawUrl = text.slice(j + 1, closeAngle).trim();
+    j = closeAngle + 1;
+    while (j < len && text[j] !== ")") j += 1;
+    if (j >= len) return null;
+  } else {
+    let parenDepth = 1;
+    const urlStart = j;
+    let urlEnd = -1;
+    while (j < len && parenDepth > 0) {
+      const ch = text[j];
+      if (ch === "\\" && j + 1 < len) {
+        j += 2;
+        continue;
+      }
+      if (ch === "(") {
+        parenDepth += 1;
+      } else if (ch === ")") {
+        parenDepth -= 1;
+        if (parenDepth === 0) {
+          if (urlEnd === -1) urlEnd = j;
+          break;
+        }
+      } else if (/\s/.test(ch) && urlEnd === -1) {
+        // Optional link title follows whitespace, e.g. [text](url "title")
+        urlEnd = j;
+      }
+      j += 1;
+    }
+    if (parenDepth !== 0 || urlEnd <= urlStart) return null;
+    rawUrl = text.slice(urlStart, urlEnd);
+  }
+
+  if (!rawUrl) return null;
+  return { rawLabel, rawUrl, endIdx: j + 1 };
+}
+
+function parseBareWebUrlAt(text, startIdx) {
+  if (!text.startsWith("https://", startIdx) && !text.startsWith("http://", startIdx)) {
+    return null;
+  }
+  // Must not be attached directly to an alphanumeric char before it.
+  if (startIdx > 0 && /[A-Za-z0-9_]/.test(text[startIdx - 1])) {
+    return null;
+  }
+  const len = text.length;
+  let j = startIdx;
+  while (j < len && !/[\s<>[\]"'`\u3000-\u303f\uff00-\uffef]/.test(text[j])) {
+    j += 1;
+  }
+  let url = text.slice(startIdx, j);
+  // Trim trailing punctuation not balanced inside the URL (e.g. "(https://a.com)." -> "https://a.com")
+  while (url.length > 0) {
+    const last = url[url.length - 1];
+    if (/[.,;:!?]/.test(last)) {
+      url = url.slice(0, -1);
+      continue;
+    }
+    if (last === ")") {
+      const opens = (url.match(/\(/g) || []).length;
+      const closes = (url.match(/\)/g) || []).length;
+      if (closes > opens) {
+        url = url.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+  if (url.length <= 8) return null;
+  return { url, endIdx: startIdx + url.length };
+}
+
+function parseFileTarget(rawUrl, cwd) {
+  let pathPart = rawUrl;
+  let anchor = "";
+  const hashIdx = rawUrl.indexOf("#");
+  if (hashIdx >= 0) {
+    pathPart = rawUrl.slice(0, hashIdx);
+    anchor = rawUrl.slice(hashIdx + 1);
+  }
+
+  let filePath = pathPart;
+  if (/^file:\/\//i.test(pathPart)) {
+    filePath = pathPart.replace(/^file:\/\/(?:localhost)?/i, "");
+    try {
+      filePath = decodeURIComponent(filePath);
+    } catch {
+      // Keep raw path if percent-encoding is malformed
+    }
+  }
+
+  let displayPath = filePath;
+  if (cwd && path.isAbsolute(filePath)) {
+    const rel = path.relative(cwd, filePath);
+    if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+      displayPath = rel;
+    }
+  }
+
+  let lineSuffix = "";
+  const lineMatch = /^L(\d+)(?:-L?(\d+))?$/i.exec(anchor);
+  if (lineMatch) {
+    lineSuffix = `:${lineMatch[1]}`;
+  }
+
+  return { filePath, displayPath, lineSuffix };
+}
+
+function labelMatchesFilePath(rawLabel, filePath) {
+  const cleanLabel = rawLabel.replace(/^`|`$/g, "").trim();
+  const base = path.basename(filePath);
+  if (!cleanLabel) return true;
+  if (cleanLabel === base || cleanLabel === filePath) return true;
+  if (cleanLabel.startsWith(`${base}#`) || cleanLabel.startsWith(`${base}:`)) return true;
+  if (filePath.endsWith(`/${cleanLabel}`)) return true;
+  return false;
+}
+
+function renderMarkdownLink(rawLabel, rawUrl, style, options = {}) {
+  const cwd = options?.cwd || "";
+
+  // 1. Standard clickable web/mail URLs -> proper OSC 8 hyperlink with stable ID
+  if (WEB_SCHEME_RE.test(rawUrl)) {
+    const label = renderInlineMarkdown(rawLabel, style, options);
+    return osc8Link(style.accent(style.underline(label)), rawUrl);
+  }
+
+  // 2. Local/remote file:// links -> plain editor-clickable path:line without OSC 8.
+  // Emitting OSC 8 file:///remote/path#L10-L20 breaks Cmd+Click over Remote SSH
+  // and in VS Code/Cursor/iTerm2 ("No such file" / "No application").
+  if (/^file:\/\//i.test(rawUrl)) {
+    const { filePath, displayPath, lineSuffix } = parseFileTarget(rawUrl, cwd);
+    const targetText = `${displayPath}${lineSuffix}`;
+    if (labelMatchesFilePath(rawLabel, filePath)) {
+      return style.accent(style.underline(targetText));
+    }
+    const label = renderInlineMarkdown(rawLabel, style, options);
+    return `${style.accent(label)} ${style.muted(`(${targetText})`)}`;
+  }
+
+  // 3. Other custom URI schemes (e.g. conversation://...) -> render cleanly without OSC 8
+  // so macOS/terminals do not pop up "There is no application set to open the URL".
+  if (CUSTOM_SCHEME_RE.test(rawUrl) || rawUrl.startsWith("#")) {
+    const label = renderInlineMarkdown(rawLabel, style, options);
+    return style.accent(label);
+  }
+
+  // 4. Relative workspace file links (e.g. [docs](docs/tips.md#L10)) -> path:line
+  const { filePath, displayPath, lineSuffix } = parseFileTarget(rawUrl, cwd);
+  const targetText = `${displayPath}${lineSuffix}`;
+  if (labelMatchesFilePath(rawLabel, filePath)) {
+    return style.accent(style.underline(targetText));
+  }
+  const label = renderInlineMarkdown(rawLabel, style, options);
+  return `${style.accent(label)} ${style.muted(`(${targetText})`)}`;
+}
+
 /**
  * Formats inline Markdown (code spans, math, links, bold, italic, strike) without
  * painting any opaque background colors.
  */
-export function renderInlineMarkdown(text, style) {
+export function renderInlineMarkdown(text, style, options = {}) {
   if (!text) return "";
   let out = "";
   let i = 0;
@@ -291,14 +478,22 @@ export function renderInlineMarkdown(text, style) {
       }
     }
 
-    // Markdown link: [label](url)
+    // Markdown link: [label](url) (supports balanced parentheses in URLs)
     if (text[i] === "[") {
-      const linkMatch = /^\[([^\]]+)\]\(([^)\s]+)\)/.exec(text.slice(i));
-      if (linkMatch) {
-        const label = renderInlineMarkdown(linkMatch[1], style);
-        const url = linkMatch[2];
-        out += osc8Link(style.accent(style.underline(label)), url);
-        i += linkMatch[0].length;
+      const parsedLink = parseMarkdownLinkAt(text, i);
+      if (parsedLink) {
+        out += renderMarkdownLink(parsedLink.rawLabel, parsedLink.rawUrl, style, options);
+        i = parsedLink.endIdx;
+        continue;
+      }
+    }
+
+    // Bare https:// or http:// URL -> OSC 8 hyperlink so wrapped URLs stay clickable
+    if (text[i] === "h" && (text.startsWith("https://", i) || text.startsWith("http://", i))) {
+      const bare = parseBareWebUrlAt(text, i);
+      if (bare) {
+        out += osc8Link(style.accent(style.underline(bare.url)), bare.url);
+        i = bare.endIdx;
         continue;
       }
     }
@@ -308,7 +503,7 @@ export function renderInlineMarkdown(text, style) {
       const delim = text.slice(i, i + 2);
       const closeIdx = text.indexOf(delim, i + 2);
       if (closeIdx !== -1 && closeIdx > i + 2) {
-        out += style.bold(renderInlineMarkdown(text.slice(i + 2, closeIdx), style));
+        out += style.bold(renderInlineMarkdown(text.slice(i + 2, closeIdx), style, options));
         i = closeIdx + 2;
         continue;
       }
@@ -328,7 +523,7 @@ export function renderInlineMarkdown(text, style) {
     if (text[i] === "*" && text[i + 1] !== "*" && text[i + 1] !== " ") {
       const closeIdx = text.indexOf("*", i + 1);
       if (closeIdx !== -1 && closeIdx > i + 1 && text[closeIdx - 1] !== " ") {
-        out += style.italic(renderInlineMarkdown(text.slice(i + 1, closeIdx), style));
+        out += style.italic(renderInlineMarkdown(text.slice(i + 1, closeIdx), style, options));
         i = closeIdx + 1;
         continue;
       }
@@ -356,7 +551,7 @@ function splitTableRow(line) {
   return trimmed.split("|").map((c) => c.trim());
 }
 
-function renderTableBlock(rawLines, maxWidth, style) {
+function renderTableBlock(rawLines, maxWidth, style, options = {}) {
   const headerCells = splitTableRow(rawLines[0]);
   const bodyRows = rawLines.slice(2).map(splitTableRow);
   const colCount = Math.max(
@@ -368,7 +563,7 @@ function renderTableBlock(rawLines, maxWidth, style) {
   const splitCellLines = (rawCell, isHeader) =>
     splitOnHtmlBreaks(String(rawCell || ""))
       .map((part) => {
-        const formatted = renderInlineMarkdown(part.trim(), style);
+        const formatted = renderInlineMarkdown(part.trim(), style, options);
         return isHeader ? style.bold(formatted) : formatted;
       });
 
@@ -450,11 +645,11 @@ function renderTableBlock(rawLines, maxWidth, style) {
   return out;
 }
 
-function pushListItem(out, indentLen, marker, bodyText, width, style) {
+function pushListItem(out, indentLen, marker, bodyText, width, style, options = {}) {
   const indent = " ".repeat(indentLen);
   const contLen = indentLen + marker.length + 1;
   const contIndent = " ".repeat(contLen);
-  const wrapped = wrapAnsiLine(renderInlineMarkdown(bodyText, style), Math.max(12, width - contLen));
+  const wrapped = wrapAnsiLine(renderInlineMarkdown(bodyText, style, options), Math.max(12, width - contLen));
   wrapped.forEach((w, idx) => {
     out.push(idx === 0 ? `${indent}${style.accent(marker)} ${w}` : `${contIndent}${w}`);
   });
@@ -464,7 +659,7 @@ function pushListItem(out, indentLen, marker, bodyText, width, style) {
  * Renders full Markdown document to ANSI lines wrapped to `maxWidth`.
  * Designed to stay clean and flicker-free while streaming partial tokens.
  */
-export function renderMarkdown(markdownText, maxWidth, style) {
+export function renderMarkdown(markdownText, maxWidth, style, options = {}) {
   const width = Math.max(20, maxWidth);
   const rawLines = String(markdownText ?? "").replace(/\r\n/g, "\n").split("\n");
   const out = [];
@@ -579,7 +774,7 @@ export function renderMarkdown(markdownText, maxWidth, style) {
         tableLines.push(rawLines[i]);
         i += 1;
       }
-      out.push(...renderTableBlock(tableLines, width, style));
+      out.push(...renderTableBlock(tableLines, width, style, options));
       continue;
     }
 
@@ -594,7 +789,7 @@ export function renderMarkdown(markdownText, maxWidth, style) {
     const headingMatch = /^(#{1,6})\s+(.*)$/.exec(trimmed);
     if (headingMatch) {
       const level = headingMatch[1].length;
-      const content = renderInlineMarkdown(headingMatch[2], style);
+      const content = renderInlineMarkdown(headingMatch[2], style, options);
       const styledHeading =
         level <= 2
           ? style.heading(content)
@@ -610,7 +805,7 @@ export function renderMarkdown(markdownText, maxWidth, style) {
     // Blockquote
     if (trimmed.startsWith(">")) {
       const quoteContent = trimmed.replace(/^>\s?/, "");
-      const styled = style.muted(renderInlineMarkdown(quoteContent, style));
+      const styled = style.muted(renderInlineMarkdown(quoteContent, style, options));
       const wrapped = wrapAnsiLine(styled, Math.max(12, width - 3));
       for (const w of wrapped) {
         out.push(`${style.border("│")} ${w}`);
@@ -622,7 +817,7 @@ export function renderMarkdown(markdownText, maxWidth, style) {
     // Unordered list item
     const bulletMatch = /^(\s*)([-*+])\s+(.*)$/.exec(line);
     if (bulletMatch) {
-      pushListItem(out, Math.min(8, bulletMatch[1].length), "•", bulletMatch[3], width, style);
+      pushListItem(out, Math.min(8, bulletMatch[1].length), "•", bulletMatch[3], width, style, options);
       i += 1;
       continue;
     }
@@ -630,14 +825,14 @@ export function renderMarkdown(markdownText, maxWidth, style) {
     // Ordered list item
     const orderedMatch = /^(\s*)(\d+[.)])\s+(.*)$/.exec(line);
     if (orderedMatch) {
-      pushListItem(out, Math.min(8, orderedMatch[1].length), orderedMatch[2], orderedMatch[3], width, style);
+      pushListItem(out, Math.min(8, orderedMatch[1].length), orderedMatch[2], orderedMatch[3], width, style, options);
       i += 1;
       continue;
     }
 
     // Regular paragraph line (split explicit HTML <br> tags onto new lines)
     for (const part of splitOnHtmlBreaks(line)) {
-      const formatted = renderInlineMarkdown(part, style);
+      const formatted = renderInlineMarkdown(part, style, options);
       out.push(...wrapAnsiLine(formatted, width));
     }
     i += 1;
@@ -646,9 +841,9 @@ export function renderMarkdown(markdownText, maxWidth, style) {
   return out;
 }
 
-export function safeRenderMarkdown(text, maxWidth, style) {
+export function safeRenderMarkdown(text, maxWidth, style, options = {}) {
   try {
-    return renderMarkdown(text || "", maxWidth, style);
+    return renderMarkdown(text || "", maxWidth, style, options);
   } catch {
     return wrapAnsiText(String(text || ""), Math.max(16, maxWidth));
   }
@@ -716,28 +911,28 @@ function findLastStableMarkdownBreak(rawLines) {
  * Caches all completed leading blocks in a WeakMap keyed by `item` and only
  * re-renders the active trailing paragraph/fence/table as tokens stream in.
  */
-export function renderMarkdownStreamingCached(item, maxWidth, style) {
+export function renderMarkdownStreamingCached(item, maxWidth, style, options = {}) {
   const fullText = String(item?.text ?? "");
   const normalized = fullText.replace(/\r\n/g, "\n");
   const rawLines = normalized.split("\n");
   const breakIdx = findLastStableMarkdownBreak(rawLines);
   if (breakIdx <= 0) {
-    return safeRenderMarkdown(normalized, maxWidth, style);
+    return safeRenderMarkdown(normalized, maxWidth, style, options);
   }
 
   const prefixText = rawLines.slice(0, breakIdx).join("\n");
   const tailText = rawLines.slice(breakIdx + 1).join("\n");
   if (!prefixText.trim()) {
-    return safeRenderMarkdown(normalized, maxWidth, style);
+    return safeRenderMarkdown(normalized, maxWidth, style, options);
   }
 
-  const layoutKey = `${maxWidth}|${style.name}|${style.depth}`;
+  const layoutKey = `${maxWidth}|${style.name}|${style.depth}|${options?.cwd || ""}`;
   let cached = item && typeof item === "object" ? streamingMarkdownCache.get(item) : null;
   let prefixLines;
   if (cached && cached.layoutKey === layoutKey && cached.prefixText === prefixText) {
     prefixLines = cached.prefixLines;
   } else {
-    prefixLines = safeRenderMarkdown(prefixText, maxWidth, style);
+    prefixLines = safeRenderMarkdown(prefixText, maxWidth, style, options);
     if (item && typeof item === "object") {
       streamingMarkdownCache.set(item, { layoutKey, prefixText, prefixLines });
     }
@@ -747,7 +942,7 @@ export function renderMarkdownStreamingCached(item, maxWidth, style) {
     return prefixLines;
   }
 
-  const tailLines = safeRenderMarkdown(tailText, maxWidth, style);
+  const tailLines = safeRenderMarkdown(tailText, maxWidth, style, options);
   if (tailLines.length === 0) {
     return prefixLines;
   }

@@ -125,3 +125,49 @@ test("<br> inside inline code is kept literally instead of splitting the line", 
   const plain = renderMarkdown("Tables with `<br>` cells now split.<br>Second line", 100, style).map(stripAnsi);
   assert.deepEqual(plain, ["Tables with <br> cells now split.", "Second line"]);
 });
+
+test("renders file:// links as editor-clickable path:line without broken OSC 8, and closes/reopens OSC 8 on wrapped web links", async () => {
+  const { truncateAnsi, wrapAnsiLine } = await import("../src/term/unicode.mjs");
+  const style = createThemeStyler("tokyo-night", "truecolor");
+
+  // 1. file:// links with #L62-L87 render as clean relative path:line (no OSC 8 file:// that fails over SSH/VS Code)
+  const fileLine = renderMarkdown(
+    "修复了 [session.mjs](file:///vlm/lws/repos/lucid/src/app/session.mjs#L62-L87) 和 [配置文件](file:///root/.config/lucid/config.json)。",
+    120,
+    style,
+    { cwd: "/vlm/lws/repos" },
+  ).join("\n");
+  assert.equal(fileLine.includes("\x1b]8;"), false, "file:// links should not emit broken OSC 8 file:// URIs");
+  assert.ok(stripAnsi(fileLine).includes("lucid/src/app/session.mjs:62"));
+  assert.ok(stripAnsi(fileLine).includes("配置文件 (/root/.config/lucid/config.json)"));
+
+  // 2. Non-web custom scheme (conversation://) never emits OSC 8
+  const customLine = renderMarkdown("见 [上次会话](conversation://1e920f2e-cb08)", 120, style).join("\n");
+  assert.equal(customLine.includes("\x1b]8;"), false);
+  assert.equal(stripAnsi(customLine), "见 上次会话");
+
+  // 3. Web links with balanced parentheses and bare https:// URLs emit proper OSC 8 with id=
+  const webLine = renderMarkdown(
+    "参考 [Wiki](https://en.wikipedia.org/wiki/Foo_(bar)) 和 https://github.com/Kagura-0001/lucid。",
+    140,
+    style,
+  ).join("\n");
+  assert.ok(webLine.includes(";https://en.wikipedia.org/wiki/Foo_(bar)\x1b\\"));
+  assert.ok(webLine.includes(";https://github.com/Kagura-0001/lucid\x1b\\"));
+  assert.ok(stripAnsi(webLine).includes("Wiki"));
+  assert.ok(stripAnsi(webLine).includes("https://github.com/Kagura-0001/lucid。"));
+
+  // 4. Wrapping a long OSC 8 hyperlink closes OSC 8 on line 1 and reopens the exact same OSC 8 on line 2
+  const longLink = renderMarkdown("[a-very-long-hyperlink-label-that-wraps](https://example.com/path)", 24, style);
+  assert.ok(longLink.length >= 2);
+  for (const row of longLink) {
+    const opens = (row.match(/\x1b\]8;id=[^;]+;https:\/\/example\.com\/path\x1b\\/g) || []).length;
+    const closes = (row.match(/\x1b\]8;;\x1b\\/g) || []).length;
+    assert.equal(opens, 1, `wrapped row must open OSC 8 once: ${JSON.stringify(row)}`);
+    assert.equal(closes, 1, `wrapped row must close OSC 8 once: ${JSON.stringify(row)}`);
+  }
+
+  // 5. Truncating mid-OSC 8 hyperlink always closes OSC 8 cleanly
+  const truncated = truncateAnsi(wrapAnsiLine(longLink[0], 100)[0], 10, "…");
+  assert.ok(truncated.includes("\x1b]8;;\x1b\\"), "truncated OSC 8 link must be closed");
+});

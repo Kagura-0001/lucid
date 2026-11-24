@@ -122,9 +122,21 @@ export function paint(text, options = {}, depth = "truecolor") {
   return `${codes.join("")}${str}${RESET}`;
 }
 
+function hashOsc8Id(url) {
+  let h = 2166136261;
+  for (let i = 0; i < url.length; i += 1) {
+    h ^= url.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return `l${h.toString(36)}`;
+}
+
 export function osc8Link(label, url) {
   if (!url) return label;
-  return `\x1b]8;;${url}\x1b\\${label}\x1b]8;;\x1b\\`;
+  const cleanUrl = String(url).replace(/[\x00-\x1f\x7f-\x9f\s]+/g, "");
+  if (!cleanUrl) return label;
+  const id = hashOsc8Id(cleanUrl);
+  return `\x1b]8;id=${id};${cleanUrl}\x1b\\${label}\x1b]8;;\x1b\\`;
 }
 
 /**

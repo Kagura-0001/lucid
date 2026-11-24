@@ -10,6 +10,8 @@ const ANSI_AT_INDEX_REGEX = new RegExp(ANSI_SOURCE, "y");
 
 const SGR_SEQUENCE_RE = /^\x1b\[[0-9;:]*m$/;
 const OSC8_PREFIX = "\x1b]8;";
+const OSC8_CLOSE = "\x1b]8;;\x1b\\";
+const OSC8_CLOSE_RE = /^\x1b\]8;[^;]*;(?:\x07|\x1b\\)$/;
 // C0 controls (incl. ESC, TAB, LF, CR), DEL and C1 controls.
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f]/;
 const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f]/g;
@@ -408,11 +410,15 @@ export function truncateAnsi(text, maxWidth, ellipsis = "") {
   let output = "";
   let visible = 0;
   let hasAnsi = false;
+  let activeOsc8 = "";
   const completed = forEachAnsiToken(
     text,
     (sequence) => {
       output += sequence;
       hasAnsi = true;
+      if (sequence.startsWith(OSC8_PREFIX)) {
+        activeOsc8 = OSC8_CLOSE_RE.test(sequence) ? "" : sequence;
+      }
     },
     (grapheme) => {
       const w = graphemeWidth(grapheme);
@@ -423,7 +429,8 @@ export function truncateAnsi(text, maxWidth, ellipsis = "") {
   );
 
   const suffix = completed ? "" : ellipsis || "";
-  return hasAnsi ? `${output}${suffix}\x1b[0m` : `${output}${suffix}`;
+  const osc8Close = activeOsc8 ? OSC8_CLOSE : "";
+  return hasAnsi ? `${output}${osc8Close}${suffix}\x1b[0m` : `${output}${suffix}`;
 }
 
 export function padEndVisible(text, targetWidth, fillChar = " ") {
@@ -459,11 +466,16 @@ export function wrapAnsiLine(line, maxWidth) {
 
   const lines = [];
   let activeSgr = "";
+  let activeOsc8 = "";
   let currentParts = [];
   let currentWidth = 0;
 
-  function updateActiveSgr(code) {
-    // Only track SGR sequences (\x1b[...m)
+  function updateActiveAnsi(code) {
+    if (code.startsWith(OSC8_PREFIX)) {
+      activeOsc8 = OSC8_CLOSE_RE.test(code) ? "" : code;
+      return;
+    }
+    // Track SGR sequences (\x1b[...m)
     if (!code.startsWith("\x1b[") || !code.endsWith("m")) {
       return;
     }
@@ -476,11 +488,16 @@ export function wrapAnsiLine(line, maxWidth) {
 
   function flushLine() {
     let rendered = currentParts.join("");
+    if (activeOsc8) {
+      rendered += OSC8_CLOSE;
+    }
     if (activeSgr) {
       rendered += "\x1b[0m";
     }
     lines.push(rendered);
-    currentParts = activeSgr ? [activeSgr] : [];
+    currentParts = [];
+    if (activeOsc8) currentParts.push(activeOsc8);
+    if (activeSgr) currentParts.push(activeSgr);
     currentWidth = 0;
   }
 
@@ -489,7 +506,7 @@ export function wrapAnsiLine(line, maxWidth) {
   while (i < tokens.length) {
     const token = tokens[i];
     if (token.ansi) {
-      updateActiveSgr(token.ansi);
+      updateActiveAnsi(token.ansi);
       currentParts.push(token.ansi);
       i += 1;
       continue;
@@ -541,6 +558,9 @@ export function wrapAnsiLine(line, maxWidth) {
 
   if (currentParts.length > 0 || lines.length === 0) {
     let rendered = currentParts.join("");
+    if (activeOsc8) {
+      rendered += OSC8_CLOSE;
+    }
     if (activeSgr) {
       rendered += "\x1b[0m";
     }

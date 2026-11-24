@@ -405,10 +405,11 @@ function renderUserItem(item, contentWidth, style, state) {
   return out;
 }
 
-function renderAssistantItem(item, contentWidth, style) {
+function renderAssistantItem(item, contentWidth, style, state) {
+  const mdOpts = { cwd: state?.cwd || "" };
   const mdLines = item.streaming
-    ? renderMarkdownStreamingCached(item, contentWidth, style)
-    : safeRenderMarkdown(item.text || "", contentWidth, style);
+    ? renderMarkdownStreamingCached(item, contentWidth, style, mdOpts)
+    : safeRenderMarkdown(item.text || "", contentWidth, style, mdOpts);
   return mdLines.map((ml) => (ml ? `  ${ml}` : ""));
 }
 
@@ -686,7 +687,7 @@ export function renderTimeline(state, cols, style) {
           if (lastEmittedType === "tool" || lastEmittedType === "thought" || lastEmittedType === "plan") {
             lines.push("");
           }
-          pushLines(renderCached(item, () => renderAssistantItem(item, contentWidth, style)));
+          pushLines(renderCached(item, () => renderAssistantItem(item, contentWidth, style, state)));
           if (item.streaming) {
             lines.push(`  ${style.accent(spinnerChar(state.spinnerFrame))}`);
           }

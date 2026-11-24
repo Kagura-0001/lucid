@@ -199,7 +199,9 @@ export class TerminalRenderer {
         continue;
       }
       const safeRow = sanitizeTerminalRow(raw);
-      nextRows[y] = `${RESET_AND_ERASE_LINE}${truncateAnsi(safeRow, cols)}\x1b[0m`;
+      const clipped = truncateAnsi(safeRow, cols);
+      const osc8Reset = clipped.includes("\x1b]8;") ? "\x1b]8;;\x1b\\" : "";
+      nextRows[y] = `${RESET_AND_ERASE_LINE}${clipped}${osc8Reset}\x1b[0m`;
     }
 
     let dirtyCount = 0;
