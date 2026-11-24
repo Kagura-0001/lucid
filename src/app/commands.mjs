@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import { readAgyOrchestratorSettings } from "../acp/agy_state.mjs";
+import { readAgyOrchestratorConfig, readAgyOrchestratorSettings } from "../acp/agy_state.mjs";
 import { fetchAgyQuota } from "../acp/client.mjs";
+import { isAgyCommand } from "../config.mjs";
 import { sanitizeUntrustedText } from "../term/unicode.mjs";
 import { formatBytes, loadImageAttachment } from "../ui/files.mjs";
 import { parseAutoCompactOverride } from "../ui/format.mjs";
@@ -30,8 +31,27 @@ const EFFORT_DISPLAY_NAMES = {
   xhigh: "Extra",
   max: "Max",
 };
+const EFFORT_SETTINGS_NAMES = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
+};
 
-function discoverModelEfforts(modelId, rawModels, activeEffortOpt, isCurrentModel) {
+const ORCHESTRATOR_PLANNER_FAMILIES = [
+  { familyId: "gemini-4-neon", name: "Gemini 4 Neon", shortName: "Neon", orchValue: "gemini-pro-orchestrator-neon" },
+  { familyId: "gemini-4-carbon", name: "Gemini 4 Carbon", shortName: "Carbon", orchValue: "gemini-pro-orchestrator" },
+  { familyId: "gemini-4-argon", name: "Gemini 4 Argon", shortName: "Argon", orchValue: "gemini-pro-orchestrator-argon" },
+  { familyId: "claude-opus-5-5", name: "Claude Opus 5.5", shortName: "Opus 5.5", orchValue: "" },
+];
+
+const ORCHESTRATOR_EXECUTOR_FAMILIES = [
+  { familyId: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", shortName: "Hydrogen" },
+  { familyId: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", shortName: "Sonnet 5.5" },
+];
+
+function discoverModelEfforts(modelId, rawModels, activeEffortOpt, isCurrentModel, familyName = "") {
   const byValue = new Map();
 
   // Discover exact supported effort variants from `availableModels` (e.g. "gemini-4-neon-xhigh").
@@ -41,9 +61,13 @@ function discoverModelEfforts(modelId, rawModels, activeEffortOpt, isCurrentMode
     if (!id.startsWith(prefix)) continue;
     const suffix = id.slice(prefix.length).toLowerCase();
     if (!EFFORT_ORDER.includes(suffix)) continue;
+    const settingsLabel =
+      (typeof m?.name === "string" && m.name.trim()) ||
+      (familyName ? `${familyName} (${EFFORT_SETTINGS_NAMES[suffix] || suffix})` : id);
     byValue.set(suffix, {
       value: suffix,
       label: EFFORT_DISPLAY_NAMES[suffix] || suffix,
+      settingsLabel,
       modelId: id,
     });
   }
@@ -54,9 +78,13 @@ function discoverModelEfforts(modelId, rawModels, activeEffortOpt, isCurrentMode
       const val = String(opt?.value || "").toLowerCase();
       if (!val) continue;
       const existing = byValue.get(val);
+      const settingsLabel =
+        existing?.settingsLabel ||
+        (familyName ? `${familyName} (${EFFORT_SETTINGS_NAMES[val] || opt.name || val})` : opt.value);
       byValue.set(val, {
         value: opt.value,
         label: opt.name || existing?.label || EFFORT_DISPLAY_NAMES[val] || opt.value,
+        settingsLabel,
         modelId: existing?.modelId || "",
       });
     }
@@ -82,41 +110,226 @@ function defaultEffortIndex(efforts, currentEffortValue, isCurrentModel) {
   return 0;
 }
 
+function normalizeEffortToken(token) {
+  const low = String(token || "").trim().toLowerCase();
+  if (low === "extra" || low === "extra-high" || low === "extra_high" || low === "xhigh") return "xhigh";
+  if (EFFORT_ORDER.includes(low)) return low;
+  return "";
+}
+
+function matchSavedRole(roleText, roleFamilies) {
+  const text = String(roleText || "").trim();
+  if (!text || !Array.isArray(roleFamilies) || roleFamilies.length === 0) return null;
+  const lower = text.toLowerCase();
+
+  for (let i = 0; i < roleFamilies.length; i += 1) {
+    const fam = roleFamilies[i];
+    for (let j = 0; j < fam.efforts.length; j += 1) {
+      const eff = fam.efforts[j];
+      if (
+        lower === String(eff.settingsLabel || "").toLowerCase() ||
+        lower === String(eff.modelId || "").toLowerCase()
+      ) {
+        return { familyIdx: i, effortIdx: j };
+      }
+    }
+  }
+
+  for (let i = 0; i < roleFamilies.length; i += 1) {
+    const fam = roleFamilies[i];
+    if (
+      lower.includes(fam.familyId.toLowerCase()) ||
+      lower.includes(fam.name.toLowerCase()) ||
+      lower.includes(fam.shortName.toLowerCase())
+    ) {
+      const effortMatch = /\((low|medium|high|xhigh|extra|max)\)|[/-]\s*(low|medium|high|xhigh|extra|max)\b/i.exec(text);
+      const effVal = normalizeEffortToken(effortMatch?.[1] || effortMatch?.[2] || "");
+      const effortIdx = effVal
+        ? Math.max(0, fam.efforts.findIndex((e) => e.value === effVal))
+        : defaultEffortIndex(fam.efforts, "", false);
+      return { familyIdx: i, effortIdx };
+    }
+  }
+
+  return null;
+}
+
+function buildRoleCandidates(templates, modelOptions, rawModels) {
+  const optMap = new Map((modelOptions || []).map((o) => [String(o.value || ""), o.name || o.value]));
+  const out = [];
+  for (const tpl of templates) {
+    const familyName = optMap.get(tpl.familyId) || tpl.name;
+    const efforts = discoverModelEfforts(tpl.familyId, rawModels, null, false, familyName);
+    if (efforts.length === 0 && !optMap.has(tpl.familyId)) continue;
+    out.push({
+      familyId: tpl.familyId,
+      name: familyName,
+      shortName: tpl.shortName,
+      orchValue: tpl.orchValue || "",
+      efforts:
+        efforts.length > 0
+          ? efforts
+          : [{ value: "high", label: "High", settingsLabel: `${familyName} (High)`, modelId: `${tpl.familyId}-high` }],
+    });
+  }
+  return out;
+}
+
+export function resolveOrchestratorSelection(orchState) {
+  if (!orchState) return null;
+  const planner = orchState.planners[orchState.plannerIdx] || orchState.planners[0];
+  const executor = orchState.executors[orchState.executorIdx] || orchState.executors[0];
+  if (!planner || !executor) return null;
+
+  const plannerEffort = planner.efforts[orchState.plannerEffortIdx] || planner.efforts[0];
+  const executorEffort = executor.efforts[orchState.executorEffortIdx] || executor.efforts[0];
+
+  const matchingBase =
+    (orchState.baseOptions || []).find((b) => b.value === planner.orchValue) ||
+    (orchState.baseOptions || [])[0] || {
+      value: "gemini-pro-orchestrator-neon",
+      name: "Orchestrator (Neon)",
+    };
+
+  const effortSummary = `${planner.shortName} ${plannerEffort.label} → ${executor.shortName} ${executorEffort.label}`;
+  return {
+    modelValue: matchingBase.value,
+    modelLabel: matchingBase.name || "Orchestrator (Neon)",
+    displayLabel: "Orchestrator",
+    plannerLabel: plannerEffort.settingsLabel,
+    executorLabel: executorEffort.settingsLabel,
+    plannerShort: `${planner.shortName} ${plannerEffort.label}`,
+    executorShort: `${executor.shortName} ${executorEffort.label}`,
+    effortSummary,
+  };
+}
+
+export function buildOrchestratorState(app, orchOptions = [], modelOptions = [], rawModels = []) {
+  const planners = buildRoleCandidates(ORCHESTRATOR_PLANNER_FAMILIES, modelOptions, rawModels);
+  const executors = buildRoleCandidates(ORCHESTRATOR_EXECUTOR_FAMILIES, modelOptions, rawModels);
+  if (planners.length === 0 || executors.length === 0) return null;
+
+  const dataDir = app.agyStateWatcher?.dataDir || "";
+  const saved = readAgyOrchestratorConfig(dataDir);
+  const activeCfg = app.state.orchestratorConfig || null;
+
+  const currentPlannerText = activeCfg?.plannerLabel || saved.planner || "";
+  const currentExecutorText = activeCfg?.executorLabel || saved.executor || "";
+
+  let plannerIdx = 0;
+  let plannerEffortIdx = defaultEffortIndex(planners[0].efforts, "", false);
+  const matchedPlanner = matchSavedRole(currentPlannerText, planners);
+  if (matchedPlanner) {
+    plannerIdx = matchedPlanner.familyIdx;
+    plannerEffortIdx = matchedPlanner.effortIdx;
+  } else {
+    const modelOpt = app.getConfigOption("model");
+    const curVal = modelOpt?.currentValue || "";
+    const byOrch = planners.findIndex((p) => p.orchValue && p.orchValue === curVal);
+    if (byOrch >= 0) {
+      plannerIdx = byOrch;
+      plannerEffortIdx = defaultEffortIndex(planners[byOrch].efforts, "", false);
+    }
+  }
+
+  let executorIdx = 0;
+  let executorEffortIdx = defaultEffortIndex(executors[0].efforts, "", false);
+  const matchedExecutor = matchSavedRole(currentExecutorText, executors);
+  if (matchedExecutor) {
+    executorIdx = matchedExecutor.familyIdx;
+    executorEffortIdx = matchedExecutor.effortIdx;
+  }
+
+  return {
+    baseOptions: orchOptions.map((o) => ({ value: o.value, name: o.name || o.value })),
+    planners,
+    executors,
+    plannerIdx,
+    plannerEffortIdx,
+    executorIdx,
+    executorEffortIdx,
+    focusField: 1, // Default focus on Planner Effort so ←/→ immediately adjusts effort!
+  };
+}
+
 export function buildModelPickerItems(app) {
   const modelOpt = app.getConfigOption("model");
   const effortOpt = app.getConfigOption("thought_level") || app.getConfigOption("effort");
   const rawModels = Array.isArray(app.state.models) ? app.state.models : [];
   const dataDir = app.agyStateWatcher?.dataDir || "";
   const orchConfigured = readAgyOrchestratorSettings(dataDir);
+  const supportsStreamOrch = isAgyCommand(app.launchSpec?.command);
+  const activeOrchConfig = app.state.orchestratorConfig || null;
 
   if (modelOpt && Array.isArray(modelOpt.options) && modelOpt.options.length > 0) {
+    const orchOptions = modelOpt.options.filter(
+      (o) => /orchestrator/i.test(o.name || "") || /orchestrator/i.test(o.value || ""),
+    );
+    const orchState =
+      supportsStreamOrch && orchOptions.length > 0
+        ? buildOrchestratorState(app, orchOptions, modelOpt.options, rawModels)
+        : null;
+
+    const items = [];
+    let insertedUnifiedOrch = false;
+
+    for (const o of modelOpt.options) {
+      const label = o.name || o.value;
+      const isOrchestrator = /orchestrator/i.test(label) || /orchestrator/i.test(o.value);
+
+      if (isOrchestrator && orchState) {
+        if (insertedUnifiedOrch) continue;
+        insertedUnifiedOrch = true;
+        const resolved = resolveOrchestratorSelection(orchState);
+        const isCurrent = Boolean(activeOrchConfig) || orchOptions.some((opt) => opt.value === modelOpt.currentValue);
+        items.push({
+          label: "Orchestrator",
+          value: resolved.modelValue,
+          description: resolved.effortSummary,
+          active: isCurrent,
+          efforts: [],
+          selectedEffortIdx: 0,
+          isOrchestrator: true,
+          orchestrator: orchState,
+          rightTag: resolved.effortSummary,
+          searchText: [
+            "Orchestrator",
+            "planner",
+            "executor",
+            ...orchOptions.map((opt) => `${opt.name || ""} ${opt.value || ""}`),
+            ...orchState.planners.map((p) => p.name),
+            ...orchState.executors.map((e) => e.name),
+          ].join(" "),
+        });
+        continue;
+      }
+
+      const isCurrent = !activeOrchConfig && o.value === modelOpt.currentValue;
+      const efforts = isOrchestrator ? [] : discoverModelEfforts(o.value, rawModels, effortOpt, isCurrent, label);
+      const selectedEffortIdx = defaultEffortIndex(efforts, effortOpt?.currentValue || "", isCurrent);
+      const fixedEffortMatch = !isOrchestrator && efforts.length === 0 ? /\((Low|Medium|High|XHigh|Extra|Max)\)\s*$/i.exec(label) : null;
+      const rightTag = isOrchestrator
+        ? (orchConfigured || "Planner/Executor · high")
+        : fixedEffortMatch
+          ? fixedEffortMatch[1]
+          : "";
+      items.push({
+        label,
+        value: o.value,
+        description: rightTag || o.value,
+        active: isCurrent,
+        efforts,
+        selectedEffortIdx,
+        isOrchestrator,
+        rightTag,
+        searchText: [label, o.value, rightTag, ...efforts.map((e) => e.label)].join(" "),
+      });
+    }
+
     return {
       preferConfig: true,
-      currentModelValue: modelOpt.currentValue || "",
-      items: modelOpt.options.map((o) => {
-        const label = o.name || o.value;
-        const isCurrent = o.value === modelOpt.currentValue;
-        const isOrchestrator = /orchestrator/i.test(label) || /orchestrator/i.test(o.value);
-        const efforts = isOrchestrator ? [] : discoverModelEfforts(o.value, rawModels, effortOpt, isCurrent);
-        const selectedEffortIdx = defaultEffortIndex(efforts, effortOpt?.currentValue || "", isCurrent);
-        const fixedEffortMatch = !isOrchestrator && efforts.length === 0 ? /\((Low|Medium|High|XHigh|Extra|Max)\)\s*$/i.exec(label) : null;
-        const rightTag = isOrchestrator
-          ? (orchConfigured || "Planner/Executor · high")
-          : fixedEffortMatch
-            ? fixedEffortMatch[1]
-            : "";
-        return {
-          label,
-          value: o.value,
-          description: rightTag || o.value,
-          active: isCurrent,
-          efforts,
-          selectedEffortIdx,
-          isOrchestrator,
-          rightTag,
-          searchText: [label, o.value, rightTag, ...efforts.map((e) => e.label)].join(" "),
-        };
-      }),
+      currentModelValue: activeOrchConfig ? activeOrchConfig.modelValue : modelOpt.currentValue || "",
+      items,
     };
   }
 
@@ -136,70 +349,162 @@ export function buildModelPickerItems(app) {
   };
 }
 
-export const COMMAND_SPECS = [
-  {
-    name: "model",
-    description: "Switch model & thinking effort (←/→ effort)",
-    needsConnection: true,
-    async run(app) {
-      const { items, preferConfig, currentModelValue } = buildModelPickerItems(app);
+function openModelPickerModal(app, { focusOrchestratorEffort = false } = {}) {
+  const { items, preferConfig, currentModelValue } = buildModelPickerItems(app);
 
-      if (items.length === 0) {
-        app.pushNotice("warn", "No selectable models exposed by this ACP agent.");
+  if (items.length === 0) {
+    app.pushNotice("warn", "No selectable models exposed by this ACP agent.");
+    app.scheduleRender();
+    return false;
+  }
+
+  if (focusOrchestratorEffort) {
+    const orchItem = items.find((i) => i.orchestrator);
+    if (orchItem) {
+      orchItem.orchestrator.focusField = 1;
+    }
+  }
+
+  app.openPickerModal({
+    title: "Select Model & Effort",
+    layout: "model",
+    items,
+    onSelect: async (chosen) => {
+      if (chosen.orchestrator) {
+        const resolved = resolveOrchestratorSelection(chosen.orchestrator);
+        if (!resolved) return;
+        await app.applyOrchestratorConfig(resolved);
+        app.showToast(`Model → Orchestrator (${resolved.effortSummary})`);
         app.scheduleRender();
         return;
       }
 
-      app.openPickerModal({
-        title: "Select Model & Effort",
-        layout: "model",
-        items,
-        onSelect: async (chosen) => {
-          const chosenEffort =
-            Array.isArray(chosen.efforts) && chosen.efforts.length > 0
-              ? chosen.efforts[chosen.selectedEffortIdx || 0]
-              : null;
+      const wasStreamOrch = Boolean(app.state.orchestratorConfig);
+      if (wasStreamOrch) {
+        await app.applyOrchestratorConfig(null);
+      }
 
-          const modelChanged = !preferConfig || chosen.value !== currentModelValue;
-          if (modelChanged) {
-            const res = await app.acp.setModel(app.state.sessionId, chosen.value, preferConfig);
-            app.applySessionMetadata(res);
-            app.state.modelLabel = chosen.label;
-          }
+      const chosenEffort =
+        Array.isArray(chosen.efforts) && chosen.efforts.length > 0
+          ? chosen.efforts[chosen.selectedEffortIdx || 0]
+          : null;
 
-          let appliedEffortLabel = app.state.effortLabel || "";
-          if (chosenEffort) {
-            const latestEffortOpt = app.getConfigOption("thought_level") || app.getConfigOption("effort");
-            if (
-              latestEffortOpt &&
-              String(latestEffortOpt.currentValue || "").toLowerCase() !== String(chosenEffort.value).toLowerCase()
-            ) {
-              const effortRes = await app.acp.setConfigOption(
-                app.state.sessionId,
-                latestEffortOpt.id,
-                chosenEffort.value,
-              );
-              app.applySessionMetadata(effortRes);
-              app.state.effortLabel = chosenEffort.label;
-              appliedEffortLabel = chosenEffort.label;
-            } else if (latestEffortOpt) {
-              appliedEffortLabel = chosenEffort.label;
-            }
-          }
+      const modelChanged = wasStreamOrch || !preferConfig || chosen.value !== currentModelValue;
+      if (modelChanged) {
+        const res = await app.acp.setModel(app.state.sessionId, chosen.value, preferConfig);
+        app.applySessionMetadata(res);
+        app.state.modelLabel = chosen.label;
+      }
 
-          const toastLabel = appliedEffortLabel ? `${chosen.label} (${appliedEffortLabel})` : chosen.label;
-          app.showToast(`Model → ${toastLabel}`);
-          app.scheduleRender();
-        },
-      });
+      let appliedEffortLabel = app.state.effortLabel || "";
+      if (chosenEffort) {
+        const latestEffortOpt = app.getConfigOption("thought_level") || app.getConfigOption("effort");
+        if (
+          latestEffortOpt &&
+          String(latestEffortOpt.currentValue || "").toLowerCase() !== String(chosenEffort.value).toLowerCase()
+        ) {
+          const effortRes = await app.acp.setConfigOption(
+            app.state.sessionId,
+            latestEffortOpt.id,
+            chosenEffort.value,
+          );
+          app.applySessionMetadata(effortRes);
+          app.state.effortLabel = chosenEffort.label;
+          appliedEffortLabel = chosenEffort.label;
+        } else if (latestEffortOpt) {
+          appliedEffortLabel = chosenEffort.label;
+        }
+      }
+
+      const toastLabel = appliedEffortLabel ? `${chosen.label} (${appliedEffortLabel})` : chosen.label;
+      app.showToast(`Model → ${toastLabel}`);
+      app.scheduleRender();
+    },
+  });
+
+  if (focusOrchestratorEffort && app.modal) {
+    const orchIdx = (app.modal.filteredItems || []).findIndex((i) => i.orchestrator);
+    if (orchIdx >= 0) {
+      app.modal.selected = orchIdx;
+      app.scheduleRender(true);
+    }
+  }
+  return true;
+}
+
+export const COMMAND_SPECS = [
+  {
+    name: "model",
+    description: "Switch model & thinking effort (←/→ effort, Tab role)",
+    needsConnection: true,
+    async run(app) {
+      openModelPickerModal(app);
     },
   },
   {
     name: "effort",
     aliases: ["thinking"],
-    description: "Switch thinking / reasoning level",
+    description: "Switch thinking / reasoning level (supports Orchestrator)",
     needsConnection: true,
-    async run(app) {
+    async run(app, argText) {
+      const isOrchActive = Boolean(app.state.orchestratorConfig) || /orchestrator/i.test(app.state.modelLabel || "");
+      if (isOrchActive && isAgyCommand(app.launchSpec?.command)) {
+        const { items } = buildModelPickerItems(app);
+        const orchItem = items.find((i) => i.orchestrator);
+        if (orchItem && argText && argText.trim()) {
+          const orch = orchItem.orchestrator;
+          const tokens = argText.trim().split(/\s+/);
+          let updated = false;
+          for (const tok of tokens) {
+            const kv = /^(planner|executor|p|e)[:=](.+)$/i.exec(tok);
+            if (kv) {
+              const role = kv[1].toLowerCase();
+              const effVal = normalizeEffortToken(kv[2]);
+              if (role === "planner" || role === "p") {
+                const idx = orch.planners[orch.plannerIdx].efforts.findIndex((e) => e.value === effVal);
+                if (idx >= 0) {
+                  orch.plannerEffortIdx = idx;
+                  updated = true;
+                }
+              } else {
+                const idx = orch.executors[orch.executorIdx].efforts.findIndex((e) => e.value === effVal);
+                if (idx >= 0) {
+                  orch.executorEffortIdx = idx;
+                  updated = true;
+                }
+              }
+            } else {
+              const effVal = normalizeEffortToken(tok);
+              if (effVal) {
+                const pIdx = orch.planners[orch.plannerIdx].efforts.findIndex((e) => e.value === effVal);
+                if (pIdx >= 0) {
+                  orch.plannerEffortIdx = pIdx;
+                  updated = true;
+                }
+              }
+            }
+          }
+          if (updated) {
+            const resolved = resolveOrchestratorSelection(orch);
+            await app.applyOrchestratorConfig(resolved);
+            app.showToast(`Orchestrator → ${resolved.effortSummary}`);
+            app.scheduleRender();
+            return;
+          }
+          const avail = orch.planners[orch.plannerIdx].efforts.map((e) => e.value).join(", ");
+          app.pushNotice(
+            "warn",
+            `Unknown effort "${argText.trim()}". Use e.g. /effort xhigh or /effort planner=xhigh executor=medium (available: ${avail}).`,
+          );
+          app.scheduleRender();
+          return;
+        }
+        if (orchItem) {
+          openModelPickerModal(app, { focusOrchestratorEffort: true });
+          return;
+        }
+      }
+
       const effortOpt = app.getConfigOption("thought_level") || app.getConfigOption("effort");
       if (!effortOpt || !Array.isArray(effortOpt.options) || effortOpt.options.length === 0) {
         if (/orchestrator/i.test(app.state.modelLabel || "")) {
@@ -215,6 +520,28 @@ export const COMMAND_SPECS = [
         } else {
           app.pushNotice("warn", "This model/agent does not expose a separate thinking level option.");
         }
+        app.scheduleRender();
+        return;
+      }
+      if (argText && argText.trim()) {
+        const requested = normalizeEffortToken(argText.trim());
+        const match = effortOpt.options.find(
+          (o) =>
+            String(o.value || "").toLowerCase() === requested ||
+            String(o.name || "").toLowerCase() === argText.trim().toLowerCase(),
+        );
+        if (match) {
+          const res = await app.acp.setConfigOption(app.state.sessionId, effortOpt.id, match.value);
+          app.applySessionMetadata(res);
+          app.state.effortLabel = match.name || match.value;
+          app.showToast(`Thinking → ${app.state.effortLabel}`);
+          app.scheduleRender();
+          return;
+        }
+        app.pushNotice(
+          "warn",
+          `Unknown effort "${argText.trim()}". Available: ${effortOpt.options.map((o) => o.value).join(", ")}`,
+        );
         app.scheduleRender();
         return;
       }

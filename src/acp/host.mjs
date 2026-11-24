@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { AcpClient, hotSwapAcpClient } from "./client.mjs";
+import { resolveAgyDataDir, saveAgyOrchestratorSettings } from "./agy_state.mjs";
 import { ensureSecureBgDir, removeBgFiles, writeBgMeta } from "./bg_registry.mjs";
 import { autoApprovePermission } from "./permissions.mjs";
 import {
@@ -11,7 +12,8 @@ import {
   mergeSessionMetadata,
   parseJsonObjectLine,
 } from "./protocol.mjs";
-import { supportsNativeBypassFlag, withDangerouslySkipPermissions } from "../config.mjs";
+import { OrchestratorStreamClient } from "./stream_client.mjs";
+import { isAgyCommand, supportsNativeBypassFlag, withDangerouslySkipPermissions } from "../config.mjs";
 
 const MAX_EVENT_LOG = 6000;
 const EMPTY_DETACHED_GRACE_MS = 4000;
@@ -54,6 +56,12 @@ export class SessionHost {
     this.nativeBypassActive = this.launchBypass;
     this.suppressReplayEvents = false;
     this.bypassSwapPromise = null;
+    this.agyDataDir = isAgyCommand(this.baseLaunchSpec?.command)
+      ? resolveAgyDataDir(this.baseLaunchSpec?.args || [])
+      : "";
+    this.orchestratorConfig = null;
+    this.orchestratorStream = null;
+    this.acpSessionClosedForStream = false;
 
     this.acp = new AcpClient(this.launchSpec);
     this.server = null;
@@ -284,41 +292,143 @@ export class SessionHost {
     }
   }
 
+  handleBackendSessionUpdate(params) {
+    if (this.suppressReplayEvents) return;
+    this.updatedAt = Date.now();
+    const update = params?.update;
+    if (update) {
+      if (update.sessionUpdate === "session_info_update" && typeof update.title === "string" && update.title.trim()) {
+        this.sessionTitle = update.title.trim();
+      } else if (update.sessionUpdate === "usage_update" && typeof update.used === "number") {
+        this.usage = { used: update.used, size: update.size };
+      } else if (update.sessionUpdate === "current_mode_update") {
+        this.modeId = update.currentModeId || update.modeId || this.modeId;
+      } else if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
+        this.sessionMeta.availableCommands = update.availableCommands;
+      } else if (update.sessionUpdate === "config_option_update" && (Array.isArray(update.configOptions) || update.configOption)) {
+        this.captureSessionMeta(update);
+      }
+      const summary = summarizeUpdateText(update);
+      if (summary) this.lastSummary = summary;
+    }
+    this.pushEvent({ type: "sessionUpdate", params });
+    this.sendToClient({ type: "sessionUpdate", params });
+    this.scheduleMetaFlush();
+  }
+
+  handleBackendPermissionRequest(req) {
+    if (this.bypassPermissions && autoApprovePermission(req)) {
+      return;
+    }
+    const permId = `perm_${this.nextPermId++}`;
+    this.pendingPermissions.set(permId, { permId, ...req });
+    this.updatedAt = Date.now();
+    this.flushMetaNow();
+    this.sendToClient({ type: "permissionRequest", permId, params: req.params });
+  }
+
+  ensureOrchestratorStream() {
+    if (!this.orchestratorStream) {
+      this.orchestratorStream = new OrchestratorStreamClient({
+        command: this.baseLaunchSpec?.command || "agy",
+        cwd: this.cwd,
+        addDirs: this.addDirs,
+        dataDir: this.agyDataDir,
+        bgDir: this.bgDir,
+      });
+      this.orchestratorStream.on("sessionUpdate", (params) => {
+        this.handleBackendSessionUpdate(params);
+      });
+      this.orchestratorStream.on("permissionRequest", (req) => {
+        this.handleBackendPermissionRequest(req);
+      });
+    }
+    return this.orchestratorStream;
+  }
+
+  async setOrchestratorConfig(sessionId, config) {
+    if (this.bypassSwapPromise) {
+      await this.bypassSwapPromise.catch(() => {});
+    }
+    const sid = sessionId || this.sessionId;
+    if (config && typeof config === "object") {
+      if (this.agyDataDir && (config.plannerLabel || config.executorLabel)) {
+        try {
+          saveAgyOrchestratorSettings(this.agyDataDir, {
+            planner: config.plannerLabel || "",
+            executor: config.executorLabel || "",
+          });
+        } catch {
+          // Best-effort persistence to agy settings.json
+        }
+      }
+      if (!this.acpSessionClosedForStream && sid) {
+        await this.acp.closeSession(sid).catch(() => {});
+        this.acpSessionClosedForStream = true;
+      }
+      this.orchestratorConfig = { ...config };
+      this.modelLabel = config.displayLabel || config.modelLabel || "Orchestrator";
+      const stream = this.ensureOrchestratorStream();
+      stream.configure({
+        sessionId: sid,
+        orchestratorConfig: this.orchestratorConfig,
+        modeId: this.modeId || "auto",
+        bypassPermissions: this.bypassPermissions,
+      });
+      this.flushMetaNow();
+      return {
+        ok: true,
+        orchestratorConfig: this.orchestratorConfig,
+        modelLabel: this.modelLabel,
+      };
+    }
+
+    if (this.orchestratorStream) {
+      await this.orchestratorStream.stopChild().catch(() => {});
+    }
+    this.orchestratorConfig = null;
+    if (this.acpSessionClosedForStream && sid) {
+      this.acpSessionClosedForStream = false;
+      let restored = false;
+      let res = null;
+      if (this.acp.supportsSessionLoad()) {
+        this.suppressReplayEvents = true;
+        try {
+          res = await this.acp.loadSession(sid, this.cwd);
+          restored = true;
+        } catch {
+          res = null;
+        } finally {
+          this.suppressReplayEvents = false;
+        }
+      }
+      if (!restored && this.acp.supportsSessionResume()) {
+        res = await this.acp.resumeSession(sid, this.cwd).catch(() => null);
+      }
+      if (res) {
+        this.captureSessionMeta(res);
+      }
+      if (this.modeId) {
+        await this.acp.setMode(sid, this.modeId).catch(() => null);
+      }
+    }
+    this.flushMetaNow();
+    return {
+      ok: true,
+      orchestratorConfig: null,
+      sessionMeta: this.sessionMeta,
+    };
+  }
+
   bindAcpEvents(acpClient) {
     acpClient.on("sessionUpdate", (params) => {
-      if (acpClient !== this.acp || this.suppressReplayEvents) return;
-      this.updatedAt = Date.now();
-      const update = params?.update;
-      if (update) {
-        if (update.sessionUpdate === "session_info_update" && typeof update.title === "string" && update.title.trim()) {
-          this.sessionTitle = update.title.trim();
-        } else if (update.sessionUpdate === "usage_update" && typeof update.used === "number") {
-          this.usage = { used: update.used, size: update.size };
-        } else if (update.sessionUpdate === "current_mode_update") {
-          this.modeId = update.currentModeId || update.modeId || this.modeId;
-        } else if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
-          this.sessionMeta.availableCommands = update.availableCommands;
-        } else if (update.sessionUpdate === "config_option_update" && (Array.isArray(update.configOptions) || update.configOption)) {
-          this.captureSessionMeta(update);
-        }
-        const summary = summarizeUpdateText(update);
-        if (summary) this.lastSummary = summary;
-      }
-      this.pushEvent({ type: "sessionUpdate", params });
-      this.sendToClient({ type: "sessionUpdate", params });
-      this.scheduleMetaFlush();
+      if (acpClient !== this.acp) return;
+      this.handleBackendSessionUpdate(params);
     });
 
     acpClient.on("permissionRequest", (req) => {
       if (acpClient !== this.acp) return;
-      if (this.bypassPermissions && autoApprovePermission(req)) {
-        return;
-      }
-      const permId = `perm_${this.nextPermId++}`;
-      this.pendingPermissions.set(permId, { permId, ...req });
-      this.updatedAt = Date.now();
-      this.flushMetaNow();
-      this.sendToClient({ type: "permissionRequest", permId, params: req.params });
+      this.handleBackendPermissionRequest(req);
     });
 
     acpClient.on("disconnect", () => {
@@ -332,11 +442,17 @@ export class SessionHost {
   async syncNativeBypass(enabled, { modeId = "", hasRunningMembers = false, immediateOnly = false } = {}) {
     const target = Boolean(enabled);
     this.bypassPermissions = target;
+    if (this.orchestratorStream) {
+      this.orchestratorStream.configure({ bypassPermissions: target });
+    }
     if (target) {
       this.approveAllPendingPermissions();
     }
 
-    if (immediateOnly) {
+    if (immediateOnly || this.orchestratorConfig) {
+      if (this.orchestratorConfig) {
+        this.nativeBypassActive = target;
+      }
       this.flushMetaNow();
       return { ok: true, nativeBypass: this.nativeBypassActive, restarted: false, deferred: false };
     }
@@ -504,6 +620,7 @@ export class SessionHost {
             turnStartedAt: this.turnStartedAt,
             bypassPermissions: this.bypassPermissions,
             nativeBypassActive: this.nativeBypassActive,
+            orchestratorConfig: this.orchestratorConfig,
             eventLog: this.eventLog,
             pendingPermissions: [...this.pendingPermissions.values()].map((p) => ({
               permId: p.permId,
@@ -545,6 +662,9 @@ export class SessionHost {
           this.reply(socket, id, await this.acp.listSessions(msg.cwd || this.cwd));
           return;
         case "createSession": {
+          if (this.orchestratorStream) await this.orchestratorStream.stopChild().catch(() => {});
+          this.orchestratorConfig = null;
+          this.acpSessionClosedForStream = false;
           this.eventLog = [];
           this.sessionMeta = {};
           this.cancelAllPendingPermissions();
@@ -560,16 +680,34 @@ export class SessionHost {
         }
         case "loadSession":
         case "resumeSession":
+          if (this.orchestratorStream) await this.orchestratorStream.stopChild().catch(() => {});
+          this.orchestratorConfig = null;
+          this.acpSessionClosedForStream = false;
           this.reply(socket, id, await this.openExistingSession(op, msg.sessionId, msg.cwd || this.cwd));
           return;
         case "closeSession":
+          if (this.orchestratorStream) await this.orchestratorStream.stopChild().catch(() => {});
+          this.orchestratorConfig = null;
+          this.acpSessionClosedForStream = false;
           if (this.sessionId === msg.sessionId) this.cancelAllPendingPermissions();
           await this.acp.closeSession(msg.sessionId);
           if (this.sessionId === msg.sessionId) this.sessionId = "";
           this.reply(socket, id, { ok: true });
           return;
+        case "setOrchestratorConfig": {
+          const res = await this.setOrchestratorConfig(msg.sessionId, msg.config ?? null);
+          this.reply(socket, id, res);
+          return;
+        }
         case "setMode":
           if (this.bypassSwapPromise) await this.bypassSwapPromise.catch(() => {});
+          if (this.orchestratorConfig && this.orchestratorStream) {
+            this.modeId = msg.modeId;
+            this.orchestratorStream.configure({ modeId: msg.modeId });
+            this.flushMetaNow();
+            this.reply(socket, id, {});
+            return;
+          }
           this.applyMetaAndReply(socket, id, await this.acp.setMode(msg.sessionId, msg.modeId), msg.modeId);
           return;
         case "setConfigOption":
@@ -589,7 +727,11 @@ export class SessionHost {
           );
           return;
         case "cancelTurn":
-          this.acp.cancelTurn(msg.sessionId);
+          if (this.orchestratorConfig && this.orchestratorStream) {
+            this.orchestratorStream.cancelTurn();
+          } else {
+            this.acp.cancelTurn(msg.sessionId);
+          }
           this.reply(socket, id, { ok: true });
           return;
         case "sendPrompt":
@@ -664,7 +806,19 @@ export class SessionHost {
       if (this.bypassSwapPromise) {
         await this.bypassSwapPromise.catch(() => {});
       }
-      const result = await this.acp.sendPrompt(sessionId, blocks);
+      let result;
+      if (this.orchestratorConfig) {
+        const stream = this.ensureOrchestratorStream();
+        stream.configure({
+          sessionId,
+          orchestratorConfig: this.orchestratorConfig,
+          modeId: this.modeId || "auto",
+          bypassPermissions: this.bypassPermissions,
+        });
+        result = await stream.sendPrompt(sessionId, blocks);
+      } else {
+        result = await this.acp.sendPrompt(sessionId, blocks);
+      }
       stopReason = result?.stopReason || "end_turn";
     } catch (err) {
       errorMessage = err?.message || String(err);
@@ -721,6 +875,14 @@ export class SessionHost {
         // Ignore
       }
       this.server = null;
+    }
+
+    try {
+      if (this.orchestratorStream) {
+        await this.orchestratorStream.stop();
+      }
+    } catch {
+      // Ignore
     }
 
     try {

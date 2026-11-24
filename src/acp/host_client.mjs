@@ -295,6 +295,10 @@ export class HostAcpClient extends EventEmitter {
     return this.request("setModel", { sessionId, modelValue, preferConfigOption }, 10000);
   }
 
+  setOrchestratorConfig(sessionId, config) {
+    return this.request("setOrchestratorConfig", { sessionId, config }, 60000);
+  }
+
   setBypassPermissions(enabled, opts = {}) {
     return this.request(
       "setBypass",

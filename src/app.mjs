@@ -1,6 +1,7 @@
-import { AgyStateWatcher, resolveAgyDataDir } from "./acp/agy_state.mjs";
+import { AgyStateWatcher, resolveAgyDataDir, saveAgyOrchestratorSettings } from "./acp/agy_state.mjs";
 import { autoApprovePermission } from "./acp/permissions.mjs";
 import { findConfigOption, mergeSessionMetadata } from "./acp/protocol.mjs";
+import { OrchestratorStreamClient } from "./acp/stream_client.mjs";
 import { buildSlashAutocompleteItems, executeLocalCommand, findLocalCommand } from "./app/commands.mjs";
 import {
   createPacedScheduler,
@@ -94,6 +95,7 @@ export class LucidApp {
       sessionId: null,
       modelLabel: "",
       effortLabel: "",
+      orchestratorConfig: null,
       modeId: "",
       modes: [],
       models: [],
@@ -147,6 +149,8 @@ export class LucidApp {
     this.nativeBypassDebounceTimer = null;
     this.nativeBypassDebounceTarget = null;
     this.modeSwitchSeq = 0;
+    this.orchestratorStream = null;
+    this.acpSessionClosedForStream = false;
 
     this.agyStateWatcher = isAgyCommand(this.launchSpec.command)
       ? new AgyStateWatcher({
@@ -333,6 +337,114 @@ export class LucidApp {
 
   getConfigOption(idOrCategory) {
     return findConfigOption(this.state.configOptions, idOrCategory);
+  }
+
+  cancelActiveTurn() {
+    if (!this.acp?.isHosted && this.state.orchestratorConfig && this.orchestratorStream) {
+      this.orchestratorStream.cancelTurn();
+      return;
+    }
+    if (this.acp && this.state.sessionId) {
+      this.acp.cancelTurn(this.state.sessionId);
+    }
+  }
+
+  ensureDirectOrchestratorStream() {
+    if (!this.orchestratorStream) {
+      this.orchestratorStream = new OrchestratorStreamClient({
+        command: this.launchSpec?.command || "agy",
+        cwd: this.cwd,
+        addDirs: this.cliOptions.addDirs || [],
+        dataDir: this.agyStateWatcher?.dataDir || "",
+      });
+      this.orchestratorStream.on("sessionUpdate", (params) => {
+        if (!this.suppressReplayEvents) {
+          handleSessionUpdate(this, params);
+        }
+      });
+      this.orchestratorStream.on("permissionRequest", (req) => {
+        this.enqueuePermissionRequest(req);
+      });
+    }
+    return this.orchestratorStream;
+  }
+
+  async applyOrchestratorConfig(config) {
+    const sid = this.state.sessionId;
+    if (this.acp?.isHosted && typeof this.acp.setOrchestratorConfig === "function") {
+      const res = await this.acp.setOrchestratorConfig(sid, config);
+      if (config) {
+        this.state.orchestratorConfig = { ...config };
+        this.state.modelLabel = config.displayLabel || config.modelLabel || "Orchestrator";
+        this.state.effortLabel = config.effortSummary || "";
+      } else {
+        this.state.orchestratorConfig = null;
+        if (res?.sessionMeta) {
+          this.applySessionMetadata(res.sessionMeta);
+        }
+      }
+      return res;
+    }
+
+    if (config && typeof config === "object") {
+      const dataDir = this.agyStateWatcher?.dataDir || "";
+      if (dataDir && (config.plannerLabel || config.executorLabel)) {
+        try {
+          saveAgyOrchestratorSettings(dataDir, {
+            planner: config.plannerLabel || "",
+            executor: config.executorLabel || "",
+          });
+        } catch {
+          // Best-effort settings.json sync
+        }
+      }
+      if (!this.acpSessionClosedForStream && sid && typeof this.acp?.closeSession === "function") {
+        await this.acp.closeSession(sid).catch(() => {});
+        this.acpSessionClosedForStream = true;
+      }
+      this.state.orchestratorConfig = { ...config };
+      this.state.modelLabel = config.displayLabel || config.modelLabel || "Orchestrator";
+      this.state.effortLabel = config.effortSummary || "";
+      const stream = this.ensureDirectOrchestratorStream();
+      stream.configure({
+        sessionId: sid,
+        orchestratorConfig: this.state.orchestratorConfig,
+        modeId: this.state.modeId || "auto",
+        bypassPermissions: this.state.bypassPermissions,
+      });
+      return { ok: true, orchestratorConfig: this.state.orchestratorConfig };
+    }
+
+    if (this.orchestratorStream) {
+      await this.orchestratorStream.stopChild().catch(() => {});
+    }
+    this.state.orchestratorConfig = null;
+    if (this.acpSessionClosedForStream && sid && this.acp) {
+      this.acpSessionClosedForStream = false;
+      let res = null;
+      let restored = false;
+      if (typeof this.acp.supportsSessionLoad === "function" && this.acp.supportsSessionLoad()) {
+        this.suppressReplayEvents = true;
+        try {
+          res = await this.acp.loadSession(sid, this.cwd);
+          restored = true;
+        } catch {
+          res = null;
+        } finally {
+          this.suppressReplayEvents = false;
+        }
+      }
+      if (!restored && typeof this.acp.supportsSessionResume === "function" && this.acp.supportsSessionResume()) {
+        res = await this.acp.resumeSession(sid, this.cwd).catch(() => null);
+      }
+      if (res) {
+        this.applySessionMetadata(res);
+      }
+      if (this.state.modeId && typeof this.acp.setMode === "function") {
+        await this.acp.setMode(sid, this.state.modeId).catch(() => null);
+      }
+    }
+    return { ok: true, orchestratorConfig: null };
   }
 
   // Permission handling
@@ -818,7 +930,18 @@ export class LucidApp {
     }
 
     try {
-      const result = await this.acp.sendPrompt(this.state.sessionId, blocks);
+      let result;
+      if (this.state.orchestratorConfig && this.orchestratorStream) {
+        this.orchestratorStream.configure({
+          sessionId: this.state.sessionId,
+          orchestratorConfig: this.state.orchestratorConfig,
+          modeId: this.state.modeId || "auto",
+          bypassPermissions: this.state.bypassPermissions,
+        });
+        result = await this.orchestratorStream.sendPrompt(this.state.sessionId, blocks);
+      } else {
+        result = await this.acp.sendPrompt(this.state.sessionId, blocks);
+      }
       if (result?.stopReason === "cancelled") {
         this.pushNotice("info", "Turn cancelled.");
       }
@@ -1049,6 +1172,10 @@ export class LucidApp {
     }
 
     this.renderer.leave();
+
+    if (this.orchestratorStream) {
+      await this.orchestratorStream.stop().catch(() => {});
+    }
 
     if (this.acp) {
       if (detach && typeof this.acp.detach === "function") {

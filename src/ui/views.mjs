@@ -1123,7 +1123,7 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
         alignLeftRight(style.muted(hintParts.join(" · ")), style.muted(rangeText), innerWidth, 2),
       );
     } else if (isModelPicker) {
-      const maxItems = Math.max(4, Math.min(14, height - 9));
+      const maxItems = Math.max(4, Math.min(12, height - 11));
       const { start, slice } = sliceCenteredWindow(items, modal.selected, maxItems);
       const compactEfforts = innerWidth < 66;
 
@@ -1137,7 +1137,9 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
 
         if (isSel) {
           let rightRaw = "";
-          if (efforts.length > 1) {
+          if (entry.orchestrator) {
+            rightRaw = entry.rightTag ? `${entry.rightTag} ` : "";
+          } else if (efforts.length > 1) {
             const fullPills = efforts.map((e, idx) => (idx === selIdx ? `[${e.label}]` : e.label)).join(" · ");
             const compactPill = `[${efforts[selIdx].label}]`;
             rightRaw = compactEfforts ? `◂ ${compactPill} ▸ ` : `◂ ${fullPills} ▸ `;
@@ -1151,10 +1153,61 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
           const leftRaw = ` ▸ ${truncateAnsi(`${label}${currentTag}`, leftBudget, "…")}`;
           const rowLine = alignLeftRight(leftRaw, rightRaw, innerWidth, 2);
           contentLines.push(style.selected(padEndVisible(rowLine, innerWidth)));
+
+          if (entry.orchestrator) {
+            const orch = entry.orchestrator;
+            const focus = orch.focusField || 0;
+            const planner = orch.planners[orch.plannerIdx] || orch.planners[0];
+            const executor = orch.executors[orch.executorIdx] || orch.executors[0];
+            const formatOrchRoleLine = (roleLabel, fam, effIdx, modelFieldIdx, effortFieldIdx) => {
+              const famName = compactEfforts ? fam.shortName : fam.name;
+              const modelPart =
+                focus === modelFieldIdx
+                  ? style.accentBold(`◂ ${famName} ▸`)
+                  : `  ${style.text(famName)}  `;
+              const famEfforts = Array.isArray(fam.efforts) ? fam.efforts : [];
+              const clampedIdx = Math.max(0, Math.min(effIdx || 0, Math.max(0, famEfforts.length - 1)));
+              let effortPart = "";
+              if (famEfforts.length > 0) {
+                if (compactEfforts) {
+                  const activeLbl = famEfforts[clampedIdx].label;
+                  effortPart =
+                    focus === effortFieldIdx
+                      ? style.accentBold(`◂ [${activeLbl}] ▸`)
+                      : style.muted(`[${activeLbl}]`);
+                } else {
+                  const pills = famEfforts
+                    .map((e, idx) =>
+                      idx === clampedIdx
+                        ? focus === effortFieldIdx
+                          ? style.accentBold(`[${e.label}]`)
+                          : style.text(`[${e.label}]`)
+                        : style.muted(e.label),
+                    )
+                    .join(style.border(" · "));
+                  effortPart =
+                    focus === effortFieldIdx
+                      ? `${style.accentBold("◂")} ${pills} ${style.accentBold("▸")}`
+                      : `  ${pills}  `;
+                }
+              }
+              const leftRole = `    ${style.muted(roleLabel.padEnd(9))} ${modelPart}`;
+              const rightRole = `${style.muted("Effort:")} ${effortPart}`;
+              return alignLeftRight(leftRole, rightRole, innerWidth, 2);
+            };
+            if (planner) {
+              contentLines.push(formatOrchRoleLine("Planner:", planner, orch.plannerEffortIdx, 0, 1));
+            }
+            if (executor) {
+              contentLines.push(formatOrchRoleLine("Executor:", executor, orch.executorEffortIdx, 2, 3));
+            }
+          }
         } else {
           const marker = entry.active ? style.success("●") : " ";
           let rightStyled = "";
-          if (efforts.length > 1) {
+          if (entry.orchestrator) {
+            rightStyled = entry.active ? style.accentAlt(entry.rightTag || "") : style.muted(entry.rightTag || "");
+          } else if (efforts.length > 1) {
             if (compactEfforts) {
               const activeEffort = efforts[selIdx];
               rightStyled = entry.active ? style.accentAlt(activeEffort.label) : style.muted(activeEffort.label);
@@ -1181,7 +1234,9 @@ export function applyOverlayModal(viewportRows, cols, modal, style) {
       contentLines.push(style.border("─".repeat(innerWidth)));
       const selectedEntry = items[modal.selected] || null;
       const hintParts = [];
-      if (selectedEntry?.isOrchestrator) {
+      if (selectedEntry?.orchestrator) {
+        hintParts.push("Tab field", "←/→ change", "Enter apply");
+      } else if (selectedEntry?.isOrchestrator) {
         hintParts.push("Orchestrator role effort: native agy /model", "Enter apply");
       } else if (Array.isArray(selectedEntry?.efforts) && selectedEntry.efforts.length > 1) {
         hintParts.push("↑/↓ model", "←/→ or Tab effort", "Enter apply");

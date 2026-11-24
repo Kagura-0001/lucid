@@ -111,10 +111,15 @@ export function resetConversationState(
   if (!keepSessionMeta) {
     app.state.usage = null;
     app.state.sessionTitle = "";
+    app.state.orchestratorConfig = null;
     app.state.busy = false;
     app.state.activePromptCount = 0;
     app.state.turnStartedAt = 0;
     app.state.composer?.clearHistory?.();
+    if (app.orchestratorStream) {
+      app.orchestratorStream.stopChild().catch(() => {});
+    }
+    app.acpSessionClosedForStream = false;
   }
 
   if (cancelPermissions && app.permissionQueue.length > 0) {
@@ -378,7 +383,9 @@ export async function switchSessionMode(app, targetId, bypassModeId) {
         app.state.modeId = autoModeId;
       }
 
-      const syncPlan = scheduleNativeBypassSync(app, true, { modeId: autoModeId || "auto" });
+      const syncPlan = app.state.orchestratorConfig
+        ? { scheduled: false, deferred: false }
+        : scheduleNativeBypassSync(app, true, { modeId: autoModeId || "auto" });
       if (syncPlan.deferred) {
         app.showToast("Mode → Bypass (auto-approving; backend upgrade queued until idle)", "error");
       } else if (syncPlan.scheduled) {
@@ -389,9 +396,17 @@ export async function switchSessionMode(app, targetId, bypassModeId) {
       app.scheduleRender(true);
 
       if (app.acp?.isHosted) {
-        await app.acp.setBypassPermissions(true, { immediateOnly: true });
+        await app.acp.setBypassPermissions(true, { immediateOnly: !app.state.orchestratorConfig });
+      } else if (app.orchestratorStream) {
+        app.orchestratorStream.configure({ bypassPermissions: true, modeId: autoModeId || "auto" });
       }
-      if (seq === app.modeSwitchSeq && autoModeId && autoModeId !== prevModeId && app.state.sessionId) {
+      if (
+        !app.state.orchestratorConfig &&
+        seq === app.modeSwitchSeq &&
+        autoModeId &&
+        autoModeId !== prevModeId &&
+        app.state.sessionId
+      ) {
         const modeRes = await app.acp.setMode(app.state.sessionId, autoModeId);
         if (seq === app.modeSwitchSeq) {
           app.applySessionMetadata(modeRes);
@@ -410,7 +425,7 @@ export async function switchSessionMode(app, targetId, bypassModeId) {
       app.userConfig.mode = targetId;
       saveUserConfig(app.userConfig);
 
-      const syncPlan = wasBypass
+      const syncPlan = wasBypass && !app.state.orchestratorConfig
         ? scheduleNativeBypassSync(app, false, { modeId: targetId })
         : { scheduled: false, deferred: false };
       const target = app.state.modes.find((mode) => mode.id === targetId);
@@ -419,13 +434,17 @@ export async function switchSessionMode(app, targetId, bypassModeId) {
       app.scheduleRender(true);
 
       if (wasBypass && app.acp?.isHosted) {
-        await app.acp.setBypassPermissions(false, { immediateOnly: true });
+        await app.acp.setBypassPermissions(false, { immediateOnly: !app.state.orchestratorConfig });
+      } else if (app.orchestratorStream) {
+        app.orchestratorStream.configure({ bypassPermissions: false, modeId: targetId });
       }
       if (seq === app.modeSwitchSeq && app.state.sessionId) {
-        const modeRes = await app.acp.setMode(app.state.sessionId, targetId);
-        if (seq === app.modeSwitchSeq) {
-          app.applySessionMetadata(modeRes);
-          app.state.modeId = targetId;
+        if (app.acp?.isHosted || !app.state.orchestratorConfig) {
+          const modeRes = await app.acp.setMode(app.state.sessionId, targetId);
+          if (seq === app.modeSwitchSeq) {
+            app.applySessionMetadata(modeRes);
+            app.state.modeId = targetId;
+          }
         }
       }
     }
@@ -451,6 +470,12 @@ export function applyHostSnapshot(app, snapshot) {
   app.state.sessionTitle = sanitizeUntrustedText(snapshot.sessionTitle || "");
   app.state.usage = snapshot.usage || null;
   app.applySessionMetadata(snapshot.sessionMeta || {});
+  if (snapshot.orchestratorConfig) {
+    app.state.orchestratorConfig = { ...snapshot.orchestratorConfig };
+    if (snapshot.orchestratorConfig.effortSummary) {
+      app.state.effortLabel = sanitizeUntrustedText(snapshot.orchestratorConfig.effortSummary);
+    }
+  }
   if (snapshot.modelLabel) app.state.modelLabel = sanitizeUntrustedText(snapshot.modelLabel);
   if (snapshot.modeId) app.state.modeId = snapshot.modeId;
   if (!app.state.launchBypass) {

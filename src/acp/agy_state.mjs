@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeJsonAtomic } from "../config.mjs";
 
 /**
  * Reads the multi-agent state that Antigravity (`agy`) persists on disk for a
@@ -221,6 +222,47 @@ function formatOrchestratorRole(roleObj) {
   const model = roleObj.model || roleObj.modelId || roleObj.name || "";
   const effort = roleObj.effort || roleObj.thinkingEffort || roleObj.thoughtLevel || roleObj.thought_level || "";
   return [model, effort].filter(Boolean).join(" / ");
+}
+
+/**
+ * Reads structured Orchestrator Planner/Executor settings from `<dataDir>/settings.json`.
+ * Returns `{ planner, executor }` strings (e.g. "Gemini 4 Neon (XHigh)").
+ */
+export function readAgyOrchestratorConfig(dataDir) {
+  if (!dataDir) return { planner: "", executor: "" };
+  const settings = readJsonFile(path.join(dataDir, "settings.json"));
+  const orch = settings?.orchestrator;
+  if (!orch || typeof orch !== "object") return { planner: "", executor: "" };
+  return {
+    planner: formatOrchestratorRole(orch.planner ?? orch.Planner),
+    executor: formatOrchestratorRole(orch.executor ?? orch.Executor),
+  };
+}
+
+/**
+ * Persists Orchestrator Planner/Executor model+effort labels into
+ * `<dataDir>/settings.json`, preserving all other settings keys.
+ */
+export function saveAgyOrchestratorSettings(dataDir, { planner = "", executor = "" } = {}) {
+  if (!dataDir) return false;
+  const settingsPath = path.join(dataDir, "settings.json");
+  let existing = {};
+  if (fs.existsSync(settingsPath)) {
+    const parsed = readJsonFile(settingsPath);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return false;
+    }
+    existing = parsed;
+  }
+  const prevOrch = existing.orchestrator && typeof existing.orchestrator === "object" ? existing.orchestrator : {};
+  const nextOrch = { ...prevOrch };
+  if (planner) nextOrch.planner = planner;
+  if (executor) nextOrch.executor = executor;
+  writeJsonAtomic(settingsPath, {
+    ...existing,
+    orchestrator: nextOrch,
+  });
+  return true;
 }
 
 /**

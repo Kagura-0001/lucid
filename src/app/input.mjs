@@ -443,7 +443,50 @@ export function handleModalInput(app, event) {
       app.scheduleRender(true);
     } else if ((event.name === "left" || event.name === "right" || event.name === "tab") && items.length > 0) {
       const current = items[modal.selected];
-      if (current && Array.isArray(current.efforts) && current.efforts.length > 1) {
+      if (current && current.orchestrator) {
+        const orch = current.orchestrator;
+        if (event.name === "tab") {
+          const delta = event.shift ? -1 : 1;
+          orch.focusField = wrapIndex(orch.focusField || 0, delta, 4);
+        } else {
+          const delta = event.name === "left" ? -1 : 1;
+          const field = orch.focusField || 0;
+          if (field === 0 && orch.planners.length > 1) {
+            const prevEffortVal = orch.planners[orch.plannerIdx]?.efforts?.[orch.plannerEffortIdx]?.value || "high";
+            orch.plannerIdx = wrapIndex(orch.plannerIdx, delta, orch.planners.length);
+            const nextEfforts = orch.planners[orch.plannerIdx].efforts;
+            const kept = nextEfforts.findIndex((e) => e.value === prevEffortVal);
+            const fallbackHigh = nextEfforts.findIndex((e) => e.value === "high");
+            orch.plannerEffortIdx = kept >= 0 ? kept : fallbackHigh >= 0 ? fallbackHigh : 0;
+          } else if (field === 1) {
+            const pEfforts = orch.planners[orch.plannerIdx]?.efforts || [];
+            if (pEfforts.length > 1) {
+              orch.plannerEffortIdx = wrapIndex(orch.plannerEffortIdx || 0, delta, pEfforts.length);
+            }
+          } else if (field === 2 && orch.executors.length > 1) {
+            const prevEffortVal = orch.executors[orch.executorIdx]?.efforts?.[orch.executorEffortIdx]?.value || "high";
+            orch.executorIdx = wrapIndex(orch.executorIdx, delta, orch.executors.length);
+            const nextEfforts = orch.executors[orch.executorIdx].efforts;
+            const kept = nextEfforts.findIndex((e) => e.value === prevEffortVal);
+            const fallbackHigh = nextEfforts.findIndex((e) => e.value === "high");
+            orch.executorEffortIdx = kept >= 0 ? kept : fallbackHigh >= 0 ? fallbackHigh : 0;
+          } else if (field === 3) {
+            const eEfforts = orch.executors[orch.executorIdx]?.efforts || [];
+            if (eEfforts.length > 1) {
+              orch.executorEffortIdx = wrapIndex(orch.executorEffortIdx || 0, delta, eEfforts.length);
+            }
+          }
+        }
+        const planner = orch.planners[orch.plannerIdx];
+        const executor = orch.executors[orch.executorIdx];
+        const pEff = planner?.efforts?.[orch.plannerEffortIdx];
+        const eEff = executor?.efforts?.[orch.executorEffortIdx];
+        if (planner && executor && pEff && eEff) {
+          current.rightTag = `${planner.shortName} ${pEff.label} → ${executor.shortName} ${eEff.label}`;
+          current.description = current.rightTag;
+        }
+        app.scheduleRender(true);
+      } else if (current && Array.isArray(current.efforts) && current.efforts.length > 1) {
         const delta = event.name === "left" || (event.name === "tab" && event.shift) ? -1 : 1;
         current.selectedEffortIdx = wrapIndex(current.selectedEffortIdx || 0, delta, current.efforts.length);
         app.scheduleRender(true);
@@ -580,7 +623,7 @@ export function handleMainKey(app, key) {
       return;
     }
     if (app.state.busy && app.state.sessionId) {
-      app.acp.cancelTurn(app.state.sessionId);
+      app.cancelActiveTurn();
       app.showToast("Cancellation requested…");
       return;
     }
@@ -649,7 +692,7 @@ export function handleMainKey(app, key) {
     } else if (app.activeLocalShell) {
       cancelLocalShell(app);
     } else if (app.state.busy && app.state.sessionId) {
-      app.acp.cancelTurn(app.state.sessionId);
+      app.cancelActiveTurn();
       app.showToast("Cancelling turn…");
     } else if (app.state.scrollOffset > 0) {
       app.state.scrollOffset = 0;
