@@ -156,6 +156,10 @@ export function mergeSessionMetadata(rawMeta, payload) {
     if (effortOpt) {
       const optMatch = (effortOpt.options || []).find((o) => o.value === effortOpt.currentValue);
       derived.effortLabel = optMatch ? optMatch.name : effortOpt.currentValue || "";
+    } else {
+      // Clear stale effort label when switching to a model without thought_level
+      // (e.g. Orchestrator in agy acp).
+      derived.effortLabel = "";
     }
 
     const modeOpt = findConfigOption(opts, "mode");

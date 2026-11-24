@@ -59,3 +59,41 @@ export function alignLeftRight(left, right, width, minGap = 2) {
   }
   return truncateAnsi(left, width, "…");
 }
+
+/**
+ * Parses agy 1.5.15+ `AGY_CLI_AUTO_COMPACT_OVERRIDE` values:
+ * integer tokens (`700000`), `K`/`M` shorthand (`800K`, `0.5M`), or percentage (`80%`).
+ */
+export function parseAutoCompactOverride(rawValue, contextSize = 0) {
+  const raw = String(rawValue ?? "").trim();
+  if (!raw) return null;
+
+  const pctMatch = /^(\d+(?:\.\d+)?)\s*%$/.exec(raw);
+  if (pctMatch) {
+    const pct = Number.parseFloat(pctMatch[1]);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) return null;
+    const tokens = contextSize > 0 ? Math.round((contextSize * pct) / 100) : 0;
+    const pctLabel = Number.isInteger(pct) ? `${pct}%` : `${pct.toFixed(1)}%`;
+    return { tokens, pct: Math.round(pct), label: `compact@${pctLabel}` };
+  }
+
+  const unitMatch = /^(\d+(?:\.\d+)?)\s*([kKmM])?$/.exec(raw);
+  if (!unitMatch) return null;
+  const num = Number.parseFloat(unitMatch[1]);
+  if (!Number.isFinite(num) || num <= 0) return null;
+
+  const unit = (unitMatch[2] || "").toLowerCase();
+  const multiplier = unit === "m" ? 1_000_000 : unit === "k" ? 1_000 : 1;
+  let tokens = Math.round(num * multiplier);
+  if (contextSize > 0 && tokens > contextSize) {
+    tokens = contextSize;
+  }
+  const pct = contextSize > 0 ? Math.min(100, Math.round((tokens / contextSize) * 100)) : 0;
+  const compactTok =
+    tokens >= 1_000_000
+      ? `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`
+      : tokens >= 1_000
+        ? `${Math.round(tokens / 1_000)}k`
+        : String(tokens);
+  return { tokens, pct, label: `compact@${compactTok}` };
+}

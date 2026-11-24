@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import { readAgyOrchestratorSettings } from "../acp/agy_state.mjs";
 import { fetchAgyQuota } from "../acp/client.mjs";
 import { sanitizeUntrustedText } from "../term/unicode.mjs";
 import { formatBytes, loadImageAttachment } from "../ui/files.mjs";
+import { parseAutoCompactOverride } from "../ui/format.mjs";
 import { listThemes } from "../ui/themes.mjs";
 import {
   createFreshSession,
@@ -73,7 +75,19 @@ export const COMMAND_SPECS = [
     async run(app) {
       const effortOpt = app.getConfigOption("thought_level") || app.getConfigOption("effort");
       if (!effortOpt || !Array.isArray(effortOpt.options) || effortOpt.options.length === 0) {
-        app.pushNotice("warn", "This model/agent does not expose a separate thinking level option.");
+        if (/orchestrator/i.test(app.state.modelLabel || "")) {
+          const dataDir = app.agyStateWatcher?.dataDir || "";
+          const configured = readAgyOrchestratorSettings(dataDir);
+          const currentDesc = configured
+            ? `Configured in settings.json: ${configured}`
+            : "Default Planner/Executor effort in agy 1.5.15+ is high (unless customized in settings.json)";
+          app.pushNotice(
+            "info",
+            `agy acp does not expose Orchestrator Planner/Executor effort over ACP. ${currentDesc}. Configure per-role effort in native agy (/model) or ${dataDir ? `${dataDir}/settings.json` : "settings.json"}.`,
+          );
+        } else {
+          app.pushNotice("warn", "This model/agent does not expose a separate thinking level option.");
+        }
         app.scheduleRender();
         return;
       }
@@ -336,6 +350,13 @@ export const COMMAND_SPECS = [
       if (app.state.usage && app.state.usage.size > 0) {
         const pct = Math.min(100, Math.round((app.state.usage.used / app.state.usage.size) * 100));
         app.pushNotice("info", `Context window: ${app.state.usage.used.toLocaleString()} / ${app.state.usage.size.toLocaleString()} tokens (${pct}%)`);
+      }
+      const compact = parseAutoCompactOverride(process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE, app.state.usage?.size || 0);
+      if (compact) {
+        const detail = compact.tokens > 0
+          ? ` (${compact.tokens.toLocaleString()} tokens${compact.pct > 0 ? ` · ${compact.pct}%` : ""})`
+          : "";
+        app.pushNotice("info", `Auto-compact override: ${compact.label}${detail}`);
       }
       if (!app.launchSpec.supportsQuotaCli) {
         if (!app.state.usage) {

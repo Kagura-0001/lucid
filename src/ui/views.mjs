@@ -3,7 +3,14 @@ import { displayWidth, padEndVisible, truncateAnsi, wrapAnsiLine, wrapAnsiText }
 import { PASTED_TOKEN_REGEX } from "./composer.mjs";
 import { renderDiffLines } from "./diff.mjs";
 import { formatBytes } from "./files.mjs";
-import { alignLeftRight, formatDuration, isToolTerminalStatus, sliceCenteredWindow, spinnerChar } from "./format.mjs";
+import {
+  alignLeftRight,
+  formatDuration,
+  isToolTerminalStatus,
+  parseAutoCompactOverride,
+  sliceCenteredWindow,
+  spinnerChar,
+} from "./format.mjs";
 import { renderMarkdownStreamingCached, safeRenderMarkdown } from "./markdown.mjs";
 import { renderSwarmDock } from "./swarm.mjs";
 import {
@@ -78,8 +85,16 @@ export function renderHeader(state, cols, style) {
   const rightParts = [];
   if (state.usage && state.usage.size > 0) {
     const pct = Math.min(100, Math.round((state.usage.used / state.usage.size) * 100));
-    const usageText = `${formatTokenCount(state.usage.used)}/${formatTokenCount(state.usage.size)} (${pct}%)`;
-    const colored = pct >= 85 ? style.error(usageText) : pct >= 65 ? style.warn(usageText) : style.muted(usageText);
+    const compact = parseAutoCompactOverride(
+      state.autoCompactOverride ?? process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE,
+      state.usage.size,
+    );
+    const usageText = compact
+      ? `${formatTokenCount(state.usage.used)}/${formatTokenCount(state.usage.size)} (${pct}% · ${compact.label})`
+      : `${formatTokenCount(state.usage.used)}/${formatTokenCount(state.usage.size)} (${pct}%)`;
+    const errAt = compact && compact.pct > 0 ? compact.pct : 85;
+    const warnAt = compact && compact.pct > 0 ? Math.max(50, compact.pct - 15) : 65;
+    const colored = pct >= errAt ? style.error(usageText) : pct >= warnAt ? style.warn(usageText) : style.muted(usageText);
     rightParts.push(colored);
   }
   if (state.quotaText) {
@@ -753,6 +768,54 @@ export function renderAutocompletePopup(popup, cols, style) {
   return lines;
 }
 
+function describeWaitingBackgroundWork(state) {
+  const items = Array.isArray(state.items) ? state.items : [];
+  const lastItem = items.length > 0 ? items[items.length - 1] : null;
+  if (lastItem?.streaming) return "";
+
+  let lastUserIdx = -1;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i]?.type === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  const bgTaskTitles = [];
+  let hasForegroundTool = false;
+  for (let i = lastUserIdx + 1; i < items.length; i += 1) {
+    const item = items[i];
+    if (!item || item.type !== "tool" || isToolTerminalStatus(item.status)) continue;
+    if (/Tool is running as a background task/i.test(item.outputText || "")) {
+      const rawTitle = String(item.title || item.name || "task").replace(/\s+/g, " ").trim() || "task";
+      const clipped = rawTitle.length > 48 ? `${rawTitle.slice(0, 47)}…` : rawTitle;
+      bgTaskTitles.push(clipped);
+    } else {
+      hasForegroundTool = true;
+    }
+  }
+  if (hasForegroundTool) return "";
+
+  const counts = state.multiAgent?.getSummaryCounts?.();
+  const subCount = counts?.subagentsRunning || 0;
+  const workerCount = counts?.working || 0;
+  if (subCount === 0 && workerCount === 0 && bgTaskTitles.length === 0) return "";
+
+  const parts = [];
+  if (subCount > 0) {
+    parts.push(`${subCount} ${subCount === 1 ? "subagent" : "subagents"}`);
+  }
+  if (workerCount > 0) {
+    parts.push(`${workerCount} ${workerCount === 1 ? "worker" : "workers"}`);
+  }
+  if (bgTaskTitles.length === 1) {
+    parts.push(`background task (${bgTaskTitles[0]})`);
+  } else if (bgTaskTitles.length > 1) {
+    parts.push(`${bgTaskTitles.length} background tasks`);
+  }
+  return parts.join(", ");
+}
+
 export function renderComposerBlock(state, cols, style) {
   const gutterWidth = 4; // " ❯ " + 1 right margin
   const inputWidth = Math.max(12, cols - gutterWidth);
@@ -793,7 +856,12 @@ export function renderComposerBlock(state, cols, style) {
       statusBanner = `${style.thought(spin)} ${style.muted(`Working · thinking${tDur} · ^T show · Esc cancel`)}`;
     } else {
       const elapsed = state.turnStartedAt ? ` · ${formatDuration(Date.now() - state.turnStartedAt)}` : "";
-      statusBanner = `${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`;
+      const waitingSummary = describeWaitingBackgroundWork(state);
+      if (waitingSummary) {
+        statusBanner = `${style.accentAlt(spin)} ${style.muted(`Waiting on ${waitingSummary}${elapsed} · type to steer · Esc cancel`)}`;
+      } else {
+        statusBanner = `${style.accent(spin)} ${style.muted(`Working${elapsed} · Esc cancel · type to steer`)}`;
+      }
     }
   }
 

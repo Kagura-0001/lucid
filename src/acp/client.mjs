@@ -177,11 +177,11 @@ export class AcpClient extends EventEmitter {
   }
 
   async loadSession(sessionId, cwd) {
-    return this.rpc.request("session/load", { sessionId, cwd, mcpServers: [] }, 30000);
+    return this.rpc.request("session/load", { sessionId, cwd, mcpServers: [] }, 60000);
   }
 
   async resumeSession(sessionId, cwd) {
-    return this.rpc.request("session/resume", { sessionId, cwd, mcpServers: [] }, 30000);
+    return this.rpc.request("session/resume", { sessionId, cwd, mcpServers: [] }, 60000);
   }
 
   async closeSession(sessionId) {

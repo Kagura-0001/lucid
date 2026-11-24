@@ -165,7 +165,11 @@ export class HostAcpClient extends EventEmitter {
         this.pending.delete(msg.id);
         clearTimeout(waiter.timer);
         if (msg.error) {
-          waiter.reject(new Error(msg.error));
+          const err = new Error(msg.error);
+          if (typeof msg.errorCode === "number") {
+            err.code = msg.errorCode;
+          }
+          waiter.reject(err);
         } else {
           waiter.resolve(msg.result);
         }
@@ -259,11 +263,11 @@ export class HostAcpClient extends EventEmitter {
   }
 
   loadSession(sessionId, cwd) {
-    return this.request("loadSession", { sessionId, cwd }, 30000);
+    return this.request("loadSession", { sessionId, cwd }, 60000);
   }
 
   resumeSession(sessionId, cwd) {
-    return this.request("resumeSession", { sessionId, cwd }, 30000);
+    return this.request("resumeSession", { sessionId, cwd }, 60000);
   }
 
   closeSession(sessionId) {

@@ -939,6 +939,15 @@ export async function openResumePicker(app, { query = "", startup = false } = {}
   }
 }
 
+function formatSessionLoadError(err, sessionId) {
+  if (err?.code === -32002) {
+    const friendly = new Error(`Session "${sessionId}" was not found (it may have been removed).`);
+    friendly.code = -32002;
+    return friendly;
+  }
+  return err;
+}
+
 export async function switchToSession(app, sessionId, titleLabel = "") {
   if (app.state.sessionId && app.state.sessionId === sessionId) {
     app.showToast("Already in this session");
@@ -968,14 +977,25 @@ export async function switchToSession(app, sessionId, titleLabel = "") {
       try {
         res = await app.acp.loadSession(sessionId, app.cwd);
       } catch (loadErr) {
+        if (loadErr?.code === -32002) {
+          throw formatSessionLoadError(loadErr, sessionId);
+        }
         if (app.acp.supportsSessionResume()) {
-          res = await app.acp.resumeSession(sessionId, app.cwd);
+          try {
+            res = await app.acp.resumeSession(sessionId, app.cwd);
+          } catch (resumeErr) {
+            throw formatSessionLoadError(resumeErr, sessionId);
+          }
         } else {
-          throw loadErr || new Error(`Could not load session ${sessionId}`);
+          throw formatSessionLoadError(loadErr, sessionId) || new Error(`Could not load session ${sessionId}`);
         }
       }
     } else if (app.acp.supportsSessionResume()) {
-      res = await app.acp.resumeSession(sessionId, app.cwd);
+      try {
+        res = await app.acp.resumeSession(sessionId, app.cwd);
+      } catch (resumeErr) {
+        throw formatSessionLoadError(resumeErr, sessionId);
+      }
     }
   } catch (err) {
     Object.assign(app.state, savedState);

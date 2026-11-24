@@ -170,6 +170,9 @@ function scanUserPromptsFromTail(text) {
   return { userTurnCount, lastUserPrompt };
 }
 
+const sessionPreviewCache = new Map();
+const MAX_PREVIEW_CACHE = 500;
+
 /**
  * Reads lightweight tail metadata (latest user prompt snippet and turn count)
  * from an Antigravity session transcript on disk so /resume can show what each
@@ -179,7 +182,15 @@ export function readSessionTranscriptPreview(dataDir, sessionId) {
   if (!dataDir || !sessionId) return null;
   const transcriptPath = path.join(dataDir, "brain", sessionId, ".system_generated", "logs", "transcript.jsonl");
   const stats = safeStat(transcriptPath);
-  if (!stats || stats.size <= 0) return null;
+  if (!stats || stats.size <= 0) {
+    sessionPreviewCache.delete(transcriptPath);
+    return null;
+  }
+
+  const cached = sessionPreviewCache.get(transcriptPath);
+  if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+    return cached.preview;
+  }
 
   let readBytes = PREVIEW_TAIL_BYTES;
   let scanned = scanUserPromptsFromTail(readFileTail(transcriptPath, readBytes));
@@ -188,12 +199,54 @@ export function readSessionTranscriptPreview(dataDir, sessionId) {
     scanned = scanUserPromptsFromTail(readFileTail(transcriptPath, readBytes));
   }
 
-  return {
+  const preview = {
     lastUserPrompt: scanned.lastUserPrompt,
     userTurnCount: scanned.userTurnCount,
     exactTurnCount: stats.size <= readBytes,
     mtimeMs: stats.mtimeMs || 0,
   };
+
+  sessionPreviewCache.delete(transcriptPath);
+  sessionPreviewCache.set(transcriptPath, { mtimeMs: stats.mtimeMs, size: stats.size, preview });
+  if (sessionPreviewCache.size > MAX_PREVIEW_CACHE) {
+    const oldestKey = sessionPreviewCache.keys().next().value;
+    sessionPreviewCache.delete(oldestKey);
+  }
+  return preview;
+}
+
+function formatOrchestratorRole(roleObj) {
+  if (typeof roleObj === "string") return roleObj.trim();
+  if (!roleObj || typeof roleObj !== "object") return "";
+  const model = roleObj.model || roleObj.modelId || roleObj.name || "";
+  const effort = roleObj.effort || roleObj.thinkingEffort || roleObj.thoughtLevel || roleObj.thought_level || "";
+  return [model, effort].filter(Boolean).join(" / ");
+}
+
+/**
+ * Reads optional user-configured Orchestrator Planner/Executor overrides from
+ * `<dataDir>/settings.json` so lucid can surface the active configuration
+ * even when `agy acp` hides `thought_level` for Orchestrator models.
+ */
+export function readAgyOrchestratorSettings(dataDir) {
+  if (!dataDir) return "";
+  const settings = readJsonFile(path.join(dataDir, "settings.json"));
+  const orch = settings?.orchestrator;
+  if (!orch || typeof orch !== "object") return "";
+
+  const parts = [];
+  const plannerStr = formatOrchestratorRole(orch.planner ?? orch.Planner);
+  if (plannerStr) parts.push(`Planner: ${plannerStr}`);
+  const executorStr = formatOrchestratorRole(orch.executor ?? orch.Executor);
+  if (executorStr) parts.push(`Executor: ${executorStr}`);
+
+  if (parts.length > 0) return parts.join(" · ");
+
+  for (const [key, val] of Object.entries(orch)) {
+    const formatted = formatOrchestratorRole(val);
+    if (formatted) parts.push(`${key}: ${formatted}`);
+  }
+  return parts.join(" · ");
 }
 
 /**

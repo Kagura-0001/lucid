@@ -461,9 +461,11 @@ export class SessionHost {
     });
   }
 
-  reply(socket, id, result = null, error = null) {
+  reply(socket, id, result = null, error = null, errorCode = undefined) {
     if (!socket || socket.destroyed) return;
-    const payload = error ? { type: "response", id, error: String(error) } : { type: "response", id, result };
+    const payload = error
+      ? { type: "response", id, error: String(error), ...(typeof errorCode === "number" ? { errorCode } : {}) }
+      : { type: "response", id, result };
     try {
       socket.write(`${JSON.stringify(payload)}\n`);
     } catch {
@@ -600,7 +602,7 @@ export class SessionHost {
           this.reply(socket, id, null, `Unknown host op: ${op}`);
       }
     } catch (err) {
-      this.reply(socket, id, null, err?.message || String(err));
+      this.reply(socket, id, null, err?.message || String(err), err?.code);
     }
   }
 

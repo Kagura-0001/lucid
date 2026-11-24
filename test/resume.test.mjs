@@ -278,3 +278,65 @@ test("-c / --continue picks the newest session in current cwd by updatedAt even 
   await app.openInitialSession();
   assert.deepEqual(calls.loaded, ["sess-here-newest"]);
 });
+
+test("switchToSession reports -32002 cleanly without resumeSession fallback, and readSessionTranscriptPreview caches by mtime/size", async () => {
+  const { switchToSession } = await import("../src/app/session.mjs");
+  const app = new LucidApp({ cwd: "/tmp/demo" });
+  app.scheduleRender = () => {};
+  app.state.sessionId = "sess-prev";
+  app.state.items = [{ type: "user", text: "Existing item" }];
+
+  let resumeCalls = 0;
+  app.acp = {
+    supportsSessionLoad: () => true,
+    supportsSessionResume: () => true,
+    loadSession: async () => {
+      const err = new Error("Session not found");
+      err.code = -32002;
+      throw err;
+    },
+    resumeSession: async () => {
+      resumeCalls += 1;
+      return {};
+    },
+  };
+
+  await assert.rejects(
+    () => switchToSession(app, "missing-sess-123"),
+    (err) => err?.code === -32002 && /was not found/i.test(err.message),
+  );
+  assert.equal(resumeCalls, 0, "-32002 must not trigger redundant resumeSession fallback");
+  assert.equal(app.state.sessionId, "sess-prev", "previous session state must be restored");
+  assert.equal(app.state.items.length, 1);
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "lucid-preview-cache-"));
+  try {
+    const logDir = path.join(tmpRoot, "brain", "sess-cache", ".system_generated", "logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    const logPath = path.join(logDir, "transcript.jsonl");
+    fs.writeFileSync(
+      logPath,
+      JSON.stringify({ type: "USER_INPUT", content: "<USER_REQUEST>\nFirst prompt\n</USER_REQUEST>" }) + "\n",
+      "utf8",
+    );
+
+    const p1 = readSessionTranscriptPreview(tmpRoot, "sess-cache");
+    const p2 = readSessionTranscriptPreview(tmpRoot, "sess-cache");
+    assert.equal(p2, p1, "unchanged transcript should return cached preview object");
+
+    fs.appendFileSync(
+      logPath,
+      JSON.stringify({ type: "USER_INPUT", content: "<USER_REQUEST>\nSecond prompt\n</USER_REQUEST>" }) + "\n",
+      "utf8",
+    );
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(logPath, future, future);
+
+    const p3 = readSessionTranscriptPreview(tmpRoot, "sess-cache");
+    assert.notEqual(p3, p1);
+    assert.equal(p3?.userTurnCount, 2);
+    assert.equal(p3?.lastUserPrompt, "Second prompt");
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

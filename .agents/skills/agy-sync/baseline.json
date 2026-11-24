@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "agyVersion": "1.5.14",
+  "agyVersion": "1.5.16",
   "acpFlags": [
     "--add-dir",
     "--agent",
@@ -70,7 +70,7 @@
     "ok": true,
     "agentInfo": {
       "name": "Antigravity ACP Server",
-      "version": "1.5.14"
+      "version": "1.5.16"
     },
     "agentCapabilities": {
       "loadSession": true,
